@@ -1,0 +1,134 @@
+Microsoft Developer Studio Workspace File, Format Version 6.00
+# WARNING: DO NOT EDIT OR DELETE THIS WORKSPACE FILE!
+
+###############################################################################
+
+Project: "All"=.\All\All.dsp - Package Owner=<4>
+
+Package=<5>
+{{{
+}}}
+
+Package=<4>
+{{{
+    Begin Project Dependency
+    Project_Dep_Name glide2x
+    End Project Dependency
+    Begin Project Dependency
+    Project_Dep_Name glide3x
+    End Project Dependency
+    Begin Project Dependency
+    Project_Dep_Name GxpOGL
+    End Project Dependency
+}}}
+
+###############################################################################
+
+Project: "FxASM"=.\FxASM.dsp - Package Owner=<4>
+
+Package=<5>
+{{{
+}}}
+
+Package=<4>
+{{{
+    Begin Project Dependency
+    Project_Dep_Name Gendate
+    End Project Dependency
+}}}
+
+###############################################################################
+
+Project: "Gendate"=.\Gendate.dsp - Package Owner=<4>
+
+Package=<5>
+{{{
+}}}
+
+Package=<4>
+{{{
+}}}
+
+###############################################################################
+
+Project: "GxpOGL"=.\GxpOGL\GxpOGL.dsp - Package Owner=<4>
+
+Package=<5>
+{{{
+}}}
+
+Package=<4>
+{{{
+}}}
+
+###############################################################################
+
+Project: "glide2x"=.\glide2x\glide2x.dsp - Package Owner=<4>
+
+Package=<5>
+{{{
+}}}
+
+Package=<4>
+{{{
+    Begin Project Dependency
+    Project_Dep_Name FxASM
+    End Project Dependency
+}}}
+
+###############################################################################
+
+Project: "glide3x"=.\glide3x.dsp - Package Owner=<4>
+
+Package=<5>
+{{{
+}}}
+
+Package=<4>
+{{{
+    Begin Project Dependency
+    Project_Dep_Name FxASM
+    End Project Dependency
+}}}
+
+###############################################################################
+
+Project: "texus2"=.\texus2.dsp - Package Owner=<4>
+
+Package=<5>
+{{{
+}}}
+
+Package=<4>
+{{{
+    Begin Project Dependency
+    Project_Dep_Name texuslib
+    End Project Dependency
+}}}
+
+###############################################################################
+
+Project: "texuslib"=.\texuslib.dsp - Package Owner=<4>
+
+Package=<5>
+{{{
+}}}
+
+Package=<4>
+{{{
+}}}
+
+###############################################################################
+
+Global:
+
+Package=<5>
+{{{
+}}}
+
+Package=<3>
+{{{
+}}}
+
+###############################################################################
+

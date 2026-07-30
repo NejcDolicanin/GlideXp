@@ -1,0 +1,362 @@
+2003-03-15  Ryan Nunn <colourles@users.sourceforge.net>
+	* H5\GLIDE3\SRC\GSFC.c : Just changed some debug output levels
+
+	* H5\GLIDE3\SRC\Gsst.c, H5\GLIDE3\SRC\winsurf.cpp : Added support for 
+	  Windowed glide modes by passing GR_RESOLUTION_NONE to grSstWinOpen.
+	  It's rather raw and is likely to have issues on V3s and 8MB 
+	  Banshees. TEXUMA wont work if enabled when using windowed mode and 
+	  could cause problems. I don't know what applications support Windowed
+	  Glide modes so no real testing has been done.
+
+	* H5\GLIDE3\SRC\Distate.c : Fixing a problem with changing
+	  rendering buffers and using FSAA.
+
+	* H5\GLIDE3\SRC\Gdraw.c : Fixing point rendering
+
+	* H5\GLIDE3\SRC\Glfb.c : Improving HWCAA LFB reads. Designed to 
+	  prevent things from being so slow.
+
+	* H5\GLIDE3\SRC\Gglide.c : Removed some old Glide2 hacks
+
+	* H5\GLIDE3\SRC\Diget.c, H5\GLIDE3\SRC\Gtexdl.c : Added PARTIALROW
+	  extension and grTexDownloadMipMapLevelPartialRowExt() function to
+	  allow down loading of parts of a row of a mipmap. It's a bit of a 
+	  hack but it's useful.
+
+	* H5\GLIDE3\SRC\Cpuid.c, H5\MINIHWC\Minihwc.c : Fixing up nasty MMX and
+	  3DNow problems that caused general floating point courruption. 
+
+	* H5\GLIDE3\SRC\Fxglide.h, H5\GLIDE3\SRC\Glide.h : Updated to reflect 
+	  changes listed above.
+
+	* GXPOGL\*.* : Modified how things work. It will now only work with
+	  761 ICD. It will not function with other versions (as it's not 
+	  intended too). Updated things so it will compile with Dx8.1 and Dx9
+	  SDKs and wont crash.
+
+	* GLIDE2X\*.* : Added 'extern "C" FX_ENTRY' function prototypes in the
+	  headers for all functions that required them. Removed those from the
+	  functions themselves. Added an 'extension' mechanism to Glide2. Has
+	  support for Glide3 extensions TEXFMT, PIXEXT, TEXTUREBUFFER, TEXUMA 
+	  and PARTIALROW. Also has GETEXT extension that is implicit because 
+	  extensions are supported, and GAMMA extension that allows manually 
+	  loading a Gamma table via the grLoadGammaTable() function.
+
+
+2003-01-20  Ryan Nunn <colourles@users.sourceforge.net>
+	* H5\GLIDE3\SRC\cpuid.*, H5\GLIDE3\SRC\Gpci.c, H5\GLIDE3\SRC\Fxglide.h,
+	  H5\GLIDE3\SRC\xtexdl.asm: Added new and improved CPU detection code.
+	  Removed FX_CPU. Added GXP_GLIDE_NO_CPU_EXTENSIONS MMX Optimized 
+	  texturing functions now used on any hardware that supports MMX, not 
+	  just AMD. 3DNow Optimized vertex functions now supported on all 
+	  hardware the suports 3DNow, not just AMD.
+
+	* H5\GLIDE3\SRC\gsfc.c, H5\GLIDE3\SRC\Diget.c, H5\GLIDE3\SRC\Diglide.c,
+	  H5\GLIDE3\SRC\Gglide.c, GLIDE2X\g2pch.h: Removed all the ??ver.h and
+	  ??.rc files and combined them into unified files.
+
+	* H5\GLIDE3\SRC\Gpci.c, H5\GLIDE3\SRC\Ditex.c, H5\GLIDE3\SRC\Ditex.c,
+	  H5\GLIDE3\SRC\xtexdl_def.c, H5\GLIDE3\SRC\Gtexdl.c, 
+	  H5\GLIDE3\SRC\Fxglide.h: Fixing nasty problem with 4x4 DXTC mipmap
+	  levels. 
+
+	* H5\MINIHWC\Minihwc.c : Rewrote much of the HWC Screencapture code
+	  (used for Glide screenshot key) to use optimized MMX code. 
+	  Screen capturing is now MUCH MUCH faster in 4x and 8x modes.
+
+	* GxpOGL\*.* : Begun work on the GxpOGL ICD Interceptor to fix issues
+	  with the 3dfx ICD. Currently all this does is use its the Microsoft
+	  DXTC compressor to compress DXTC textures. This is much FASTER and is
+	  higher QUALITY than the 3dfx one. DXT1, DXT3 and DXT5 now all work 
+	  properly and look great. This fixes problems with games such as Star
+	  Trek Voyager Elite Force and Jedi Knight II. The GL_S3_S3TC
+	  extensions textures are now translated to 
+	  GL_EXT_TEXTURE_COMPRESSION_S3TC calls. This now means that Quake 3 
+	  will use DXTC compression rather than FXT1 and also look better too.
+	  GxpOGL requires the 3dfx 761 OpenGL ICD to function correctly. The 
+	  761 ICD must be renamed to 3dfxICD.dll and the GxpOGL dll must be 
+	  called 3dfxogl.dll and placed in the Windows System(32) dir.
+	  
+
+2003-01-07  Ryan Nunn <colourles@users.sourceforge.net>
+	* H5\GLIDE3\SRC\Gpci.c : Added missing 8x FSAA Reg settings/env vars.
+	  Added GXP_GL_LFBLOCK_HACK, GXP_GLIDE_USE_HWC_AA_FOR_LFB_READ and
+	  GXP_GLIDE_DITHER_HWC_AA environment var. See source for details about
+	  the settings.
+
+	* H5\GLIDE3\SRC\Distate.c : Fixed 4 Chip Dither Rotation.
+
+	* H5\GLIDE3\SRC\Gtexdl.c, H5\GLIDE3\SRC\Ditex.c, H5\GLIDE3\SRC\gsfc.c,
+	  H5\GLIDE3\SRC\Gtex.c, H5\GLIDE3\SRC\gsfctabl.h, 
+	  H5\GLIDE3\SRC\Fxglide.h 
+	 : S3TC support (Thanks Kool)
+
+	* H5\GLIDE3\SRC\Gsst.c, H5\GLIDE3\SRC\Glfb.c, H5\GLIDE3\SRC\Fxglide.h :
+	  Working around problems reading from the Frame buffer when bit depth 
+	  is forced to 32 bit. This still might fail with some poorly written 
+	  programs.
+
+	* H5\GLIDE3\SRC\Glfb.c, H5\MINIHWC\Minihwc.c, H5\MINIHWC\Minihwc.h :
+	  Changed things so apps doing Frame Buffer captures can get
+	  antialiased images from 4 chip boards. This might still fail with 
+	  some poorly written programs. OpenGL has special handling. Also
+	  allows for dithering when capturing 32 bit and FSAA images when the
+	  app is expecting 16 bit data.
+
+	* H5\GLIDE3\SRC\Gglide.c, H5\MINIHWC\Minihwc.c, H5\MINIHWC\Minihwc.h : 
+	  32 Bit Glide Screenshot dithering. Probably pointless, but I'll allow
+	  it. Changed the way filenames are generated for Glide screenshots 
+	  under windows. Format is now glide_yyyymmdd_hhmmss.tga where yyyymmdd
+	  is the date and hhmmss is the time the screenshot was taken at.
+
+
+2002-10-07  Ryan Nunn <colourles@users.sourceforge.net>
+	* H5\GLIDE3\SRC\*.asm : Use ASM files
+
+	* H5\GLIDE3\SRC\fxgasm.c : Changes for getting asm files to compile 
+	  easily.
+
+	* H5\GLIDE3\SRC\Gglide.c : Formatting changes and getting TBuffer to
+	  work.
+
+	* H5\GLIDE3\SRC\Gsst.c : Force 4 chip cards to 1 chip in NT to get
+	  2x FSAA to work. Also, changed things so choosing FSAA mode with
+	  more samples than the card can use will now choose the best mode
+	  the card can handle.
+
+	* H5\GLIDE3\SRC\Fxglide.h, H5\GLIDE3\SRC\Distate.c : Made the 
+	  Multisample enable/disable setting a counter so apps that enable and
+	  disable antialiasing for text will not cause the FSAA Enable/Disable
+	  key not to work.
+
+	* H5\GLIDE3\SRC\Diget.c : Use actual number of chips on card when
+	  reporting the card type. Made it will actually report a V5 6000
+	  (I had intentionally made it not report a 6000 before)
+
+	* H5\GLIDE3\SRC\Rcver.h : Indicate if GlideXP has been compiled with
+	  NOASM
+
+	* H5\MINIHWC\Gdebug.c : gdbg_msgfile is no longer static.
+
+	* H5\MINIHWC\win_regpath.c : Making sure getting the registry path for
+	  cards in Win9x actually works
+
+	* H5\MINIHWC\Win_mode.c : Formatting. Registry stuff
+
+	* H5\MINIHWC\nt6ksli_mode.c : Attempting, and failing to get 4 Chip SLI
+	  to properly enable in NT.
+
+	* H5\MINIHWC\Minihwc.c : Formatting changes. Force 4 chip cards to 1 
+	  chip in NT to get 2x FSAA to work. Registry stuff. Save actual number
+	  of chips on card
+
+	* H5\MINIHWC\minihwc.h: Save actual number of chips on card
+
+	* H5\MINIHWC\Hwcio.h : Some changes for my 6K NT SLI hack
+
+	* GLIDE2X\G2misc.* : GXP_HINT_AA_MULTI_SAMPLE Extension (used by FS2GXP)
+
+	* GLIDE2X\g2impfuncs.cpp : Attempt to load both GlideXP.dll and
+	  Glide3x.dll. Order is GlideXP.dll first then Glide3x.dll
+
+2002-09-04  Ryan Nunn <colourles@users.sourceforge.net>
+
+	* h5\glide3\src\Gpci.c : Added GXP_GLIDE_FSAA_PIXEL_CENTER setting to
+	  control the offset for the pixel center in FSAA modes. Defaults to 8
+	  which is best for most games. Unreal Tournament (and probably all
+	  Unreal engine games) likes a settings of 4. Using a setting of 16
+	  will give you output that is the same as previous Glide versions.
+
+	* h5\glide3\src\Gglide.c, h5\glide3\src\diget.c :  Added ALPHAFOG
+	  extension to enabled the GR_FOG_WITH_ITERATED_ALPHA_EXT fog mode so
+	  Iterated Alpha Fog will work with the Glide2 Translator.
+
+
+2002-09-03  Ryan Nunn <colourles@users.sourceforge.net>
+
+	* h5\glide3\minihwc\minihwc.c : Alt-Tab changes
+
+	* h5\glide3\minihwc\win_mode.c : A sort of work in progress Alt-Tab
+	  change.
+
+	* glide2x\g2fog.cpp : Fixing Fogging problems
+
+	* glide2x\*.* : Added extra dummy functions for some unsupported 
+	  exported functions that certain titles expect (such as Tribes).
+
+	* Misc files : Updated various Version property page stuff.
+
+
+2002-07-16  Ryan Nunn <colourles@users.sourceforge.net>
+
+	* h5\glide3\src\Gpci.c : FX_GLIDE_LOD_SUBSAMPLE_DITHER has now been
+	  changed to GXP_GLIDE_LOD_SUBSAMPLE_DITHER to indicate it's a GlideXP
+	  feature. Any further GlideXP settings will follow the pattern
+	  GXP_GLIDE_ for General Glide/OpenGL changes, GXP_GLIDE2_ for Glide2
+	  specific changes, GXP_GLIDE3_ for Glide3 specific changes and
+	  GXP_OPENGL_ for OpenGL specific Changes
+
+	* h5\minihwc\minihwc.c : Added per resolution and per colour depth
+	  refresh rate settings. Use GXP_GLIDE_REFRESH_???x??? and 
+	  GXP_GLIDE_REFRESH_???x???x??? where the ?'s are the resolution and
+	  the BPP (16 or 32)
+
+	* h5\glide3\minihwc\win_mode.c : Fixed some more refresh rate problems
+
+	* h5\glide3\src\Gsst.c, Distate.c, Fxglide.h, glfb.c : Fixing problems
+	  when forcing 32BPP mode. Fixes are incorrect frame buffer dumps and
+	  issues with depth biasing (e.g. flickering details textures in Unreal
+	  engine games)
+
+	* h5\minihwc\minihwc.c : Working around V5 6000 FSAA Gamma problem
+
+	* SWLIBS\TEXUS2\cmd : Allow texus2 tool to be compiled.
+
+	* glide2x\*.* : All new Glide 2 to Glide 3 Translator. Fixes lots of
+	  problems. Supports new environment settings. See 
+	  NonStateInfo::Environment_s::Init() in g2state.cpp for details on
+	  settings. Settings are GXP_GLIDE2_FASTER_PALETTES and 
+	  GXP_GLIDE2_NO_MULTITEXTURE.
+
+	* Misc files: Added some Glide3 Extensions (QUERY and POINTCAST) to
+	  help with the G2->G3 Translator, however they are currently not
+	  active because they do not work correctly. Note that the Translator
+	  WILL attempt to use them if it can so it is unwise to enable them in
+	  Glide3x unless they are fixed.
+
+
+2002-03-31  Ryan Nunn <colourles@users.sourceforge.net>
+	* h5\glide3\src\diglide.c : Fixed up a crash with Glide2 apps.
+	
+	* SWLIBS\TEXUS2 : Compile in Texus2 lib.
+
+	* Other files: Working on texture compression and motion blur.
+
+
+2001-12-28  Ryan Nunn <colourles@users.sourceforge.net>
+	* h5\glide3\src\Gsst.c : Stopping crash on OpenGL Fullscreen->Windowed
+
+	* h5\glide3\src\diglide.c : Fixing potential tiny memory leak in the
+	  Glide2 state hack.
+
+	* h5\minihwc\minihwc.c : Improving faster WinXP Alt-Tab fix. Removed
+	  silly debug comments.
+
+	* h5\glide3\src\Glide.h, h5\glide3\src\Digutex.c, h5\glide3\src\gutex.c:
+	  Fixing a lod bias problem in Glide 2 when using GU texturing
+	  functions.
+
+
+2001-12-23  Ryan Nunn <colourles@users.sourceforge.net>
+	* h5\glide3\src\gsst.c : Trying to fix fullscreen OpenGL
+
+
+2001-12-22  Ryan Nunn <colourles@users.sourceforge.net>
+	* h5\glide3\src\gsst.c, h5\glide3\src\winglide3.h : Enabled Splash
+	  Screen.
+
+	* h5\glide3\src\glide.h, h5\glide3\src\gaa.c : Fixed some Antialiased
+	  primitive problems in Glide2.
+
+	* h5\glide3\src\gu.c, h5\glide3\src\gutex.c, h5\glide3\src\digutex.c :
+	  Fixing Glide Utility library texturing functions for Glide2.
+
+
+2001-12-20  Ryan Nunn <colourles@users.sourceforge.net>
+	* too many files to list: Glide2x. STWHINT is now properly implimented.
+	  Fixes texturing problems in Unreal Tournament and Deus Ex. 
+
+
+2001-12-18  Ryan Nunn <colourles@users.sourceforge.net>
+	* too many files to list: Again working on Glide2x.
+
+	* h5\glide3\minihwc\win_mode.c : Fixed some refresh rate problems.
+	  Fixed a multimonitor problem.
+
+
+2001-12-16  Ryan Nunn <colourles@users.sourceforge.net>
+	* too many files to list: More Glide2x stuff. Changing the way texture
+	  info translation is done.
+
+
+2001-12-15  Ryan Nunn <colourles@users.sourceforge.net>
+	* too many files to list: Hacking in ability to compile DLL as Glide2x.
+	  Define GLIDE2 as 1 to build as Glide2x.
+
+
+2001-12-14  Ryan Nunn <colourles@users.sourceforge.net>
+
+	* h5\glide3\src\rcver.h, h5\glide3\src\glide.rc : Modified for GlideXP.
+
+	* h5\glide3\src\Gtex.c, h5\glide3\src\Distate.c, h5\glide3\src\Fxglide.h:
+	  Removed calls to MultitextureAndTrilinear(). That will now be called
+	  by g3LodBiasPerChip().
+
+	* h5\glide3\src\fifo.c : Changed an #ifdef to #if
+
+	* h5\glide3\src\gsst.c : Call GetCurrentWindow if no  HWND was supplied
+	  to grSstWinOpen or grSstWinOpenExt
+
+
+2001-12-13  Ryan Nunn <colourles@users.sourceforge.net>
+
+	* h5\minihwc\minihwc.*, h5\glide3\src\Fxglide.h : Getting Alt-Tab on
+          Windows XP to work. #define WINXP_ALT_TAB_FIX=1 to enable
+
+        * h5\minihwc\minihwc.c : Fixing Screenshots on 4 chip boards and
+	  improved accuracy.
+
+
+2001-12-12  Ryan Nunn <colourles@users.sourceforge.net>
+
+	* h5\glide3\src\Gglide.C : grTBufferWriteMaskExt was causing problems
+	  on 4 chip boards, so I disabled it for now.
+
+	* h5\glide3\src\Gtex.c :  Make Sub Sample LOD Dither work on a Per TMU
+	  Basis.4 Chip boards now have Sub Sample LOD Dither in 2x.
+
+	* h5\glide3\src\ditex.c, h5\glide3\src\Gtex.c : Removed the function
+         _grTexFloatLODToFixedLOD because it's useless
+
+	* h5\glide3\src\Fxglide.H h5\glide3\src\Gpci.c, h5\glide3\src\Gtex.c :
+	  Sub Sample LOD Dither Env settings.
+
+	* h5\glide3\src\Gpci.c, h5\glide3\src\Gtex.c : Changed the way env
+	  FX_GLIDE_LOD_DITHER works. If set to -1, there will never be
+	  dithering.
+
+
+2001-12-11  Ryan Nunn <colourles@users.sourceforge.net>
+
+	* h5\glide3\src\Gpci.c : 4 Chip can now use env vars to override 2x\4x
+
+	  FSAA sample positions.
+	* h5\glide3\src\gsst.c : Only force Analog SLI on 4 chip cards when 
+	  doing FSAA.
+
+
+2001-12-10  Ryan Nunn <colourles@users.sourceforge.net>
+
+        * h5\glide3\src\winglide3.h : Modified macglide3.h to get compile in
+	  Windows with MSVC 6.
+
+	* h5\minihwc\minihwc.c : Getting to compile in windows. Working around
+	  problems in Windows XP.
+
+	* h5\minihwc\Win_mode.c : Getting to compile in windows for H5 Glide3.
+	  Copied from H3 Glide3.
+
+	* h5\minihwc\Gdebug.c : Automatically write Level 80 ouput to gdbg.txt
+	  when _DEBUG is defined
+
+        * h5\glide3\src\Cpudtect.c : Converted Cpudtect.asm to a C file with
+	  Inline ASM.
+
+        * h5\glide3\src\Fxglide.h : Define a TRISETUP macro just for when
+	  GLIDE_USE_C_TRISETUP is defined.
+
+	* h5\glide3\src\Gdraw.c : Commented out __declspec( naked ) for
+	  grDrawTriangle since it was causing problems
+
+	* h5\glide3\src\Gpci.c : Added gdbginfos to output the cpu vendor
+	  (Intel and AMD) only.
