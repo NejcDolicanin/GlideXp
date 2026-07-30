@@ -1,0 +1,149 @@
+# GLIDE2X — MinGW makefile
+#
+# Builds ../glide2x.dll, the Glide2->Glide3 wrapper.
+#
+#   mingw32-make -f Makefile.mingw            # build
+#   mingw32-make -f Makefile.mingw clean
+#   mingw32-make -f Makefile.mingw exports    # dump the export table
+#
+# Settings lifted from glide2x.dsp (Release configuration).  This makefile is
+# added alongside the VC6 project, not as a replacement for it.
+#
+# Target is Windows 98 on a Voodoo 5, so: i686, no SSE, no exceptions/RTTI,
+# and the libgcc/libstdc++ runtimes are linked statically.
+#
+# The export table comes entirely from glide2x.def — the reference DLL exports
+# MSVC-decorated names (_grFoo@N, leading underscore *and* @bytes) and games
+# link against a stock glide2x.lib, so those names must match exactly.  Nothing
+# here may rely on __declspec(dllexport).
+
+CXX     := g++
+CC      := gcc
+WINDRES := windres
+OBJDUMP := objdump
+
+TARGET  := ../glide2x.dll
+GENDATE := ../H5/INCSRC/gendate.h
+DEFFILE := glide2x.def
+RCFILE  := ../GLIDEXP.RC
+OBJDIR  := mingw-obj
+
+INCLUDES := \
+	-I. \
+	-I.. \
+	-I../H5/incsrc \
+	-I../SWLIBS/fxmisc \
+	-I../H5/glide3/src \
+	-I../SWLIBS/newpci/pcilib \
+	-I../H5/minihwc \
+	-I../SWLIBS/texus2/lib
+
+DEFINES := \
+	-DNDEBUG \
+	-DWIN32 \
+	-D_WINDOWS \
+	-D_MBCS \
+	-D_USRDLL \
+	-DGLIDE2X_EXPORTS \
+	-DG2_TRANS
+
+# -fms-extensions: g2misc.cpp's GrProcAddresses union uses an unnamed struct
+#   member and a zero-length trailing array, both MSVC extensions.
+# -fno-exceptions/-fno-rtti: the sources use C++ for namespaces only.
+# -fno-asynchronous-unwind-tables: with libstdc++ gone there is no DWARF
+#   unwinder linked into the image at all, so .eh_frame is 8K nothing can read.
+CXXFLAGS := -O2 -march=i686 -mtune=i686 -mno-sse -mno-mmx \
+	-fno-exceptions -fno-rtti -fms-extensions -fno-strict-aliasing \
+	-fno-asynchronous-unwind-tables \
+	-Wall -Wno-unused-variable -Wno-write-strings \
+	$(DEFINES) $(INCLUDES)
+
+# --kill-at would strip the @N; --add-stdcall-alias would add undecorated
+# aliases.  Neither is wanted: the .def is the authority on every name.
+# --enable-stdcall-fixup is deliberately NOT used either — it fuzzy-matches
+# names whose @N disagrees, which is exactly the ABI mistake that has to stay
+# a hard link error.
+# --subsystem,windows matches the reference DLL (GUI, not the CUI that ld
+# defaults to).
+#
+# -s strips .debug_* from the image.  Our own objects carry no debug info
+# (-O2, NDEBUG, no -g); the ~120K of DWARF comes from MinGW's prebuilt
+# libgcc.a/libstdc++.a.  Build with SYMBOLS=1 to keep it for a gdb session.
+ifdef SYMBOLS
+STRIPFLAG :=
+else
+STRIPFLAG := -s
+endif
+
+# Linked with gcc, not g++, so libstdc++ is never pulled in -- g2new.cpp
+# supplies the only two things this DLL wanted from it.  That drops the DWARF
+# unwinder, gthr-win32's CreateSemaphoreW import (a Win98 stub that always
+# fails), and a chunk of msvcrt surface the MSVC reference DLL does not use.
+LINK := gcc
+
+LDFLAGS := -shared -static-libgcc $(STRIPFLAG) \
+	-Wl,--image-base,0x1A000000 \
+	-Wl,--subsystem,windows
+
+LIBS := -lkernel32 -luser32 -lgdi32 -ladvapi32
+
+# Every .cpp in this directory except G2PCH.CPP, which exists only to generate
+# the MSVC precompiled header.  No PCH under GCC.
+SOURCES := \
+	G2buffer.cpp \
+	G2clip.cpp \
+	G2color.cpp \
+	G2DEBUG.CPP \
+	G2DRAW.CPP \
+	G2FOG.CPP \
+	G2glide.cpp \
+	G2gutex.cpp \
+	g2impfuncs.cpp \
+	G2MAIN.CPP \
+	G2misc.cpp \
+	g2new.cpp \
+	G2SST.CPP \
+	G2STATE.CPP \
+	G2tex.cpp \
+	G2utils.cpp
+
+OBJECTS := $(addprefix $(OBJDIR)/,$(addsuffix .o,$(basename $(SOURCES))))
+RESOBJ  := $(OBJDIR)/glidexp.res.o
+
+.PHONY: all clean exports
+
+all: $(TARGET)
+
+$(TARGET): $(OBJECTS) $(RESOBJ) $(DEFFILE)
+	$(LINK) $(LDFLAGS) -o $@ $(OBJECTS) $(RESOBJ) $(DEFFILE) $(LIBS)
+
+$(OBJECTS): $(GENDATE)
+
+$(OBJDIR)/%.o: %.cpp | $(OBJDIR)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(OBJDIR)/%.o: %.CPP | $(OBJDIR)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+# h3defs.h includes gendate.h, a generated header holding nothing but a
+# BUILD_DATE string.  VC6 builds Gendate.dsp and pipes its stdout to
+# H5/INCSRC/gendate.h; this does the same with a host-compiled gendate.exe.
+# Generated once and then left alone — it is not a phony target, so an
+# incremental build does not churn every object file.
+$(GENDATE): ../H5/INCSRC/GENDATE.C | $(OBJDIR)
+	$(CC) -O1 $< -o $(OBJDIR)/gendate.exe
+	$(OBJDIR)/gendate.exe > $@
+
+$(RESOBJ): $(RCFILE) | $(OBJDIR)
+	$(WINDRES) $(INCLUDES) -I.. $< -O coff -o $@
+
+$(OBJDIR):
+	mkdir $(OBJDIR)
+
+# Must print 123 names, all of the form _name@bytes, matching the reference
+# glide2x.dll.
+exports: $(TARGET)
+	$(OBJDUMP) -p $(TARGET) | sed -n '/Ordinal\/Name Pointer/,$$p'
+
+clean:
+	rm -rf $(OBJDIR) $(TARGET) $(GENDATE)

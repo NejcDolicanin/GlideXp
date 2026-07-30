@@ -209,10 +209,21 @@ inline static void single_precision_asm(void)
 #define FN_NAME "single_precision_asm"
     GDBG_INFO(80, "%s\n", FN_NAME);
 
+#if defined(__GNUC__)
+
+  unsigned short cw;
+
+  __asm__ __volatile__ ("fnclex");          /* clear pending exceptions */
+  __asm__ __volatile__ ("fnstcw %0" : "=m" (cw));
+  cw &= 0xfcff;                             /* clear bits 9:8 */
+  __asm__ __volatile__ ("fldcw %0" : : "m" (cw));
+
+#else
+
   __asm
   {
     push  eax       ; make room
-    fnclex          ; clear pending exceptions    
+    fnclex          ; clear pending exceptions
     fstcw WORD PTR [esp]
     mov   eax, DWORD PTR [esp]
     and   eax, 0000fcffh  ; clear bits 9:8
@@ -220,6 +231,8 @@ inline static void single_precision_asm(void)
     fldcw WORD PTR [esp]
     pop   eax
   }
+
+#endif
 
 #undef FN_NAME
 }
@@ -235,9 +248,23 @@ inline static void double_precision_asm(void)
 #define FN_NAME "double_precision_asm"
     GDBG_INFO(80, "%s\n", FN_NAME);
 
+#if defined(__GNUC__)
+
+  unsigned short cw;
+
+  __asm__ __volatile__ ("fnclex");          /* clear pending exceptions */
+  __asm__ __volatile__ ("fnstcw %0" : "=m" (cw));
+  cw = (unsigned short)((cw & 0xfcff) | 0x02ff); /* set bits 9:8 to 10b */
+  __asm__ __volatile__ ("fldcw %0" : : "m" (cw));
+
+  /* NB: the MSVC block below has a stray `ret 0` even though this is not a
+     naked function.  That looks like a latent bug; nothing to mirror here. */
+
+#else
+
   __asm {
     push  eax       ; make room
-    fnclex          ; clear pending exceptions    
+    fnclex          ; clear pending exceptions
     fstcw WORD PTR [esp]
     mov   eax, DWORD PTR [esp]
     and   eax, 0000fcffh  ; clear bits 9:8
@@ -247,6 +274,8 @@ inline static void double_precision_asm(void)
     pop   eax
     ret   0
   }
+
+#endif
 
 #undef FN_NAME
 }
@@ -569,7 +598,9 @@ struct GrProcAddressTuple {
 };
 
 // Disable the warning
+#ifdef _MSC_VER
 #pragma warning (disable:4200)
+#endif
 
 // Can be addressed in 2 ways. Either by index, or by function name
 // Don't ask me what the indices are, because I don't know
@@ -583,12 +614,22 @@ union GrProcAddresses
 	};
 	
 	// *** Non-standard extension *** //
-	GrProcAddressTuple index[];	
+#if defined(__GNUC__)
+	// GCC rejects a flexible array member in a union even under
+	// -fms-extensions.  This is only ever used as a base pointer, walked
+	// until the terminator, so a [1] bound behaves identically and does
+	// not change the union's size (the struct above is larger).
+	GrProcAddressTuple index[1];
+#else
+	GrProcAddressTuple index[];
+#endif
 
 } _functionTable;
 
 // Renable the warning
+#ifdef _MSC_VER
 #pragma warning (default:4200)
+#endif
 
 GrProc FX_CALL grGetProcAddressExtXP (char *procName)
 {

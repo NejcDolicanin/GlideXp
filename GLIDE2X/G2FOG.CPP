@@ -86,7 +86,7 @@ NAKED_CALL void FX_CALL grFogMode( GrFogMode_t mode )
 #define FN_NAME "grFogMode"
     GDBG_INFO(69, "%s (%i)\n", FN_NAME, mode);
 
-#ifdef _DEBUG
+#if defined(_DEBUG) || defined(__GNUC__)
 	if ((mode & 0xFF) == G2_FOG_WITH_ITERATED_ALPHA) mode += 3;
 
 	Glide3::grFogMode(mode);

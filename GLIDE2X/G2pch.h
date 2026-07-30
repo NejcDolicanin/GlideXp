@@ -19,6 +19,13 @@
 #define NAKED_CALL
 #define ASM_JMP(func, args) return func args
 #define VOID_ASM_JMP(func, args) func args
+#elif defined(__GNUC__)
+// GCC has no __declspec(naked) on x86 and no MSVC-style inline asm, so the
+// forwarding thunks are plain calls rather than tail jumps. Costs one call
+// frame per Glide2 entry point; nothing else changes.
+#define NAKED_CALL
+#define ASM_JMP(func, args) return func args
+#define VOID_ASM_JMP(func, args) func args
 #else
 #define NAKED_CALL	__declspec(naked)
 #define ASM_JMP(func, args) __asm jmp func
