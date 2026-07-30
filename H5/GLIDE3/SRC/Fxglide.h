@@ -2599,6 +2599,24 @@ _grSstVRetraceOn(void);
 #define WNT_TEB_TLS_OFFSET              0xE10
 #define WNT_TLS_INDEX_TO_OFFSET(i)      ((i)*sizeof(DWORD)+WNT_TEB_TLS_OFFSET)
 
+#if defined(__GNUC__)
+
+/* MinGW: no MSVC inline asm.  fs:[0x18] is the TEB's linear self-pointer, so
+   this is just a load from teb + _GlideRoot.tlsOffset.  %c1 emits the offset
+   as a bare immediate rather than an operand. */
+#define __GR_GET_TLSC_VALUE() getThreadValueFast()
+
+__inline FxU32
+getThreadValueFast() {
+  FxU32 teb;
+  __asm__ __volatile__ ("movl %%fs:%c1, %0"
+                        : "=r" (teb)
+                        : "i" (WNT_TEB_PTR));
+  return *(FxU32 *)(teb + _GlideRoot.tlsOffset);
+}
+
+#else /* MSVC */
+
 #define __GR_GET_TLSC_VALUE() \
 __asm { \
    __asm mov eax, DWORD PTR fs:[WNT_TEB_PTR] \
@@ -2610,12 +2628,14 @@ __asm { \
 __inline FxU32
 getThreadValueFast() {
   __asm {
-    __asm mov eax, DWORD PTR fs:[WNT_TEB_PTR] 
-    __asm add eax, DWORD PTR _GlideRoot.tlsOffset 
-    __asm mov eax, DWORD PTR [eax] 
+    __asm mov eax, DWORD PTR fs:[WNT_TEB_PTR]
+    __asm add eax, DWORD PTR _GlideRoot.tlsOffset
+    __asm mov eax, DWORD PTR [eax]
   }
 }
 #pragma warning (3:4035)
+
+#endif /* MSVC */
 #endif
 
 #if (GLIDE_PLATFORM & GLIDE_OS_MACOS)

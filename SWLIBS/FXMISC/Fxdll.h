@@ -85,6 +85,16 @@
       #define FX_EXPORT
       #define FX_CSTYLE __stdcall __export
 
+    #elif defined(__GNUC__)
+      /* MinGW. The export table is supplied by glide2x.def, which reproduces
+         the MSVC _name@bytes decoration that the games' import libraries
+         expect. ld exports only what the .def lists, so no dllexport
+         attribute is applied here. */
+      #define FX_ENTRY
+      #define FX_EXPORT
+      #define FX_CALL __stdcall
+      #define FX_CSTYLE __stdcall
+
     #else /* compiler */
       #error define FX_ENTRY,FX_CALL & FX_EXPORT,FX_CSTYLE for your compiler
     #endif /* compiler */

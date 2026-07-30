@@ -92,6 +92,14 @@ typedef struct { float r, g, b, a; } FxColor4;
 #  else /* !macintosh */
 #    error "Unknown MetroWerks target platform"
 #  endif /* !macintosh */
+#elif defined(__GNUC__)
+   /* MinGW.  __DJGPP__ and __unix__ are matched above, so this is the Win32
+      GCC case, and it must agree with the MSVC branch: Glide is a __stdcall
+      API and the games link against MSVC-built import libraries.  Falling
+      through to the generic branch below would silently make every entry
+      point cdecl. */
+#  define FX_ENTRY extern
+#  define FX_CALL  __stdcall
 #else
 #  warning define FX_ENTRY & FX_CALL for your compiler
 #  define FX_ENTRY extern
