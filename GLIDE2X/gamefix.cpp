@@ -562,6 +562,183 @@ static void InstallCameraHook(int extraZoomHundredths, unsigned int virtualHeigh
         VirtualFree(stub, 0, MEM_RELEASE);
 }
 
+// ---------------------------------------------------------------------------
+// 4. HUD horizontal placement
+// ---------------------------------------------------------------------------
+//
+// The HUD is laid out in a 640-wide virtual space, so on 2560x1080 the
+// right-hand cluster (x1 / x5 / $0 / hearts) stops at 640*2.25 = 1440 instead
+// of reaching the screen edge.
+//
+// Finding the code that positions it took a runtime diagnostic, after six
+// static approaches came up empty.  Two transforms carry HUD coordinates:
+//
+//     0x5d0640   x = 611, 631, 620, 507, 16    (1061 records)
+//     0x4932c0   x = 633, 518                  (139 records)
+//
+// Two traps cost a hardware test each, and both are invisible from the screen:
+//
+//   1. These coordinates are 16.14 FIXED POINT.  x=633 is stored as
+//      633*16384 = 10,371,072.  An earlier build compared against a plain 320
+//      and added a plain 1120, which moved things by 1120/16384 = 0.07 px --
+//      indistinguishable from the hook never firing.
+//
+//   2. Each transform scales TWO coordinates and the FIRST one is Y.  Hooking
+//      it offset the vertical instead: the HUD moved *down* by 560 px and a
+//      portrait went off the bottom of the screen.  The hook belongs on the
+//      SECOND multiply's shift.
+//
+//     delta  = screen_width - 640*scale       = 2560 - 1440 = 1120 px
+//     centre : x += (delta/2) << 14
+//     spread : x += delta << 14   when x_virtual >= 320 << 14
+//
+// A blanket offset is still too blunt -- it dragged the world-anchored crash
+// popup far left and stretched the car-name frame (whose left edge is below
+// x=320 and right edge above).  ThirteenAG solves this with a per-element
+// posType; the diagnostic gave us the same discrimination for free by
+// recording each record's CALLER.  The status bar comes from a known few:
+//
+//     0x4932c0 site : 0x4903f8                     x 518..633
+//     0x5d0640 site : 0x5c9389                     x 551..631
+//                     0x5ced73 0x5cefe2 0x5cf02b   x 507..620
+//
+// (the left-hand bars come from 0x5c8b94/8bc8/8bfd/8d66/8da6 at x 16..93 and
+// need nothing -- they are already below the threshold)
+//
+// So the offset applies only to whitelisted callers.  Everything else --
+// world-anchored popups, message text, anything unclassified -- passes through
+// untouched, which is the safe default.
+//
+// The patched instruction is `mov $0xe,%ecx ; call __allshr` (10 bytes).  The
+// stub does that shift inline with shrd, which is exact: __allshr is an
+// arithmetic 64-bit shift and only the low dword was ever consumed.  ecx and
+// edx are free -- the displaced code clobbered both, and the instruction after
+// the patch site rewrites them before use.
+//
+// Stack arithmetic: the call pushes a return address (+4) and the stub pushes
+// flags (+4), so the site's X offset gains 8.  The caller's return address is
+// at 0x10(%esp) at both patch points, hence 0x18(%esp) inside the stub.
+//
+#define HUD_MAX_CALLERS 6
+
+struct HudSite {
+    const char   *note;
+    unsigned char sigLen;
+    unsigned char xAtInStub;   // X stack offset + 8
+    unsigned char sig[10];
+    DWORD         callers[HUD_MAX_CALLERS];   // 0-terminated whitelist
+};
+
+static const HudSite g_hudSites[] = {
+    { "0x4932fd -- X shift in the 0x4932c0 transform", 10, 0x18 + 8,
+      { 0xb9, 0x0e, 0x00, 0x00, 0x00, 0xe8, 0xa9, 0x31, 0x15, 0x00 },
+      { 0x004903f8, 0 } },
+    { "0x5d067d -- X shift in the 0x5d0640 transform", 10, 0x1c + 8,
+      { 0xb9, 0x0e, 0x00, 0x00, 0x00, 0xe8, 0x29, 0x5e, 0x01, 0x00 },
+      { 0x005c9389, 0x005ced73, 0x005cefe2, 0x005cf02b, 0 } },
+};
+
+//
+//    0  pushfd
+//    1  shrd $0xe,%edx,%eax         the shift the displaced code owed
+//    5  cmpl $thr,<x>(%esp)         x >= 320<<14 ?
+//   13  jl   done
+//   15  mov  0x18(%esp),%ecx        caller return address
+//   19  mov  $table,%edx
+//   24  loop: cmp %ecx,(%edx) / je apply / add $4,%edx / cmpl $0,(%edx) / jne loop
+//   36  jmp  done
+//   40  apply: add $delta,%eax
+//   45  done: popfd
+//   46  ret
+//   48  caller table (0-terminated)
+//
+static unsigned char hud_stub_tmpl[] = {
+    0x9c,
+    0x0f, 0xac, 0xd0, 0x0e,
+    0x81, 0x7c, 0x24, 0x20, 0, 0, 0, 0,   /* x at 8, thr at 9 */
+    0x7c, 0x1e,
+    0x8b, 0x4c, 0x24, 0x18,
+    0xba, 0, 0, 0, 0,                     /* table at 20 */
+    0x39, 0x0a,
+    0x74, 0x0c,
+    0x83, 0xc2, 0x04,
+    0x83, 0x3a, 0x00,
+    0x75, 0xf4,
+    0xeb, 0x07,
+    0x90, 0x90,
+    0x05, 0, 0, 0, 0,                     /* delta at 41 */
+    0x9d,
+    0xc3
+};
+#define HUD_XOFF_AT    8
+#define HUD_THR_AT     9
+#define HUD_TABLE_AT  20
+#define HUD_DELTA_AT  41
+#define HUD_TABLE_OFF 48
+
+static void InstallHudHook(int mode, unsigned int virtualHeight)
+{
+    HMODULE        mod;
+    unsigned char *code = NULL;
+    unsigned int   codeSize = 0, i;
+    int            hudWidth, delta, thr, add;
+
+    if (mode <= 0) return;
+    if (virtualHeight < 120) virtualHeight = 120;
+
+    mod = GetModuleHandleA(NULL);
+    if (!mod) return;
+    if (!GetCodeRange(mod, &code, &codeSize)) return;
+
+    hudWidth = (int)(((long long)640 * GTA2_TARGET_H) / virtualHeight);
+    delta    = GTA2_TARGET_W - hudWidth;
+    if (delta < 0) delta = 0;
+
+    if (mode == 1) {                    /* centre: make the compare always pass */
+        thr = (int)0x80000000;
+        add = (delta / 2) << 14;
+    } else {                            /* spread: right-hand half only */
+        thr = 320 << 14;
+        add = delta << 14;
+    }
+
+    for (i = 0; i < sizeof(g_hudSites) / sizeof(g_hudSites[0]); i++) {
+        const HudSite *s = &g_hudSites[i];
+        unsigned char *at, *stub, *table, call[10];
+        unsigned int   nc;
+        int            rel;
+
+        at = FindUnique(code, codeSize, s->sig, s->sigLen);
+        if (!at) continue;
+
+        stub = (unsigned char *)VirtualAlloc(
+                   NULL, HUD_TABLE_OFF + sizeof(s->callers),
+                   MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        if (!stub) continue;
+
+        memcpy(stub, hud_stub_tmpl, sizeof(hud_stub_tmpl));
+        stub[HUD_XOFF_AT] = s->xAtInStub;
+        memcpy(stub + HUD_THR_AT,   &thr, 4);
+        memcpy(stub + HUD_DELTA_AT, &add, 4);
+
+        table = stub + HUD_TABLE_OFF;
+        for (nc = 0; nc < HUD_MAX_CALLERS; nc++) {
+            DWORD c = s->callers[nc];
+            memcpy(table + nc * 4, &c, 4);
+            if (!c) break;
+        }
+        memcpy(stub + HUD_TABLE_AT, &table, 4);
+
+        rel = (int)(stub - (at + 5));
+        call[0] = 0xe8;
+        memcpy(call + 1, &rel, 4);
+        memset(call + 5, 0x90, 5);
+
+        if (!WriteCode(at, call, 10))
+            VirtualFree(stub, 0, MEM_RELEASE);
+    }
+}
+
 void GameFix_Apply(void)
 {
     char         exePath[MAX_PATH];
@@ -594,5 +771,16 @@ void GameFix_Apply(void)
     {
         InstallCameraHook(
             (int)GetPrivateProfileIntA("GTA2", "extra_zoom", 0, ini), vh);
+    }
+
+    //
+    // HUD horizontal placement.  Same reason it is not a BytePatch: the stub
+    // holds a runtime-allocated caller table.
+    //
+    if (haveIni &&
+        (PathEndsWith(exePath, "gta2.exe") || PathEndsWith(exePath, "gta2.icd")))
+    {
+        InstallHudHook((int)GetPrivateProfileIntA("GTA2", "hud_mode", 0, ini),
+                       vh);
     }
 }
