@@ -10,6 +10,7 @@
 //
 
 #include "g2pch.h"
+#include "gamefix.h"
 
 const static char glideIdent[] = "@#%" "2.70 " VERSIONSTR "GXP";
 
@@ -66,6 +67,23 @@ void FX_CALL grGlideInit( void )
 	}
 
     GDBG_INFO(80, "%s\n", FN_NAME);
+
+	// Per-game patches, second chance.
+	//
+	// DLL_PROCESS_ATTACH is the natural place, but it is not reliable here:
+	// GTA2 pulls its video device in with LoadLibrary, and on Win9x
+	// GetModuleHandle("DMAGlide.dll") still comes back NULL while that load is
+	// in progress -- which is why the in-memory patch did nothing on hardware
+	// while the identical on-disk patch worked.
+	//
+	// grGlideInit is a guaranteed-good hook instead: DMAGlide's Vid_Init_SYS
+	// calls it as its very first Glide call, and only afterwards allocates and
+	// fills the mode list we need to rewrite. By the time we are here the
+	// module is fully loaded and its code is definitely reachable.
+	//
+	// GameFix_Apply is idempotent, so the DllMain call staying in place costs
+	// nothing on platforms where it does work.
+	GameFix_Apply();
 
 	Glide3::grGlideInit();
 

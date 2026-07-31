@@ -98,6 +98,7 @@ SOURCES := \
 	G2FOG.CPP \
 	G2glide.cpp \
 	G2gutex.cpp \
+	gamefix.cpp \
 	g2impfuncs.cpp \
 	G2MAIN.CPP \
 	G2misc.cpp \

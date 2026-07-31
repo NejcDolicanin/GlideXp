@@ -10,9 +10,10 @@
 //
 
 #include "g2pch.h"
+#include "gamefix.h"
 
-BOOL WINAPI 
-DllMain(HANDLE hInst, ULONG  ul_reason_for_call, LPVOID lpReserved) 
+BOOL WINAPI
+DllMain(HANDLE hInst, ULONG  ul_reason_for_call, LPVOID lpReserved)
 {
   switch( ul_reason_for_call ) {
   case DLL_PROCESS_DETACH:
@@ -25,6 +26,13 @@ DllMain(HANDLE hInst, ULONG  ul_reason_for_call, LPVOID lpReserved)
 	theState.Reset();
 	Glide3::SetupAllFunctions();
 	//if (!Glide3::SetupAllFunctions()) return FALSE;
+
+	// Per-game binary patches.  For GTA2 this rewrites DMAGlide.dll's
+	// hardcoded mode list before the game reads it.  We get here early
+	// enough because DMAGlide.dll imports us, so it is already mapped
+	// while the loader is still resolving its imports.  Never fails
+	// loudly -- an unpatched game at stock resolution beats no game.
+	GameFix_Apply();
     break;
   case DLL_THREAD_ATTACH:
     break;
