@@ -812,14 +812,13 @@ static unsigned char hud_stub_tmpl[] = {
 #define HUD_TABLE_AT  10
 #define HUD_TABLE_OFF 40
 
-static void InstallHudHook(int mode, unsigned int virtualHeight)
+static void InstallHudHook(unsigned int virtualHeight)
 {
     HMODULE        mod;
     unsigned char *code = NULL;
     unsigned int   codeSize = 0, i;
     int            hudWidth, delta, offSpread, offCentre;
 
-    if (mode <= 0) return;
     if (virtualHeight < 120) virtualHeight = 120;
 
     mod = GetModuleHandleA(NULL);
@@ -881,49 +880,21 @@ static void InstallHudHook(int mode, unsigned int virtualHeight)
 // screen -- W*virtual_height/H, 1137 at 2560x1080 -- re-centres centred text on
 // the real screen and pushes right-anchored text to the real edge.
 //
-// This is known to work: an earlier build rewrote all 15 at once and the ESC
-// quit prompt and the area-name text both came out correctly centred.  The
-// reason it was reverted is that the same sweep also hit whatever the
-// world-anchored crash popup uses, dragging it off position, and left the
-// area-name frame behind so frame and text disagreed.
+// Only the sites actually needed are listed below.  The module has 15 such
+// constants; an early build rewrote all 15 at once, which fixed the ESC prompt
+// and the area-name text but also dragged the world-anchored crash popup off
+// position and left the area-name frame behind, so frame and text disagreed.
+// The sweep was right in kind and wrong in scope.
 //
-// So the sweep was right in kind and wrong in scope.  Each site is now
-// selectable by bit, so a single element can be fixed without touching the
-// rest, and a site that misbehaves can be dropped without losing the others.
-//
-//   bit  0  0x5ca685 |
-//   bit  1  0x5ca6e5 |  (640-w)/2 then draw -- a family of three centred-text
-//   bit  2  0x5ca747 |  routines reading the width global 0x700768
-//   bit  3  0x5caad6    clamp: x > 640 -> 640
-//   bit  4  0x5caadd    640 - w
-//   bit  5  0x5cade3    640 - w
-//   bit  6  0x5cb088    push $640
-//   bit  7  0x5cb0f0    640 - w
-//   bit  8  0x5ce4c6 |
-//   bit  9  0x5ce624 |  (640-w)/2 -- a second family of three, working from a
-//   bit 10  0x5ce714 |  rect at esi+0x44/+0x48 (frame-like)
-//   bit 11  0x5cea62    (640-w)/2
-//   bit 12  0x5cf4d1    (640-w)/2
-//   bit 13  0x5cf578    640-a-b   right-anchored
-//   bit 14  0x5cf5ce    (640-w)/2
-//
-// Every signature below is unique image-wide, and the 32-bit immediate is at
-// offset 1 in all of them (they are all `mov reg,imm32` / `push imm32` /
-// `cmp eax,imm32`).
-//
+// The eight that were never needed have been dropped rather than left switchable
+// -- they are recorded in git history and in CLAUDE.md if one is ever wanted.
+// The mission title went with them: its site (0x5cf426) never executes, and the
+// title is handled by the HUD caller table at 0x5caede instead.
 //
 // Two kinds of constant appear here:
 //
 //   WIDTH  -- a 640 used as the layout width, e.g. `(640-w)/2` or `640-w`.
 //             Becomes the virtual width that fills the screen: W*vh/H = 1137.
-//   CENTRE -- a 320 pushed directly as a centre point.  Becomes half of that,
-//             568, which lands at screen x 1278 against a true centre of 1280.
-//
-// The mission title is the CENTRE case and is why it resisted every earlier
-// probe: it is not laid out from a width at all, so none of the 640 bits could
-// ever have moved it.  Measuring it off a screenshot (virtual centre 319,
-// y 114..165) matched `push $0x140 / push $0x88` = (320, 136) exactly.
-//
 //   WIDTH_FX -- the same layout width, but already in 16.14 (640<<14 =
 //             0xa00000) because the site works in fixed point throughout.
 //             Becomes vw<<14.  Scanning for plain 640 could never have found
@@ -936,10 +907,9 @@ static void InstallHudHook(int mode, unsigned int virtualHeight)
 //              size.  See the score-popup notes on bits 17/18 below.
 //
 #define MSG_WIDTH      0
-#define MSG_CENTRE     1
-#define MSG_WIDTH_FX   2
-#define MSG_SCREENW_FX 3
-#define MSG_SCREENH_FX 4
+#define MSG_WIDTH_FX   1
+#define MSG_SCREENW_FX 2
+#define MSG_SCREENH_FX 3
 
 struct MsgSite {
     const char   *note;
@@ -953,27 +923,10 @@ static const MsgSite g_msgSites[] = {
  { "0x5ca685", MSG_WIDTH, 1, 18, {0xb8,0x80,0x02,0x00,0x00,0x51,0x2b,0xc5,0x8b,0xcc,0x99,0x2b,0xc2,0xd1,0xf8,0x50,0xe8,0xf6} },
  { "0x5ca6e5", MSG_WIDTH, 1, 18, {0xb8,0x80,0x02,0x00,0x00,0x51,0x2b,0xc5,0x8b,0xcc,0x99,0x2b,0xc2,0xd1,0xf8,0x50,0xe8,0x96} },
  { "0x5ca747", MSG_WIDTH, 1, 18, {0xb8,0x80,0x02,0x00,0x00,0x51,0x2b,0xc5,0x8b,0xcc,0x99,0x2b,0xc2,0xd1,0xf8,0x50,0xe8,0x34} },
- { "0x5caad6", MSG_WIDTH, 1, 5, {0x3d,0x80,0x02,0x00,0x00} },
- { "0x5caadd", MSG_WIDTH, 1, 5, {0xbe,0x80,0x02,0x00,0x00} },
- { "0x5cade3", MSG_WIDTH, 1, 6, {0xb9,0x80,0x02,0x00,0x00,0x2b} },
- { "0x5cb088", MSG_WIDTH, 1, 6, {0x68,0x80,0x02,0x00,0x00,0x66} },
- { "0x5cb0f0", MSG_WIDTH, 1, 5, {0xba,0x80,0x02,0x00,0x00} },
  { "0x5ce4c6", MSG_WIDTH, 1, 18, {0xb8,0x80,0x02,0x00,0x00,0x2b,0xc2,0x51,0x99,0x2b,0xc2,0x8b,0xcc,0xd1,0xf8,0x50,0xe8,0xb5} },
  { "0x5ce624", MSG_WIDTH, 1, 18, {0xb8,0x80,0x02,0x00,0x00,0x2b,0xc2,0x51,0x99,0x2b,0xc2,0x8b,0xcc,0xd1,0xf8,0x50,0xe8,0x57} },
  { "0x5ce714", MSG_WIDTH, 1, 18, {0xb8,0x80,0x02,0x00,0x00,0x2b,0xc2,0x51,0x99,0x2b,0xc2,0x8b,0xcc,0xd1,0xf8,0x50,0xe8,0x67} },
  { "0x5cea62", MSG_WIDTH, 1, 7, {0xb8,0x80,0x02,0x00,0x00,0x2b,0xc1} },
- { "0x5cf4d1", MSG_WIDTH, 1, 8, {0xb8,0x80,0x02,0x00,0x00,0x51,0x2b,0xc3} },
- { "0x5cf578", MSG_WIDTH, 1, 6, {0xb8,0x80,0x02,0x00,0x00,0x83} },
- { "0x5cf5ce", MSG_WIDTH, 1, 7, {0xb8,0x80,0x02,0x00,0x00,0x2b,0xc7} },
-
- /* bit 15 -- mission title ("TUTORIAL!").  A CENTRE point, not a width, which
-    is why none of the 640 bits could ever have moved it:
-        5cf426  push $0x140   x = 320   <- this
-        5cf430  push $0x88    y = 136
-    Measured off a screenshot the title spans virtual x 199..438, centre 319,
-    at y 114..165 -- (320,136) exactly. */
- { "0x5cf426", MSG_CENTRE, 1, 13,
-   {0x68,0x40,0x01,0x00,0x00, 0xe8,0x60,0x62,0xe6,0xff, 0x68,0x88,0x00} },
 
  /* bit 16 -- wanted-level icons.  A repeated-icon widget centred against a
     hardcoded 640, at the head of its drawing function:
@@ -1035,8 +988,6 @@ static const MsgSite g_msgSites[] = {
    {0x81,0xfd,0x00,0x00,0x78,0x00, 0x7f,0x45} },
 };
 
-#define MSG_IMM_AT 1        /* the imm32 sits at offset 1 in every signature */
-
 //
 // Score popup ("+50" on a kill or a crash) -- scale its position.
 //
@@ -1095,14 +1046,12 @@ static unsigned char popup_stub[] = {
 };
 #define POPUP_JMP_AT 41
 
-static void InstallPopupScale(unsigned int on)
+static void InstallPopupScale(void)
 {
     HMODULE        mod;
     unsigned char *code = NULL, *at, *stub, *target, call[5];
     unsigned int   codeSize = 0;
     int            rel;
-
-    if (!on) return;
 
     mod = GetModuleHandleA(NULL);
     if (!mod) return;
@@ -1135,14 +1084,13 @@ static void InstallPopupScale(unsigned int on)
         VirtualFree(stub, 0, MEM_RELEASE);
 }
 
-static void ApplyMsgSites(unsigned int mask, unsigned int virtualHeight)
+static void ApplyMsgSites(unsigned int virtualHeight)
 {
     HMODULE        mod;
     unsigned char *code = NULL;
     unsigned int   codeSize = 0, i;
     int            vw;
 
-    if (!mask) return;
     if (virtualHeight < 120) virtualHeight = 120;
 
     mod = GetModuleHandleA(NULL);
@@ -1155,362 +1103,18 @@ static void ApplyMsgSites(unsigned int mask, unsigned int virtualHeight)
     for (i = 0; i < sizeof(g_msgSites) / sizeof(g_msgSites[0]); i++) {
         unsigned char *at;
 
-        if (!(mask & (1u << i))) continue;
-
         int val;
 
         at = FindUnique(code, codeSize, g_msgSites[i].sig, g_msgSites[i].sigLen);
         if (!at) continue;
 
         switch (g_msgSites[i].kind) {
-        case MSG_CENTRE:      val = vw / 2;                break;
         case MSG_WIDTH_FX:    val = vw << 14;              break;
         case MSG_SCREENW_FX:  val = GTA2_TARGET_W << 14;   break;
         case MSG_SCREENH_FX:  val = GTA2_TARGET_H << 14;   break;
         default:              val = vw;                    break;
         }
         WriteCode(at + g_msgSites[i].immAt, (const unsigned char *)&val, 4);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// 6. DIAGNOSTIC -- TEMPORARY, remove once the caller map is complete
-// ---------------------------------------------------------------------------
-//
-// Every element is identified by which call site feeds the transform, so what
-// is needed is a complete caller -> x map.  Guessing at individual callers has
-// now cost two hardware runs, so this produces the whole map in one.
-//
-// The earlier version of this failed for a mundane reason worth recording: it
-// recorded every call, and the HUD emits ~1200 records per frame, so the buffer
-// filled long before any transient element appeared.  Deduplicating by caller
-// fixes that completely -- each distinct call site contributes a handful of
-// records, so a full map fits easily and rare events are never crowded out.
-//
-// Hooked at `mov 0x66fce0,%ebx` in each transform's prologue: no stack side
-// effects, so the stub runs the displaced instruction verbatim.  Both functions
-// begin `push %ebx`, so the caller's return address is at a known slot.
-//
-#define DIAG_MAX_CALLERS 192
-#define DIAG_PER_CALLER   4     /* distinct x rows kept per (site,caller) */
-
-struct DiagEnt {
-    DWORD site, caller, x, y, hits;
-};
-
-//
-// Sites 0-3 are the four copies of the coordinate transform.  Sites 4 and 5
-// are the two shared DRAW entries, added because three consecutive captures
-// showed the score popup on none of the transforms -- it is drawn from an
-// inlined transform in the sprite region, exactly as the wanted-level icons
-// were.  Everything drawn has to pass through one of these two, so this is the
-// instrument that cannot have a blind spot:
-//
-//   0x5d19f0  15 call sites   (sprite region + transforms 0x5d06f0/0x5d0778)
-//   0x5d0e90   9 call sites   (incl. 0x5c89f5, the world-anchored path)
-//
-// Both are hooked past their prologue at `mov 0x38(%esp),%eax`, which has no
-// stack side effect so the displaced bytes can run verbatim before the stub
-// returns.  Hooking the true entry is not possible for either: 0x5d19f0 opens
-// with `sub $0x14,%esp` and 0x5d0e90 with an SEH frame setup, and displacing
-// instructions that move esp would leave `ret` popping the wrong slot.
-//
-// The slot numbers follow from that prologue.  For 0x5d19f0, esp at the hook
-// is E-0x18 (E = entry esp, holding the return address) and our call pushes 4
-// more, so the caller sits at stk[7] and arguments follow from stk[8].  For
-// 0x5d0e90 the SEH setup plus `sub $0x24` puts esp at E-0x30, giving stk[13].
-//
-struct DiagSiteDef {
-    const unsigned char *sig;
-    unsigned int         sigLen;
-    unsigned int         dispLen;      /* bytes displaced, >= 5 */
-    unsigned char        callerSlot, xSlot, ySlot;
-};
-
-//
-// REVERTED TO FOUR SITES -- the two draw-entry hooks corrupted the UI.
-//
-// Cause, worth recording because it is a trap for any future hook here: the
-// displaced bytes at both draw entries are ESP-RELATIVE
-// (`mov 0x38(%esp),%eax`), and the stub runs them with esp 4 lower than the
-// original site saw, because our own `call` pushed a return address.  So they
-// read one slot off and the draw functions got wrong arguments.  Sites 0-3
-// displace `mov 0x66fce0,%ebx`, which is absolute -- which is the only reason
-// they have always been safe.
-//
-// Reinstating them means ending the stub with `add $4,%esp` ... `jmp back`
-// instead of `ret`, so esp matches at the displaced bytes; every slot index
-// then shifts by one.  (Site 4's index was also simply wrong: esp at 0x5d19f3
-// is E-0x14, not E-0x18, so its caller was stk[6] and it logged a garbage
-// address.  Site 5's indices were correct and its data is good.)
-//
-// Not rebuilt that way because the one capture taken before the revert already
-// gave the answer: 0x591f7a and 0x5c9e18 are the world-anchored drawers.
-//
-#define DIAG_NSITES 4
-
-static const unsigned char diag_sig0[] = {          /* 0x4932c1 */
-    0x8b,0x1d,0xe0,0xfc,0x66,0x00, 0x55,0x56, 0x8b,0x83,0xa8,0x00,0x00,0x00,
-    0x57,0x99, 0x8b,0xf0, 0x8b,0x44,0x24,0x1c, 0x8b,0xfa,0x99,0x57,0x56,0x52,
-    0x50,0xe8,0xfd };
-static const unsigned char diag_sig1[] = {          /* 0x5d0641 */
-    0x8b,0x1d,0xe0,0xfc,0x66,0x00, 0x55,0x56, 0x8b,0x83,0xa8,0x00,0x00,0x00,
-    0x57,0x99, 0x8b,0xf0, 0x8b,0x44,0x24,0x20 };
-//
-// The transform is duplicated FOUR times.  Only the first two were ever in the
-// dedup diagnostic; these two were probed once, during ordinary gameplay with
-// no mission title on screen, and read as silent.  That is not evidence -- it
-// is the same "wrong moment" error that lost two earlier captures.
-//
-static const unsigned char diag_sig2[] = {          /* 0x5d06f1 */
-    0x8b,0x1d,0xe0,0xfc,0x66,0x00, 0x55,0x56, 0x8b,0x83,0xa8,0x00,0x00,0x00,
-    0x57,0x99, 0x8b,0xf0, 0x8b,0x44,0x24,0x1c, 0x8b,0xfa,0x99,0x57,0x56,0x52,
-    0x50,0xe8,0xcd };
-static const unsigned char diag_sig3[] = {          /* 0x5d0772 */
-    0x8b,0x1d,0xe0,0xfc,0x66,0x00, 0xc7 };
-
-static const struct DiagSiteDef g_diagSites[DIAG_NSITES] = {
-    { diag_sig0, sizeof(diag_sig0), 6,  2,  4,  5 },
-    { diag_sig1, sizeof(diag_sig1), 6,  2,  5,  6 },
-    { diag_sig2, sizeof(diag_sig2), 6,  2,  4,  5 },
-    { diag_sig3, sizeof(diag_sig3), 6,  2,  4,  5 },
-};
-
-static DiagEnt      g_diagEnt[DIAG_MAX_CALLERS];
-static unsigned int g_diagEnts = 0;
-//
-// Key-triggered capture: INSERT starts, DELETE stops and writes.
-//
-// A frame countdown from launch was always the wrong control for this.  The
-// elements worth catching are transient -- a mission title, a quit prompt --
-// and the window had to cover loading, reaching the trigger, AND the element
-// being on screen.  Two captures were lost that way and read as "this element
-// does not use these paths", which was never what they showed.  Triggering by
-// hand removes the guesswork entirely.
-//
-// g_diagArmed is set by diag=1; recording only runs between the keypresses, so
-// the table holds exactly the frames of interest.  Pressing INSERT again starts
-// a fresh capture, so several can be taken in one session.
-//
-// GetAsyncKeyState is polled once per frame from grBufferSwap.  It reads
-// hardware state rather than the message queue, so it works even though the
-// game owns input.  It lives in user32 and is ANSI-only -- no *W variant to
-// worry about on Win9x.
-//
-static unsigned int g_diagFrames = 0, g_diagGoal = 0;
-static BOOL         g_diagDone  = FALSE;
-static BOOL         g_diagArmed = FALSE;   // diag=1 in the ini
-static BOOL         g_diagRec   = FALSE;   // between INSERT and DELETE
-
-static void DiagFlush(void);
-
-//
-// regs: [0]=eflags then pushad order in memory: edi,esi,ebp,esp,ebx,edx,ecx,eax
-//
-static void __cdecl DiagLog(unsigned int site, const DWORD *regs)
-{
-    const DWORD *stk;
-    DWORD caller, x, y;
-    unsigned int i;
-
-    if (!g_diagRec) return;                /* only between INSERT and DELETE */
-
-    if (site >= DIAG_NSITES) return;
-
-    stk = (const DWORD *)regs[4];          /* esp as the hooked site saw it */
-    if (IsBadReadPtr(stk, 96)) return;
-
-    //
-    // Slots are per-site and spelled out in g_diagSites rather than derived.
-    // They differ for two independent reasons: the transform copies read X
-    // from different argument positions (0x5d0640 uses arg3, the others arg1),
-    // and the two draw entries are hooked several instructions in, past a
-    // prologue that has already moved esp.  Guessing here once made site 2's
-    // capture read as nonsense (y = 5312).
-    //
-    caller = stk[g_diagSites[site].callerSlot];
-    x      = stk[g_diagSites[site].xSlot];
-    y      = stk[g_diagSites[site].ySlot];
-
-    //
-    // Dedup on POSITION as well as caller.
-    //
-    // Keying on the caller alone hid things: one call site can draw several
-    // distinct elements, and only the first few samples were kept, so extra
-    // elements from a known caller were invisible.  Including x makes every
-    // distinct position its own row, which is what actually identifies an
-    // element.  Rounding to whole virtual units keeps a moving element from
-    // filling the table with near-identical rows.
-    //
-    // Bounded so a long string cannot flood the table: the draw entries see one
-    // call per glyph, each at its own x, and 24 call sites of that would fill
-    // any buffer before a transient event appeared.  Past DIAG_PER_CALLER
-    // distinct positions the caller is already identified, so further ones only
-    // bump a counter.
-    {
-        unsigned int same = 0;
-        int          last = -1;
-
-        for (i = 0; i < g_diagEnts; i++) {
-            if (g_diagEnt[i].site != site || g_diagEnt[i].caller != caller)
-                continue;
-            if ((g_diagEnt[i].x >> 14) == (x >> 14)) {
-                g_diagEnt[i].hits++;
-                return;
-            }
-            same++;
-            last = (int)i;
-        }
-        if (same >= DIAG_PER_CALLER) {
-            if (last >= 0) g_diagEnt[last].hits++;
-            return;
-        }
-    }
-    if (g_diagEnts >= DIAG_MAX_CALLERS) return;
-    g_diagEnt[g_diagEnts].site   = site;
-    g_diagEnt[g_diagEnts].caller = caller;
-    g_diagEnt[g_diagEnts].x      = x;
-    g_diagEnt[g_diagEnts].y      = y;
-    g_diagEnt[g_diagEnts].hits   = 1;
-    g_diagEnts++;
-}
-
-static void DiagFlush(void)
-{
-    char   path[MAX_PATH], line[256];
-    HANDLE f;
-    DWORD  done;
-    unsigned int i;
-
-    /* Written once per DELETE press; a repeat capture overwrites the file. */
-    g_diagDone = TRUE;
-
-    if (!PathBesideExe("wideDriver_diag.txt", path)) return;
-    f = CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
-                    FILE_ATTRIBUTE_NORMAL, NULL);
-    if (f == INVALID_HANDLE_VALUE) return;
-
-    i = (unsigned int)wsprintfA(line, "callers=%lu\r\nsite caller x y hits\r\n",
-                                (unsigned long)g_diagEnts);
-    WriteFile(f, line, i, &done, NULL);
-
-    for (i = 0; i < g_diagEnts; i++) {
-        int n = wsprintfA(line, "%lu %08lx %08lx %08lx %lu\r\n",
-                          (unsigned long)g_diagEnt[i].site,
-                          (unsigned long)g_diagEnt[i].caller,
-                          (unsigned long)g_diagEnt[i].x,
-                          (unsigned long)g_diagEnt[i].y,
-                          (unsigned long)g_diagEnt[i].hits);
-        WriteFile(f, line, n, &done, NULL);
-    }
-    CloseHandle(f);
-}
-
-//
-// Stub prologue.  The displaced bytes are appended per site, followed by ret,
-// so one template serves both the 6-byte transform hooks and the 8-byte draw
-// hooks.  Every displaced sequence must be free of stack side effects: the
-// stub runs them after popad and then rets, so anything that moves esp would
-// leave `ret` popping the wrong slot.
-//
-static const unsigned char diag_stub_tmpl[] = {
-    0x60,                       /* pushad                       */
-    0x9c,                       /* pushfd                       */
-    0x54,                       /* push %esp                    */
-    0x6a, 0x00,                 /* push $site      (imm8 at 4)  */
-    0xe8, 0,0,0,0,              /* call DiagLog    (rel32 at 6) */
-    0x83, 0xc4, 0x08,           /* add  $8,%esp                 */
-    0x9d,                       /* popfd                        */
-    0x61                        /* popad                        */
-};
-#define DIAG_ID_AT   4
-#define DIAG_REL_AT  6
-#define DIAG_DISP_AT sizeof(diag_stub_tmpl)
-#define DIAG_MAX_DISP 8
-
-void GameFix_DiagTick(void)
-{
-    static BOOL insPrev = FALSE, delPrev = FALSE;
-    BOOL ins, del;
-
-    if (!g_diagArmed) return;
-
-    ins = (GetAsyncKeyState(VK_INSERT) & 0x8000) != 0;
-    del = (GetAsyncKeyState(VK_DELETE) & 0x8000) != 0;
-
-    /* Rising edges only, so holding a key does not retrigger. */
-    if (ins && !insPrev) {
-        g_diagEnts  = 0;               /* fresh capture */
-        g_diagFrames = 0;
-        g_diagDone  = FALSE;
-        g_diagRec   = TRUE;
-    } else if (del && !delPrev) {
-        if (g_diagRec) {
-            g_diagRec = FALSE;
-            DiagFlush();
-        }
-    } else if (g_diagRec && g_diagGoal && ++g_diagFrames >= g_diagGoal) {
-        //
-        // Safety net.  If the keys turn out not to reach us -- the game owns
-        // input and this is a 1999 title on Win9x -- a capture would otherwise
-        // run forever and never produce a file, which is the failure mode that
-        // has already cost two runs.  diag_frames=0 disables this.
-        //
-        g_diagRec = FALSE;
-        DiagFlush();
-    }
-
-    insPrev = ins;
-    delPrev = del;
-}
-
-static void InstallDiag(unsigned int on, unsigned int frames)
-{
-    HMODULE        mod;
-    unsigned char *code = NULL;
-    unsigned int   codeSize = 0, i;
-
-    if (!on) return;
-    g_diagArmed = TRUE;
-    g_diagGoal  = frames;          /* 0 = no safety flush, keys only */
-
-    mod = GetModuleHandleA(NULL);
-    if (!mod) return;
-    if (!GetCodeRange(mod, &code, &codeSize)) return;
-
-    for (i = 0; i < DIAG_NSITES; i++) {
-        const struct DiagSiteDef *s = &g_diagSites[i];
-        unsigned char *at, *stub, call[DIAG_MAX_DISP];
-        unsigned int   n;
-        int            rel;
-
-        if (s->dispLen < 5 || s->dispLen > DIAG_MAX_DISP) continue;
-
-        at = FindUnique(code, codeSize, s->sig, s->sigLen);
-        if (!at) continue;
-
-        stub = (unsigned char *)VirtualAlloc(NULL,
-                                             DIAG_DISP_AT + s->dispLen + 1,
-                                             MEM_COMMIT | MEM_RESERVE,
-                                             PAGE_EXECUTE_READWRITE);
-        if (!stub) continue;
-
-        memcpy(stub, diag_stub_tmpl, DIAG_DISP_AT);
-        stub[DIAG_ID_AT] = (unsigned char)i;
-        rel = (int)((unsigned char *)&DiagLog - (stub + DIAG_REL_AT + 4));
-        memcpy(stub + DIAG_REL_AT, &rel, 4);
-
-        /* displaced original bytes, then return past them */
-        memcpy(stub + DIAG_DISP_AT, at, s->dispLen);
-        stub[DIAG_DISP_AT + s->dispLen] = 0xc3;
-
-        rel = (int)(stub - (at + 5));
-        call[0] = 0xe8;
-        memcpy(call + 1, &rel, 4);
-        for (n = 5; n < s->dispLen; n++) call[n] = 0x90;
-
-        if (!WriteCode(at, call, s->dispLen))
-            VirtualFree(stub, 0, MEM_RELEASE);
     }
 }
 
@@ -1549,28 +1153,19 @@ void GameFix_Apply(void)
     }
 
     //
-    // HUD horizontal placement.  Same reason it is not a BytePatch: the stub
-    // holds a runtime-allocated caller table.
+    // UI placement.  These three are unconditional rather than ini toggles:
+    // each is a plain correctness fix -- put the element where it belongs --
+    // and there is no configuration in which leaving it wrong is wanted.  They
+    // are not BytePatches because their stubs hold runtime-allocated tables.
     //
-    if (haveIni &&
-        (PathEndsWith(exePath, "gta2.exe") || PathEndsWith(exePath, "gta2.icd")))
-    {
-        InstallHudHook((int)GetPrivateProfileIntA("GTA2", "hud_mode", 0, ini),
-                       vh);
-
-        // Score popup position scaling.  Needs msg_sites bits 17/18 as well:
-        // once the position is in real pixels the 640x480 cull becomes real,
-        // and would drop every popup outside the top-left corner.
-        InstallPopupScale(
-            (unsigned int)GetPrivateProfileIntA("GTA2", "popup_fix", 0, ini));
-
-        // Message text: one bit per layout site, see section 5.
-        ApplyMsgSites(
-            (unsigned int)GetPrivateProfileIntA("GTA2", "msg_sites", 0, ini), vh);
-
-        // TEMPORARY caller map -- see section 6.  Off unless diag=1.
-        InstallDiag(
-            (unsigned int)GetPrivateProfileIntA("GTA2", "diag",        0,   ini),
-            (unsigned int)GetPrivateProfileIntA("GTA2", "diag_frames", 600, ini));
+    // They are also a set.  The popup fix converts the score popup's position
+    // to real pixels, which only works because ApplyMsgSites has raised the
+    // 640x480 visibility cull to the real screen size; enabling one without the
+    // other would drop every popup outside the top-left corner.
+    //
+    if (PathEndsWith(exePath, "gta2.exe") || PathEndsWith(exePath, "gta2.icd")) {
+        InstallHudHook(vh);
+        InstallPopupScale();
+        ApplyMsgSites(vh);
     }
 }
