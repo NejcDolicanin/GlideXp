@@ -65,10 +65,32 @@ struct GameProfile {
 // The configuration file, read from beside the host exe.
 #define GAMEFIX_INI "wideDriver.ini"
 
-// Target resolution.  The DMAGlide bytes below encode it literally, so these
-// two must agree with them.
-#define GTA2_TARGET_W 2560
-#define GTA2_TARGET_H 1080
+//
+// Target resolution -- taken from the driver, not hardcoded.
+//
+// The wide driver's own "Glide Override Resolution" setting is the single
+// source of truth: whatever the user picked there is what the screen will
+// actually be, so it is what every calculation here has to agree with.  It is
+// read through the driver's own lookup (see GameFix_SetResolutionEnum) rather
+// than by reimplementing the registry path.
+//
+// 640x480 is the default because it makes every fix below inert:
+//
+//   vw    = W*vh/H  = 640    -> msg_sites rewrite 640 to 640, a no-op
+//   delta = W - 640*scale    = 0, so the HUD moves nowhere
+//   the popup's scale        = 1.0, so its position is unchanged
+//
+// So with the override disabled the game behaves exactly as it always did,
+// without needing a switch anywhere.  The one exception is the DMAGlide mode
+// list, which is skipped outright -- rewriting 800x600 to 640x480 would lose a
+// mode rather than add one.
+//
+static unsigned int g_targetW   = 640;
+static unsigned int g_targetH   = 480;
+static unsigned int g_targetRes = 0;      /* Glide enum; 0 = no override */
+
+#define GTA2_TARGET_W ((int)g_targetW)
+#define GTA2_TARGET_H ((int)g_targetH)
 
 
 // ---------------------------------------------------------------------------
@@ -110,12 +132,18 @@ static const unsigned char gta2_mode_find[] = {
     0x56,                           // push %esi
     0xe8                            // call
 };
-static const unsigned char gta2_mode_replace[] = {
-    0x68, 0x38, 0x04, 0x00, 0x00,   // push $0x438   (1080)
-    0x68, 0x00, 0x0a, 0x00, 0x00,   // push $0xa00   (2560)
+//
+// Built at runtime from the driver's resolution -- the immediates below are
+// only placeholders.  Offsets: height at [1], width at [6].
+//
+static unsigned char gta2_mode_replace[] = {
+    0x68, 0x38, 0x04, 0x00, 0x00,   // push $height
+    0x68, 0x00, 0x0a, 0x00, 0x00,   // push $width
     0x56,
     0xe8
 };
+#define MODE_H_AT 1
+#define MODE_W_AT 6
 
 //
 // B) the (width,height) -> Glide enum arm @0x10010ca.  The two jne
@@ -129,13 +157,95 @@ static const unsigned char gta2_enum_find[] = {
     0x75, 0x0b,
     0xc7, 0x40, 0x3c, 0x08, 0x00, 0x00, 0x00   // movl $0x8,0x3c(%eax)
 };
-static const unsigned char gta2_enum_replace[] = {
-    0x81, 0xf9, 0x00, 0x0a, 0x00, 0x00,        // cmp  $0xa00,%ecx    (2560)
+//
+// Also built at runtime.  The two jne displacements stay as they are: the
+// replacement is the same length, so no branch target has moved.
+// Offsets: width at [2], height at [10], Glide enum at [19].
+//
+static unsigned char gta2_enum_replace[] = {
+    0x81, 0xf9, 0x00, 0x0a, 0x00, 0x00,        // cmp  $width,%ecx
     0x75, 0x13,
-    0x81, 0xfe, 0x38, 0x04, 0x00, 0x00,        // cmp  $0x438,%esi    (1080)
+    0x81, 0xfe, 0x38, 0x04, 0x00, 0x00,        // cmp  $height,%esi
     0x75, 0x0b,
-    0xc7, 0x40, 0x3c, 0x26, 0x00, 0x00, 0x00   // movl $0x26  (2560x1080)
+    0xc7, 0x40, 0x3c, 0x26, 0x00, 0x00, 0x00   // movl $enum,0x3c(%eax)
 };
+#define ENUM_W_AT    2
+#define ENUM_H_AT   10
+#define ENUM_RES_AT 19
+
+//
+// Glide resolution enum -> pixels.
+//
+// Mirrors _resTable in glide3x/h5/glide3/src/gsst.c, which the driver indexes
+// by the enum directly (`_resTable[resolution].xres`), so the enum IS the
+// index.  Only the modes the wide driver offers in its "Glide Override
+// Resolution" list are listed -- the stock 0x00-0x17 range is deliberately
+// absent, since selecting one of those is not a widescreen case and needs no
+// patching.  The values match the driver's Tweak Map one for one.
+//
+struct GlideRes {
+    unsigned char res;
+    unsigned short w, h;
+};
+
+/* Little-endian store, so the byte tables above stay readable as x86. */
+static void PutU32(unsigned char *at, unsigned int v)
+{
+    at[0] = (unsigned char)(v      );
+    at[1] = (unsigned char)(v >>  8);
+    at[2] = (unsigned char)(v >> 16);
+    at[3] = (unsigned char)(v >> 24);
+}
+
+static const GlideRes g_glideRes[] = {
+    { 0x0c, 1024,  768 },
+    { 0x0d, 1280, 1024 },
+    { 0x0e, 1600, 1200 },
+    { 0x18, 1280,  720 },
+    { 0x19, 1280,  800 },
+    { 0x1a, 1360,  768 },
+    { 0x1b, 1440,  900 },
+    { 0x1c, 1600,  900 },
+    { 0x1d, 1680,  720 },
+    { 0x1e, 1680, 1050 },
+    { 0x1f, 1792,  768 },
+    { 0x20, 1920,  800 },
+    { 0x21, 1920, 1080 },
+    { 0x22, 1920, 1200 },
+    { 0x23, 1960,  840 },
+    { 0x24, 2096,  900 },
+    { 0x25, 2304,  960 },
+    { 0x26, 2560, 1080 },
+};
+
+int GameFix_SetResolutionEnum(unsigned int glideEnum)
+{
+    unsigned int i;
+
+    //
+    // The driver ignores anything <= 1 (gsst.c:1558 tests `> 1`), which is how
+    // "Disabled" is expressed, so we must treat those the same way or we would
+    // patch the game for a resolution the driver is not going to set.
+    //
+    if (glideEnum <= 1) return 0;
+
+    for (i = 0; i < sizeof(g_glideRes) / sizeof(g_glideRes[0]); i++) {
+        if (g_glideRes[i].res != glideEnum) continue;
+
+        g_targetW   = g_glideRes[i].w;
+        g_targetH   = g_glideRes[i].h;
+        g_targetRes = glideEnum;
+
+        /* Bake the chosen mode into the DMAGlide replacement bytes. */
+        PutU32(gta2_mode_replace + MODE_H_AT,  g_targetH);
+        PutU32(gta2_mode_replace + MODE_W_AT,  g_targetW);
+        PutU32(gta2_enum_replace + ENUM_W_AT,  g_targetW);
+        PutU32(gta2_enum_replace + ENUM_H_AT,  g_targetH);
+        PutU32(gta2_enum_replace + ENUM_RES_AT, g_targetRes);
+        return 1;
+    }
+    return 0;
+}
 
 static const BytePatch gta2_dmaglide_patches[] = {
     { "advertised mode 800x600 -> 2560x1080",
@@ -1126,6 +1236,25 @@ void GameFix_Apply(void)
     unsigned int i, vh = GTA2_VHEIGHT_DEFAULT;
     BOOL         haveIni;
 
+    //
+    // Nothing is patched until the target resolution is known.
+    //
+    // Two reasons, and the second is a real hazard rather than tidiness:
+    //
+    //  - With the override disabled there is nothing to fix.  The game runs at
+    //    a mode it was designed for, so it should be left completely alone
+    //    rather than patched with values that merely happen to be inert.
+    //
+    //  - GameFix_Apply is also called from DLL_PROCESS_ATTACH, which happens
+    //    long before glide3x is loaded and the resolution can be read.  Without
+    //    this test that early call would bake 640x480-derived constants into
+    //    the image AND consume the `find` patterns, so the later, correct call
+    //    from grGlideInit would find nothing left to patch and silently leave
+    //    the wrong values in place.  Idempotency protects against applying a
+    //    patch twice; it cannot protect against applying the wrong one first.
+    //
+    if (!g_targetRes) return;
+
     exePath[0] = '\0';
     len = GetModuleFileNameA(NULL, exePath, MAX_PATH);
     if (len == 0 || len >= MAX_PATH) return;
@@ -1135,8 +1264,9 @@ void GameFix_Apply(void)
         vh = ReadVirtualHeight(ini);
 
     for (i = 0; i < g_profileCount; i++) {
-        if (PathEndsWith(exePath, g_profiles[i].exeName))
-            ApplyProfile(&g_profiles[i]);
+        if (!PathEndsWith(exePath, g_profiles[i].exeName)) continue;
+
+        ApplyProfile(&g_profiles[i]);
     }
 
     //

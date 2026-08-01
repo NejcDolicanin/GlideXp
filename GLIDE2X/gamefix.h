@@ -26,6 +26,24 @@ extern "C" {
 // far better outcome than one that refuses to start.
 void GameFix_Apply(void);
 
+// Tell gamefix which resolution the screen will actually be, as a Glide
+// resolution enum (GR_RESOLUTION_*).  Call BEFORE GameFix_Apply.
+//
+// The wide driver's "Glide Override Resolution" setting is the single source of
+// truth for this: whatever is selected there is what the driver will force, so
+// it is what the game's projection, HUD layout and mode list all have to agree
+// with.  Hardcoding a resolution here would silently disagree with the driver
+// the moment the setting changed.
+//
+// Values <= 1 mean "Disabled" and are rejected, matching the driver's own test
+// (`glideResOverride > 1`, gsst.c:1558).  Enums outside the wide driver's list
+// are rejected too.
+//
+// Returns non-zero if the resolution was recognised and adopted.  On failure
+// the target stays 640x480, which leaves every fix inert -- the game then runs
+// exactly as it would unpatched.
+int GameFix_SetResolutionEnum(unsigned int glideEnum);
+
 #ifdef __cplusplus
 }
 #endif

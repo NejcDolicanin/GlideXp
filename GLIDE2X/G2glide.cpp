@@ -83,6 +83,31 @@ void FX_CALL grGlideInit( void )
 	//
 	// GameFix_Apply is idempotent, so the DllMain call staying in place costs
 	// nothing on platforms where it does work.
+	//
+	// Before that, tell it which resolution the screen is actually going to be.
+	//
+	// We ask the DRIVER rather than deciding for ourselves.  glide3x reads
+	// FX_GLIDE_OVERRIDE_RESOLUTION in gpci.c:1439 and, when it is > 1, forces
+	// that resolution in grSstWinOpen (gsst.c:1558).  So it is the one value
+	// that determines the real screen size, and every per-game fix has to agree
+	// with it or the projection is computed for the wrong screen.
+	//
+	// grGetRegistryOrEnvironmentStringExt is glide3x's own lookup, exported for
+	// exactly this purpose -- its comment says it exists "so the spooky code for
+	// finding the correct registry tweak path in 9x/NT/2K does not have to be
+	// duplicated".  It checks the environment first, then HKCU and HKLM under
+	// the driver's device key, so we read precisely what the driver will read.
+	// Reimplementing that path here would be a second source of truth and would
+	// drift.
+	//
+	// Safe to call now: SetupAllFunctions() above has already resolved it, and
+	// G2misc falls back to plain getenv if the extension is missing.
+	if (Glide3::grGetRegistryOrEnvironmentStringExt) {
+		const char *res =
+			Glide3::grGetRegistryOrEnvironmentStringExt("FX_GLIDE_OVERRIDE_RESOLUTION");
+		if (res) GameFix_SetResolutionEnum((unsigned int)atoi(res));
+	}
+
 	GameFix_Apply();
 
 	Glide3::grGlideInit();
