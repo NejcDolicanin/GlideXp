@@ -877,32 +877,47 @@ static void InstallHudHook(int mode, unsigned int virtualHeight)
 // ever have moved it.  Measuring it off a screenshot (virtual centre 319,
 // y 114..165) matched `push $0x140 / push $0x88` = (320, 136) exactly.
 //
-#define MSG_WIDTH  0
-#define MSG_CENTRE 1
+//   WIDTH_FX -- the same layout width, but already in 16.14 (640<<14 =
+//             0xa00000) because the site works in fixed point throughout.
+//             Becomes vw<<14.  Scanning for plain 640 could never have found
+//             these, which is exactly why the wanted-level icons stayed put
+//             through every earlier msg_sites sweep.
+//
+//   SCREENW_FX / SCREENH_FX
+//           -- not a layout width at all but the ORIGINAL SCREEN SIZE in
+//              16.14, used as a visibility cull.  Becomes the real screen
+//              size.  See the score-popup notes on bits 17/18 below.
+//
+#define MSG_WIDTH      0
+#define MSG_CENTRE     1
+#define MSG_WIDTH_FX   2
+#define MSG_SCREENW_FX 3
+#define MSG_SCREENH_FX 4
 
 struct MsgSite {
     const char   *note;
     unsigned char kind;
+    unsigned char immAt;      /* offset of the imm32 within sig */
     unsigned char sigLen;
     unsigned char sig[18];
 };
 
 static const MsgSite g_msgSites[] = {
- { "0x5ca685", MSG_WIDTH, 18, {0xb8,0x80,0x02,0x00,0x00,0x51,0x2b,0xc5,0x8b,0xcc,0x99,0x2b,0xc2,0xd1,0xf8,0x50,0xe8,0xf6} },
- { "0x5ca6e5", MSG_WIDTH, 18, {0xb8,0x80,0x02,0x00,0x00,0x51,0x2b,0xc5,0x8b,0xcc,0x99,0x2b,0xc2,0xd1,0xf8,0x50,0xe8,0x96} },
- { "0x5ca747", MSG_WIDTH, 18, {0xb8,0x80,0x02,0x00,0x00,0x51,0x2b,0xc5,0x8b,0xcc,0x99,0x2b,0xc2,0xd1,0xf8,0x50,0xe8,0x34} },
- { "0x5caad6", MSG_WIDTH, 5, {0x3d,0x80,0x02,0x00,0x00} },
- { "0x5caadd", MSG_WIDTH, 5, {0xbe,0x80,0x02,0x00,0x00} },
- { "0x5cade3", MSG_WIDTH, 6, {0xb9,0x80,0x02,0x00,0x00,0x2b} },
- { "0x5cb088", MSG_WIDTH, 6, {0x68,0x80,0x02,0x00,0x00,0x66} },
- { "0x5cb0f0", MSG_WIDTH, 5, {0xba,0x80,0x02,0x00,0x00} },
- { "0x5ce4c6", MSG_WIDTH, 18, {0xb8,0x80,0x02,0x00,0x00,0x2b,0xc2,0x51,0x99,0x2b,0xc2,0x8b,0xcc,0xd1,0xf8,0x50,0xe8,0xb5} },
- { "0x5ce624", MSG_WIDTH, 18, {0xb8,0x80,0x02,0x00,0x00,0x2b,0xc2,0x51,0x99,0x2b,0xc2,0x8b,0xcc,0xd1,0xf8,0x50,0xe8,0x57} },
- { "0x5ce714", MSG_WIDTH, 18, {0xb8,0x80,0x02,0x00,0x00,0x2b,0xc2,0x51,0x99,0x2b,0xc2,0x8b,0xcc,0xd1,0xf8,0x50,0xe8,0x67} },
- { "0x5cea62", MSG_WIDTH, 7, {0xb8,0x80,0x02,0x00,0x00,0x2b,0xc1} },
- { "0x5cf4d1", MSG_WIDTH, 8, {0xb8,0x80,0x02,0x00,0x00,0x51,0x2b,0xc3} },
- { "0x5cf578", MSG_WIDTH, 6, {0xb8,0x80,0x02,0x00,0x00,0x83} },
- { "0x5cf5ce", MSG_WIDTH, 7, {0xb8,0x80,0x02,0x00,0x00,0x2b,0xc7} },
+ { "0x5ca685", MSG_WIDTH, 1, 18, {0xb8,0x80,0x02,0x00,0x00,0x51,0x2b,0xc5,0x8b,0xcc,0x99,0x2b,0xc2,0xd1,0xf8,0x50,0xe8,0xf6} },
+ { "0x5ca6e5", MSG_WIDTH, 1, 18, {0xb8,0x80,0x02,0x00,0x00,0x51,0x2b,0xc5,0x8b,0xcc,0x99,0x2b,0xc2,0xd1,0xf8,0x50,0xe8,0x96} },
+ { "0x5ca747", MSG_WIDTH, 1, 18, {0xb8,0x80,0x02,0x00,0x00,0x51,0x2b,0xc5,0x8b,0xcc,0x99,0x2b,0xc2,0xd1,0xf8,0x50,0xe8,0x34} },
+ { "0x5caad6", MSG_WIDTH, 1, 5, {0x3d,0x80,0x02,0x00,0x00} },
+ { "0x5caadd", MSG_WIDTH, 1, 5, {0xbe,0x80,0x02,0x00,0x00} },
+ { "0x5cade3", MSG_WIDTH, 1, 6, {0xb9,0x80,0x02,0x00,0x00,0x2b} },
+ { "0x5cb088", MSG_WIDTH, 1, 6, {0x68,0x80,0x02,0x00,0x00,0x66} },
+ { "0x5cb0f0", MSG_WIDTH, 1, 5, {0xba,0x80,0x02,0x00,0x00} },
+ { "0x5ce4c6", MSG_WIDTH, 1, 18, {0xb8,0x80,0x02,0x00,0x00,0x2b,0xc2,0x51,0x99,0x2b,0xc2,0x8b,0xcc,0xd1,0xf8,0x50,0xe8,0xb5} },
+ { "0x5ce624", MSG_WIDTH, 1, 18, {0xb8,0x80,0x02,0x00,0x00,0x2b,0xc2,0x51,0x99,0x2b,0xc2,0x8b,0xcc,0xd1,0xf8,0x50,0xe8,0x57} },
+ { "0x5ce714", MSG_WIDTH, 1, 18, {0xb8,0x80,0x02,0x00,0x00,0x2b,0xc2,0x51,0x99,0x2b,0xc2,0x8b,0xcc,0xd1,0xf8,0x50,0xe8,0x67} },
+ { "0x5cea62", MSG_WIDTH, 1, 7, {0xb8,0x80,0x02,0x00,0x00,0x2b,0xc1} },
+ { "0x5cf4d1", MSG_WIDTH, 1, 8, {0xb8,0x80,0x02,0x00,0x00,0x51,0x2b,0xc3} },
+ { "0x5cf578", MSG_WIDTH, 1, 6, {0xb8,0x80,0x02,0x00,0x00,0x83} },
+ { "0x5cf5ce", MSG_WIDTH, 1, 7, {0xb8,0x80,0x02,0x00,0x00,0x2b,0xc7} },
 
  /* bit 15 -- mission title ("TUTORIAL!").  A CENTRE point, not a width, which
     is why none of the 640 bits could ever have moved it:
@@ -910,8 +925,67 @@ static const MsgSite g_msgSites[] = {
         5cf430  push $0x88    y = 136
     Measured off a screenshot the title spans virtual x 199..438, centre 319,
     at y 114..165 -- (320,136) exactly. */
- { "0x5cf426", MSG_CENTRE, 13,
+ { "0x5cf426", MSG_CENTRE, 1, 13,
    {0x68,0x40,0x01,0x00,0x00, 0xe8,0x60,0x62,0xe6,0xff, 0x68,0x88,0x00} },
+
+ /* bit 16 -- wanted-level icons.  A repeated-icon widget centred against a
+    hardcoded 640, at the head of its drawing function:
+
+        5c91b0  sub  $0x14,%esp
+        5c91b6  mov  %ecx,%edi            ; this
+        5c91b8  mov  $0xa00000,%eax       ; 640 << 14      <- this
+        5c91c1  mov  0x48(%edi),%ebx      ; icon count
+        5c91c4  mov  0x4c(%edi),%ecx      ; per-icon spacing
+        5c91c7  imul %ebx,%ecx            ; total group width
+        5c91ca  sub  %ecx,%eax            ; 640<<14 - groupWidth
+        5c91e1  sar  %esi                 ; /2   -> centred
+        ...loop  add $0xc,%edi / movzbw (%edi),%dx / push $6
+
+    Invisible to every earlier probe for two independent reasons: the constant
+    is 16.14 rather than plain 640, and the coordinate transform is *inlined*
+    here rather than called, so none of the four transform hooks ever saw it.
+    That is why the capture showed no unknown caller even with the icons on
+    screen.
+
+    The 5-byte form `mov $0xa00000,%eax` is NOT unique -- it also matches the
+    edge-anchor helper at 0x591436 -- so the signature runs to 12 bytes. */
+ { "0x5c91b8", MSG_WIDTH_FX, 1, 12,
+   {0xb8,0x00,0x00,0xa0,0x00, 0x89,0x7c,0x24,0x1c, 0x8b,0x5f,0x48} },
+
+ /* bits 17,18 -- score popup ("+50" on a kill or a crash).  A VISIBILITY CULL
+    against the original screen size, not a layout constant:
+
+        591f1b  cmp  %eax,%ebx          ; x < lowerBound(0x6fcd78) ?
+        591f1f  jl   0x591f7a           ;   -> skip the draw entirely
+        591f21  cmp  $0xa00000,%ebx     ; x > 640<<14 ?   <- bit 17
+        591f27  jg   0x591f7a           ;   -> skip
+        591f29  cmp  %eax,%ebp
+        591f2b  jl   0x591f7a
+        591f2d  cmp  $0x780000,%ebp     ; y > 480<<14 ?   <- bit 18
+        591f33  jg   0x591f7a           ;   -> skip
+        591f35  mov  0xa8(%edi),%eax    ; scale -- GLYPH SIZE only
+        591f70  push %ebp               ; y pushed RAW
+        591f71  push %ebx               ; x pushed RAW
+        591f75  call 0x5d0e90
+
+    ebx/ebp are REAL SCREEN PIXELS in 16.14: the function seeds the projection
+    from 0x74(%edi), the viewport centreY (height/2, real pixels), at 0x591e69.
+    So the position was always correct and no scale fix is wanted here -- the
+    bug is purely that the bounds are the 1999 screen size, so on 2560x1080
+    anything outside the top-left 640x480 PIXELS is silently dropped.
+
+    That is why every proportional-error theory failed, and why the captured x
+    values stop dead at 624.4: those were the only popups that survived the
+    cull.  The element never moved; it simply vanished unless the event
+    happened in the top-left corner.
+
+    Unlike every other site here the constant is the REAL screen size, not the
+    virtual layout width -- these are pixels, not 640-space units.  And the
+    opcode is two bytes (81 fb / 81 fd), so the immediate is at offset 2. */
+ { "0x591f21", MSG_SCREENW_FX, 2, 8,
+   {0x81,0xfb,0x00,0x00,0xa0,0x00, 0x7f,0x51} },
+ { "0x591f2d", MSG_SCREENH_FX, 2, 8,
+   {0x81,0xfd,0x00,0x00,0x78,0x00, 0x7f,0x45} },
 };
 
 #define MSG_IMM_AT 1        /* the imm32 sits at offset 1 in every signature */
@@ -943,8 +1017,14 @@ static void ApplyMsgSites(unsigned int mask, unsigned int virtualHeight)
         at = FindUnique(code, codeSize, g_msgSites[i].sig, g_msgSites[i].sigLen);
         if (!at) continue;
 
-        val = (g_msgSites[i].kind == MSG_CENTRE) ? (vw / 2) : vw;
-        WriteCode(at + MSG_IMM_AT, (const unsigned char *)&val, 4);
+        switch (g_msgSites[i].kind) {
+        case MSG_CENTRE:      val = vw / 2;                break;
+        case MSG_WIDTH_FX:    val = vw << 14;              break;
+        case MSG_SCREENW_FX:  val = GTA2_TARGET_W << 14;   break;
+        case MSG_SCREENH_FX:  val = GTA2_TARGET_H << 14;   break;
+        default:              val = vw;                    break;
+        }
+        WriteCode(at + g_msgSites[i].immAt, (const unsigned char *)&val, 4);
     }
 }
 
@@ -966,11 +1046,89 @@ static void ApplyMsgSites(unsigned int mask, unsigned int virtualHeight)
 // effects, so the stub runs the displaced instruction verbatim.  Both functions
 // begin `push %ebx`, so the caller's return address is at a known slot.
 //
-#define DIAG_MAX_CALLERS 96
-#define DIAG_PER_CALLER   3
+#define DIAG_MAX_CALLERS 192
+#define DIAG_PER_CALLER   4     /* distinct x rows kept per (site,caller) */
 
 struct DiagEnt {
     DWORD site, caller, x, y, hits;
+};
+
+//
+// Sites 0-3 are the four copies of the coordinate transform.  Sites 4 and 5
+// are the two shared DRAW entries, added because three consecutive captures
+// showed the score popup on none of the transforms -- it is drawn from an
+// inlined transform in the sprite region, exactly as the wanted-level icons
+// were.  Everything drawn has to pass through one of these two, so this is the
+// instrument that cannot have a blind spot:
+//
+//   0x5d19f0  15 call sites   (sprite region + transforms 0x5d06f0/0x5d0778)
+//   0x5d0e90   9 call sites   (incl. 0x5c89f5, the world-anchored path)
+//
+// Both are hooked past their prologue at `mov 0x38(%esp),%eax`, which has no
+// stack side effect so the displaced bytes can run verbatim before the stub
+// returns.  Hooking the true entry is not possible for either: 0x5d19f0 opens
+// with `sub $0x14,%esp` and 0x5d0e90 with an SEH frame setup, and displacing
+// instructions that move esp would leave `ret` popping the wrong slot.
+//
+// The slot numbers follow from that prologue.  For 0x5d19f0, esp at the hook
+// is E-0x18 (E = entry esp, holding the return address) and our call pushes 4
+// more, so the caller sits at stk[7] and arguments follow from stk[8].  For
+// 0x5d0e90 the SEH setup plus `sub $0x24` puts esp at E-0x30, giving stk[13].
+//
+struct DiagSiteDef {
+    const unsigned char *sig;
+    unsigned int         sigLen;
+    unsigned int         dispLen;      /* bytes displaced, >= 5 */
+    unsigned char        callerSlot, xSlot, ySlot;
+};
+
+//
+// REVERTED TO FOUR SITES -- the two draw-entry hooks corrupted the UI.
+//
+// Cause, worth recording because it is a trap for any future hook here: the
+// displaced bytes at both draw entries are ESP-RELATIVE
+// (`mov 0x38(%esp),%eax`), and the stub runs them with esp 4 lower than the
+// original site saw, because our own `call` pushed a return address.  So they
+// read one slot off and the draw functions got wrong arguments.  Sites 0-3
+// displace `mov 0x66fce0,%ebx`, which is absolute -- which is the only reason
+// they have always been safe.
+//
+// Reinstating them means ending the stub with `add $4,%esp` ... `jmp back`
+// instead of `ret`, so esp matches at the displaced bytes; every slot index
+// then shifts by one.  (Site 4's index was also simply wrong: esp at 0x5d19f3
+// is E-0x14, not E-0x18, so its caller was stk[6] and it logged a garbage
+// address.  Site 5's indices were correct and its data is good.)
+//
+// Not rebuilt that way because the one capture taken before the revert already
+// gave the answer: 0x591f7a and 0x5c9e18 are the world-anchored drawers.
+//
+#define DIAG_NSITES 4
+
+static const unsigned char diag_sig0[] = {          /* 0x4932c1 */
+    0x8b,0x1d,0xe0,0xfc,0x66,0x00, 0x55,0x56, 0x8b,0x83,0xa8,0x00,0x00,0x00,
+    0x57,0x99, 0x8b,0xf0, 0x8b,0x44,0x24,0x1c, 0x8b,0xfa,0x99,0x57,0x56,0x52,
+    0x50,0xe8,0xfd };
+static const unsigned char diag_sig1[] = {          /* 0x5d0641 */
+    0x8b,0x1d,0xe0,0xfc,0x66,0x00, 0x55,0x56, 0x8b,0x83,0xa8,0x00,0x00,0x00,
+    0x57,0x99, 0x8b,0xf0, 0x8b,0x44,0x24,0x20 };
+//
+// The transform is duplicated FOUR times.  Only the first two were ever in the
+// dedup diagnostic; these two were probed once, during ordinary gameplay with
+// no mission title on screen, and read as silent.  That is not evidence -- it
+// is the same "wrong moment" error that lost two earlier captures.
+//
+static const unsigned char diag_sig2[] = {          /* 0x5d06f1 */
+    0x8b,0x1d,0xe0,0xfc,0x66,0x00, 0x55,0x56, 0x8b,0x83,0xa8,0x00,0x00,0x00,
+    0x57,0x99, 0x8b,0xf0, 0x8b,0x44,0x24,0x1c, 0x8b,0xfa,0x99,0x57,0x56,0x52,
+    0x50,0xe8,0xcd };
+static const unsigned char diag_sig3[] = {          /* 0x5d0772 */
+    0x8b,0x1d,0xe0,0xfc,0x66,0x00, 0xc7 };
+
+static const struct DiagSiteDef g_diagSites[DIAG_NSITES] = {
+    { diag_sig0, sizeof(diag_sig0), 6,  2,  4,  5 },
+    { diag_sig1, sizeof(diag_sig1), 6,  2,  5,  6 },
+    { diag_sig2, sizeof(diag_sig2), 6,  2,  4,  5 },
+    { diag_sig3, sizeof(diag_sig3), 6,  2,  4,  5 },
 };
 
 static DiagEnt      g_diagEnt[DIAG_MAX_CALLERS];
@@ -1012,27 +1170,55 @@ static void __cdecl DiagLog(unsigned int site, const DWORD *regs)
 
     if (!g_diagRec) return;                /* only between INSERT and DELETE */
 
+    if (site >= DIAG_NSITES) return;
+
     stk = (const DWORD *)regs[4];          /* esp as the hooked site saw it */
-    if (IsBadReadPtr(stk, 48)) return;
+    if (IsBadReadPtr(stk, 96)) return;
 
     //
-    // Argument slots differ per copy of the transform: 0x5d0640 reads X from
-    // 0x20(%esp) (arg3) while 0x4932c0 and 0x5d06f0 read it from 0x18/0x1c
-    // (arg1).  Getting this wrong made site 2's first capture look like
-    // nonsense (y = 5312), so it is spelled out rather than assumed.
+    // Slots are per-site and spelled out in g_diagSites rather than derived.
+    // They differ for two independent reasons: the transform copies read X
+    // from different argument positions (0x5d0640 uses arg3, the others arg1),
+    // and the two draw entries are hooked several instructions in, past a
+    // prologue that has already moved esp.  Guessing here once made site 2's
+    // capture read as nonsense (y = 5312).
     //
-    caller = stk[2];                       /* past our retaddr + saved ebx  */
-    if (site == 1) { x = stk[5]; y = stk[6]; }
-    else           { x = stk[4]; y = stk[5]; }
+    caller = stk[g_diagSites[site].callerSlot];
+    x      = stk[g_diagSites[site].xSlot];
+    y      = stk[g_diagSites[site].ySlot];
 
-    for (i = 0; i < g_diagEnts; i++) {
-        if (g_diagEnt[i].site == site && g_diagEnt[i].caller == caller) {
-            if (g_diagEnt[i].hits < DIAG_PER_CALLER) {
-                g_diagEnt[i].x = x;        /* keep the most recent sample   */
-                g_diagEnt[i].y = y;
+    //
+    // Dedup on POSITION as well as caller.
+    //
+    // Keying on the caller alone hid things: one call site can draw several
+    // distinct elements, and only the first few samples were kept, so extra
+    // elements from a known caller were invisible.  Including x makes every
+    // distinct position its own row, which is what actually identifies an
+    // element.  Rounding to whole virtual units keeps a moving element from
+    // filling the table with near-identical rows.
+    //
+    // Bounded so a long string cannot flood the table: the draw entries see one
+    // call per glyph, each at its own x, and 24 call sites of that would fill
+    // any buffer before a transient event appeared.  Past DIAG_PER_CALLER
+    // distinct positions the caller is already identified, so further ones only
+    // bump a counter.
+    {
+        unsigned int same = 0;
+        int          last = -1;
+
+        for (i = 0; i < g_diagEnts; i++) {
+            if (g_diagEnt[i].site != site || g_diagEnt[i].caller != caller)
+                continue;
+            if ((g_diagEnt[i].x >> 14) == (x >> 14)) {
+                g_diagEnt[i].hits++;
+                return;
             }
-            g_diagEnt[i].hits++;
-            return;                        /* already known -- do not flood */
+            same++;
+            last = (int)i;
+        }
+        if (same >= DIAG_PER_CALLER) {
+            if (last >= 0) g_diagEnt[last].hits++;
+            return;
         }
     }
     if (g_diagEnts >= DIAG_MAX_CALLERS) return;
@@ -1075,27 +1261,14 @@ static void DiagFlush(void)
     CloseHandle(f);
 }
 
-static const unsigned char diag_sig0[] = {          /* 0x4932c1 */
-    0x8b,0x1d,0xe0,0xfc,0x66,0x00, 0x55,0x56, 0x8b,0x83,0xa8,0x00,0x00,0x00,
-    0x57,0x99, 0x8b,0xf0, 0x8b,0x44,0x24,0x1c, 0x8b,0xfa,0x99,0x57,0x56,0x52,
-    0x50,0xe8,0xfd };
-static const unsigned char diag_sig1[] = {          /* 0x5d0641 */
-    0x8b,0x1d,0xe0,0xfc,0x66,0x00, 0x55,0x56, 0x8b,0x83,0xa8,0x00,0x00,0x00,
-    0x57,0x99, 0x8b,0xf0, 0x8b,0x44,0x24,0x20 };
 //
-// The transform is duplicated FOUR times.  Only the first two were ever in the
-// dedup diagnostic; these two were probed once, during ordinary gameplay with
-// no mission title on screen, and read as silent.  That is not evidence -- it
-// is the same "wrong moment" error that lost two earlier captures.
+// Stub prologue.  The displaced bytes are appended per site, followed by ret,
+// so one template serves both the 6-byte transform hooks and the 8-byte draw
+// hooks.  Every displaced sequence must be free of stack side effects: the
+// stub runs them after popad and then rets, so anything that moves esp would
+// leave `ret` popping the wrong slot.
 //
-static const unsigned char diag_sig2[] = {          /* 0x5d06f1 */
-    0x8b,0x1d,0xe0,0xfc,0x66,0x00, 0x55,0x56, 0x8b,0x83,0xa8,0x00,0x00,0x00,
-    0x57,0x99, 0x8b,0xf0, 0x8b,0x44,0x24,0x1c, 0x8b,0xfa,0x99,0x57,0x56,0x52,
-    0x50,0xe8,0xcd };
-static const unsigned char diag_sig3[] = {          /* 0x5d0772 */
-    0x8b,0x1d,0xe0,0xfc,0x66,0x00, 0xc7 };
-
-static unsigned char diag_stub_tmpl[] = {
+static const unsigned char diag_stub_tmpl[] = {
     0x60,                       /* pushad                       */
     0x9c,                       /* pushfd                       */
     0x54,                       /* push %esp                    */
@@ -1103,12 +1276,12 @@ static unsigned char diag_stub_tmpl[] = {
     0xe8, 0,0,0,0,              /* call DiagLog    (rel32 at 6) */
     0x83, 0xc4, 0x08,           /* add  $8,%esp                 */
     0x9d,                       /* popfd                        */
-    0x61,                       /* popad                        */
-    0x8b, 0x1d, 0xe0, 0xfc, 0x66, 0x00,   /* displaced, verbatim */
-    0xc3                        /* ret                          */
+    0x61                        /* popad                        */
 };
-#define DIAG_ID_AT  4
-#define DIAG_REL_AT 6
+#define DIAG_ID_AT   4
+#define DIAG_REL_AT  6
+#define DIAG_DISP_AT sizeof(diag_stub_tmpl)
+#define DIAG_MAX_DISP 8
 
 void GameFix_DiagTick(void)
 {
@@ -1160,36 +1333,38 @@ static void InstallDiag(unsigned int on, unsigned int frames)
     if (!mod) return;
     if (!GetCodeRange(mod, &code, &codeSize)) return;
 
-    for (i = 0; i < 4; i++) {
-        static const unsigned char *const sigs[4] =
-            { diag_sig0, diag_sig1, diag_sig2, diag_sig3 };
-        static const unsigned int         lens[4] =
-            { sizeof(diag_sig0), sizeof(diag_sig1),
-              sizeof(diag_sig2), sizeof(diag_sig3) };
-        const unsigned char *sig = sigs[i];
-        unsigned int         len = lens[i];
-        unsigned char       *at, *stub, call[6];
-        int                  rel;
+    for (i = 0; i < DIAG_NSITES; i++) {
+        const struct DiagSiteDef *s = &g_diagSites[i];
+        unsigned char *at, *stub, call[DIAG_MAX_DISP];
+        unsigned int   n;
+        int            rel;
 
-        at = FindUnique(code, codeSize, sig, len);
+        if (s->dispLen < 5 || s->dispLen > DIAG_MAX_DISP) continue;
+
+        at = FindUnique(code, codeSize, s->sig, s->sigLen);
         if (!at) continue;
 
-        stub = (unsigned char *)VirtualAlloc(NULL, sizeof(diag_stub_tmpl),
+        stub = (unsigned char *)VirtualAlloc(NULL,
+                                             DIAG_DISP_AT + s->dispLen + 1,
                                              MEM_COMMIT | MEM_RESERVE,
                                              PAGE_EXECUTE_READWRITE);
         if (!stub) continue;
 
-        memcpy(stub, diag_stub_tmpl, sizeof(diag_stub_tmpl));
+        memcpy(stub, diag_stub_tmpl, DIAG_DISP_AT);
         stub[DIAG_ID_AT] = (unsigned char)i;
         rel = (int)((unsigned char *)&DiagLog - (stub + DIAG_REL_AT + 4));
         memcpy(stub + DIAG_REL_AT, &rel, 4);
 
+        /* displaced original bytes, then return past them */
+        memcpy(stub + DIAG_DISP_AT, at, s->dispLen);
+        stub[DIAG_DISP_AT + s->dispLen] = 0xc3;
+
         rel = (int)(stub - (at + 5));
         call[0] = 0xe8;
         memcpy(call + 1, &rel, 4);
-        call[5] = 0x90;
+        for (n = 5; n < s->dispLen; n++) call[n] = 0x90;
 
-        if (!WriteCode(at, call, 6))
+        if (!WriteCode(at, call, s->dispLen))
             VirtualFree(stub, 0, MEM_RELEASE);
     }
 }
