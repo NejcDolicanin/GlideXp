@@ -638,7 +638,7 @@ static void InstallCameraHook(int extraZoomHundredths, unsigned int virtualHeigh
 //   OFF_CENTRE  = delta/2    centred: the name frame
 //   (absent)    = 0          everything else, including world-anchored popups
 //
-#define HUD_MAX_ENTRIES 16
+#define HUD_MAX_ENTRIES 24
 
 struct HudCaller {
     DWORD ret;                 // caller return address, 0 terminates
@@ -669,9 +669,38 @@ static const HudSite g_hudSites[] = {
       { 0xb9, 0x0e, 0x00, 0x00, 0x00, 0xe8, 0x29, 0x5e, 0x01, 0x00 },
       { { 0x005c9389, 1 },                       /* HUD, right-anchored     */
 
+        /* HALF heart -- the odd unit when health is not an even number.
+           Found statically, not from a capture: it is the tail of the very
+           routine that draws the full hearts, so it cannot be anything else.
+
+               5c9350  test %eax,%eax        ; count of FULL hearts
+               5c9356  loop: push $0x71 ; call 0x5d0640   -> 0x5c9389
+               5c9389  add  $0x14,%esi       ; 20 per heart
+               5c938d  jne  loop
+               5c9393  ; (hp & 1) == 1 ?
+               5c93a4  jne  skip
+               5c93aa  sub  %ebx,%esi        ; back up 2
+               5c93ac  push $0x72 ; call 0x5d0640          -> 0x5c93df
+
+           Sprite 0x71 is a whole heart, 0x72 the half.  Same transform, same
+           anchor, so kind 1 like its neighbours.
+
+           (0x5c93df is the address once guessed for the money counter and
+           reported as "wrong".  It was a real caller all along -- just a
+           different element.  Guessing an address is not the same as knowing
+           what draws there.) */
+        { 0x005c93df, 1 },
+
         { 0x005ced73, 1 },
         { 0x005cefe2, 1 },
         { 0x005cf02b, 1 },
+
+        /* Equipped-item indicator, virtual (623,117) -- present exactly while
+           an item is held, one call per frame.  Right-anchored like the rest of
+           the cluster, just further down and in a routine of its own, which is
+           why it was never in the map: every earlier capture happened to be
+           taken empty-handed.  Confirmed on hardware. */
+        { 0x005cf1f2, 1 },
 
         /* Car-name frame: routine at 0x5ce420, two frame pieces, its text
            being msg_sites bit 8 (0x5ce4c6).  Confirmed centred on hardware. */
@@ -694,6 +723,12 @@ static const HudSite g_hudSites[] = {
            copy hooked too (below), the two move together. */
         { 0x005cd6d1, 2 },
 
+        /* Weapon ICON, virtual (594,67).  Its ammo TEXT is a separate caller
+           on the next transform copy (0x5cf175, below) -- the same split that
+           caught out the avatar and its dialogue, so both go in together or the
+           icon moves and the number stays behind.  Confirmed on hardware. */
+        { 0x005cf0dc, 1 },
+
         { 0, 0 } } },
 
     //
@@ -714,6 +749,18 @@ static const HudSite g_hudSites[] = {
            to find this by patching 640 and 320 constants were both dead ends;
            it was on the transform all along, in the copy nobody was watching. */
         { 0x005caede, 2 },
+
+        /* Ammo count, virtual (625,82) -- right-anchored, so kind 1 to match
+           its icon at 0x5cf0dc on the previous copy. */
+        { 0x005cf175, 1 },
+
+        /* Armour count, virtual (617,127) -- same arrangement one row down:
+           icon on the previous copy (0x5cf1f2), count here.  Item icon and
+           item COUNT are consistently split across the two transform copies,
+           so assume any future "the number stayed behind" report is another
+           caller in this table, not a missing one in the previous.
+           Confirmed on hardware. */
+        { 0x005cf25d, 1 },
 
         { 0, 0 } } },
 };
@@ -989,6 +1036,104 @@ static const MsgSite g_msgSites[] = {
 };
 
 #define MSG_IMM_AT 1        /* the imm32 sits at offset 1 in every signature */
+
+//
+// Score popup ("+50" on a kill or a crash) -- scale its position.
+//
+// The drawer at 0x5d0e90 takes REAL SCREEN PIXELS in 16.14.  That is settled
+// by the HUD, which reaches it through the transform at 0x5d06b5 and passes
+// 2260.8 for an element that renders correctly at the right-hand edge of a
+// 2560-wide screen.
+//
+// The popup's call site does not scale:
+//
+//     591f35  mov  0xa8(%edi),%eax     ; the scale IS read here...
+//     591f40  imull 0x3c(%esp)         ; ...but spent on GLYPH SIZE
+//     591f70  push %ebp                ; y pushed RAW
+//     591f71  push %ebx                ; x pushed RAW
+//     591f73  push $6
+//     591f75  call 0x5d0e90
+//
+// So ebx/ebp stay in the game's 640x480 virtual space and land at 1/2.25 of
+// where they belong -- top-left, with the error growing with distance from the
+// origin.  That is both "very far left" and "sometimes the location is also
+// displaced": the error is proportional, not a constant offset.
+//
+// Invisible for 26 years because the scale is exactly 1.0 at 640x480.  Only
+// 800x600 would ever have shown it, and then only by 25%.
+//
+// Hooked by redirecting the call rather than editing the push sequence: the
+// stub scales arguments 3 and 4 in place and tail-jumps to the real drawer, so
+// the game's return address is already correct and nothing has to be moved.
+// edi still holds the viewport at the call -- nothing between 0x591f35 and the
+// call touches it -- so the scale is read live and tracks virtual_height
+// instead of being baked in.
+//
+static const unsigned char popup_sig[] = {
+    0x55, 0x53, 0x50, 0x6a, 0x06,          /* push ebp; push ebx; push eax; push $6 */
+    0xe8, 0x16, 0xef, 0x03, 0x00           /* call 0x5d0e90                         */
+};
+#define POPUP_CALL_AT 5
+
+static unsigned char popup_stub[] = {
+    0x50,                                  /* push %eax                     */
+    0x52,                                  /* push %edx                     */
+    0x51,                                  /* push %ecx                     */
+    0x8b, 0x8f, 0xa8, 0x00, 0x00, 0x00,    /* mov 0xa8(%edi),%ecx   scale   */
+    0x8b, 0x44, 0x24, 0x18,                /* mov 0x18(%esp),%eax   x       */
+    0xf7, 0xe9,                            /* imul %ecx                     */
+    0x0f, 0xac, 0xd0, 0x0e,                /* shrd $0xe,%edx,%eax           */
+    0x89, 0x44, 0x24, 0x18,                /* mov %eax,0x18(%esp)           */
+    0x8b, 0x44, 0x24, 0x1c,                /* mov 0x1c(%esp),%eax   y       */
+    0xf7, 0xe9,                            /* imul %ecx                     */
+    0x0f, 0xac, 0xd0, 0x0e,                /* shrd $0xe,%edx,%eax           */
+    0x89, 0x44, 0x24, 0x1c,                /* mov %eax,0x1c(%esp)           */
+    0x59,                                  /* pop %ecx                      */
+    0x5a,                                  /* pop %edx                      */
+    0x58,                                  /* pop %eax                      */
+    0xe9, 0, 0, 0, 0                       /* jmp 0x5d0e90   (rel32 at 41)  */
+};
+#define POPUP_JMP_AT 41
+
+static void InstallPopupScale(unsigned int on)
+{
+    HMODULE        mod;
+    unsigned char *code = NULL, *at, *stub, *target, call[5];
+    unsigned int   codeSize = 0;
+    int            rel;
+
+    if (!on) return;
+
+    mod = GetModuleHandleA(NULL);
+    if (!mod) return;
+    if (!GetCodeRange(mod, &code, &codeSize)) return;
+
+    at = FindUnique(code, codeSize, popup_sig, sizeof(popup_sig));
+    if (!at) return;
+
+    at += POPUP_CALL_AT;                       /* the call itself */
+
+    /* Resolve the real drawer from the call we are replacing, so the address
+       never has to be hardcoded. */
+    memcpy(&rel, at + 1, 4);
+    target = at + 5 + rel;
+
+    stub = (unsigned char *)VirtualAlloc(NULL, sizeof(popup_stub),
+                                         MEM_COMMIT | MEM_RESERVE,
+                                         PAGE_EXECUTE_READWRITE);
+    if (!stub) return;
+
+    memcpy(stub, popup_stub, sizeof(popup_stub));
+    rel = (int)(target - (stub + POPUP_JMP_AT + 4));
+    memcpy(stub + POPUP_JMP_AT, &rel, 4);
+
+    rel = (int)(stub - (at + 5));
+    call[0] = 0xe8;
+    memcpy(call + 1, &rel, 4);
+
+    if (!WriteCode(at, call, 5))
+        VirtualFree(stub, 0, MEM_RELEASE);
+}
 
 static void ApplyMsgSites(unsigned int mask, unsigned int virtualHeight)
 {
@@ -1412,6 +1557,12 @@ void GameFix_Apply(void)
     {
         InstallHudHook((int)GetPrivateProfileIntA("GTA2", "hud_mode", 0, ini),
                        vh);
+
+        // Score popup position scaling.  Needs msg_sites bits 17/18 as well:
+        // once the position is in real pixels the 640x480 cull becomes real,
+        // and would drop every popup outside the top-left corner.
+        InstallPopupScale(
+            (unsigned int)GetPrivateProfileIntA("GTA2", "popup_fix", 0, ini));
 
         // Message text: one bit per layout site, see section 5.
         ApplyMsgSites(
