@@ -10,6 +10,7 @@
 //
 
 #include "g2pch.h"
+#include "gamefix.h"
 
 // The values for the extemes on the depth buffer
 static FxU32 zMinMax[2];
@@ -107,6 +108,8 @@ NAKED_CALL void FX_CALL grBufferSwap( int swap_interval )
 {
 #define FN_NAME "grBufferSwap"
     GDBG_INFO(80, "%s\n", FN_NAME);
+
+	GameFix_DiagTick();   /* TEMPORARY: diagnostic flush timer */
 
 	using Glide3::grBufferSwap;
 	VOID_ASM_JMP(grBufferSwap, (swap_interval));

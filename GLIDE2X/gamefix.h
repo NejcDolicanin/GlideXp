@@ -26,6 +26,10 @@ extern "C" {
 // far better outcome than one that refuses to start.
 void GameFix_Apply(void);
 
+// TEMPORARY diagnostic -- call once per frame.  Writes the caller map after
+// diag_frames frames.  No-op unless diag=1 in the ini.
+void GameFix_DiagTick(void);
+
 #ifdef __cplusplus
 }
 #endif
