@@ -89,9 +89,249 @@ static unsigned int g_targetW   = 640;
 static unsigned int g_targetH   = 480;
 static unsigned int g_targetRes = 0;      /* Glide enum; 0 = no override */
 
+//
+// Glide resolution enum -> pixels.
+//
+// Mirrors _resTable in glide3x/h5/glide3/src/gsst.c, which the driver indexes
+// by the enum directly (`_resTable[resolution].xres`), so the enum IS the
+// index.  Only the modes the wide driver offers in its "Glide Override
+// Resolution" list are listed -- the stock 0x00-0x17 range is deliberately
+// absent, since selecting one of those is not a widescreen case and needs no
+// patching.  The values match the driver's Tweak Map one for one.
+//
+struct GlideRes {
+    unsigned char res;
+    unsigned short w, h;
+};
+
+static const GlideRes g_glideRes[] = {
+    { 0x0c, 1024,  768 },
+    { 0x0d, 1280, 1024 },
+    { 0x0e, 1600, 1200 },
+    { 0x18, 1280,  720 },
+    { 0x19, 1280,  800 },
+    { 0x1a, 1360,  768 },
+    { 0x1b, 1440,  900 },
+    { 0x1c, 1600,  900 },
+    { 0x1d, 1680,  720 },
+    { 0x1e, 1680, 1050 },
+    { 0x1f, 1792,  768 },
+    { 0x20, 1920,  800 },
+    { 0x21, 1920, 1080 },
+    { 0x22, 1920, 1200 },
+    { 0x23, 1960,  840 },
+    { 0x24, 2096,  900 },
+    { 0x25, 2304,  960 },
+    { 0x26, 2560, 1080 },
+};
+
+
+// ==========================================================================
+// Shared machinery
+// ==========================================================================
+
+/* Little-endian store, so the byte tables above stay readable as x86. */
+static void PutU32(unsigned char *at, unsigned int v)
+{
+    at[0] = (unsigned char)(v      );
+    at[1] = (unsigned char)(v >>  8);
+    at[2] = (unsigned char)(v >> 16);
+    at[3] = (unsigned char)(v >> 24);
+}
+
+static unsigned int ReadU32(const unsigned char *at)
+{
+    return (unsigned int)at[0]
+         | ((unsigned int)at[1] <<  8)
+         | ((unsigned int)at[2] << 16)
+         | ((unsigned int)at[3] << 24);
+}
+
+/* The raw bits of a float, so it can be written as an x86 immediate. */
+static unsigned int FloatBits(float f)
+{
+    union { float f; unsigned int u; } c;
+    c.f = f;
+    return c.u;
+}
+
+/* Emit `movl $imm,ds:addr` -- the ten-byte form the viewport patch uses. */
+static void PutMovAbsImm(unsigned char *at, unsigned int addr, unsigned int imm)
+{
+    at[0] = 0xc7;
+    at[1] = 0x05;
+    PutU32(at + 2, addr);
+    PutU32(at + 6, imm);
+}
+
+
+// ---------------------------------------------------------------------------
+// machinery
+// ---------------------------------------------------------------------------
+
+//
+// Case-insensitive tail comparison: does `path` end in `name`?  Used so a
+// profile can say "gta2.exe" and still match whatever absolute path the process
+// was launched from.  Deliberately ASCII-only and locale-independent; _stricmp
+// would drag in locale handling for no gain here.
+//
+static BOOL PathEndsWith(const char *path, const char *name)
+{
+    size_t lp, ln;
+    const char *tail;
+
+    if (!path || !name) return FALSE;
+
+    lp = strlen(path);
+    ln = strlen(name);
+    if (ln > lp) return FALSE;
+
+    tail = path + (lp - ln);
+    while (*tail) {
+        char a = *tail++;
+        char b = *name++;
+        if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+        if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
+        if (a != b) return FALSE;
+    }
+    return TRUE;
+}
+
+//
+// Build a path to a file sitting next to the host exe.  Not the current
+// directory -- the game may have chdir'd by the time we run.
+//
+static BOOL PathBesideExe(const char *leaf, char *out)
+{
+    char *slash, *p;
+
+    out[0] = '\0';
+    if (GetModuleFileNameA(NULL, out, MAX_PATH) == 0) return FALSE;
+
+    slash = out;
+    for (p = out; *p; p++)
+        if (*p == '\\' || *p == '/') slash = p + 1;
+
+    if ((size_t)(slash - out) + lstrlenA(leaf) + 1 >= MAX_PATH) return FALSE;
+    lstrcpyA(slash, leaf);
+    return TRUE;
+}
+
+//
+// Locate a module's executable code range from its PE headers.
+//
+// Scanning only the code section keeps the search small and, more importantly,
+// keeps it off the import/data sections where a byte sequence could coincide
+// without being an instruction.  Returns nothing rather than guessing.
+//
+static BOOL GetCodeRange(HMODULE mod, unsigned char **base, unsigned int *size)
+{
+    const IMAGE_DOS_HEADER *dos = (const IMAGE_DOS_HEADER *)mod;
+    const IMAGE_NT_HEADERS *nt;
+
+    if (!mod) return FALSE;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return FALSE;
+
+    nt = (const IMAGE_NT_HEADERS *)((const unsigned char *)mod + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return FALSE;
+
+    if (!nt->OptionalHeader.BaseOfCode || !nt->OptionalHeader.SizeOfCode)
+        return FALSE;
+
+    *base = (unsigned char *)mod + nt->OptionalHeader.BaseOfCode;
+    *size = (unsigned int)nt->OptionalHeader.SizeOfCode;
+    return TRUE;
+}
+
+//
+// Find `pattern` in [base, base+size).  Requires exactly one match.
+//
+// Insisting on uniqueness is the point.  A pattern that has become ambiguous in
+// some other build of the target is a pattern we no longer understand, and
+// patching the first of several candidates would be a guess.  Not patching is
+// the safe answer.
+//
+static unsigned char *FindUnique(unsigned char *base, unsigned int size,
+                                 const unsigned char *pattern, unsigned int len)
+{
+    unsigned char *hit = NULL;
+    unsigned int i;
+
+    if (len == 0 || len > size) return NULL;
+
+    for (i = 0; i <= size - len; i++) {
+        if (base[i] == pattern[0] && memcmp(base + i, pattern, len) == 0) {
+            if (hit) return NULL;          // ambiguous -- refuse
+            hit = base + i;
+        }
+    }
+    return hit;
+}
+
+//
+// Write over read-execute image pages.
+//
+// Win9x honours VirtualProtect on mapped image sections, and the pages are
+// copy-on-write, so this affects only our process.  The old protection is put
+// back rather than left writable: leaving a game's code section RWX for the
+// rest of the run would be a gratuitous change to its memory hygiene.
+//
+static BOOL WriteCode(unsigned char *at, const unsigned char *bytes,
+                      unsigned int len)
+{
+    DWORD oldProtect = 0;
+
+    if (!VirtualProtect(at, len, PAGE_EXECUTE_READWRITE, &oldProtect))
+        return FALSE;
+
+    memcpy(at, bytes, len);
+
+    VirtualProtect(at, len, oldProtect, &oldProtect);
+
+    // Harmless on the single-core boxes this targets, but correct on anything
+    // that caches decoded instructions.
+    FlushInstructionCache(GetCurrentProcess(), at, len);
+    return TRUE;
+}
+
+static void ApplyProfile(const GameProfile *profile)
+{
+    HMODULE        mod;
+    unsigned char *code = NULL;
+    unsigned int   codeSize = 0;
+    unsigned int   i;
+
+    // NULL moduleName means the host process's own main image -- for GTA2 that
+    // is the SafeDisc-decrypted GTA2.ICD, only readable this late.
+    //
+    // Otherwise: not LoadLibrary.  If the module is not already mapped we are
+    // simply too early (or this game does not use it), and forcing it in would
+    // change the game's own load order.
+    mod = GetModuleHandleA(profile->moduleName);
+    if (!mod) return;
+
+    if (!GetCodeRange(mod, &code, &codeSize)) return;
+
+    for (i = 0; i < profile->patchCount; i++) {
+        const BytePatch *p = &profile->patches[i];
+        unsigned char   *at;
+
+        at = FindUnique(code, codeSize, p->find, p->length);
+        if (!at) continue;      // already patched, absent, or ambiguous
+
+        WriteCode(at, p->replace, p->length);
+    }
+}
+
+
+
+// ==========================================================================
+// GTA2 @ 2560x1080
+// ==========================================================================
+
+/* Shorthand used throughout this section only. */
 #define GTA2_TARGET_W ((int)g_targetW)
 #define GTA2_TARGET_H ((int)g_targetH)
-
 
 // ---------------------------------------------------------------------------
 // 1. The mode list, in DMAGlide.dll (GTA2's Glide video device)
@@ -173,79 +413,6 @@ static unsigned char gta2_enum_replace[] = {
 #define ENUM_H_AT   10
 #define ENUM_RES_AT 19
 
-//
-// Glide resolution enum -> pixels.
-//
-// Mirrors _resTable in glide3x/h5/glide3/src/gsst.c, which the driver indexes
-// by the enum directly (`_resTable[resolution].xres`), so the enum IS the
-// index.  Only the modes the wide driver offers in its "Glide Override
-// Resolution" list are listed -- the stock 0x00-0x17 range is deliberately
-// absent, since selecting one of those is not a widescreen case and needs no
-// patching.  The values match the driver's Tweak Map one for one.
-//
-struct GlideRes {
-    unsigned char res;
-    unsigned short w, h;
-};
-
-/* Little-endian store, so the byte tables above stay readable as x86. */
-static void PutU32(unsigned char *at, unsigned int v)
-{
-    at[0] = (unsigned char)(v      );
-    at[1] = (unsigned char)(v >>  8);
-    at[2] = (unsigned char)(v >> 16);
-    at[3] = (unsigned char)(v >> 24);
-}
-
-static const GlideRes g_glideRes[] = {
-    { 0x0c, 1024,  768 },
-    { 0x0d, 1280, 1024 },
-    { 0x0e, 1600, 1200 },
-    { 0x18, 1280,  720 },
-    { 0x19, 1280,  800 },
-    { 0x1a, 1360,  768 },
-    { 0x1b, 1440,  900 },
-    { 0x1c, 1600,  900 },
-    { 0x1d, 1680,  720 },
-    { 0x1e, 1680, 1050 },
-    { 0x1f, 1792,  768 },
-    { 0x20, 1920,  800 },
-    { 0x21, 1920, 1080 },
-    { 0x22, 1920, 1200 },
-    { 0x23, 1960,  840 },
-    { 0x24, 2096,  900 },
-    { 0x25, 2304,  960 },
-    { 0x26, 2560, 1080 },
-};
-
-int GameFix_SetResolutionEnum(unsigned int glideEnum)
-{
-    unsigned int i;
-
-    //
-    // The driver ignores anything <= 1 (gsst.c:1558 tests `> 1`), which is how
-    // "Disabled" is expressed, so we must treat those the same way or we would
-    // patch the game for a resolution the driver is not going to set.
-    //
-    if (glideEnum <= 1) return 0;
-
-    for (i = 0; i < sizeof(g_glideRes) / sizeof(g_glideRes[0]); i++) {
-        if (g_glideRes[i].res != glideEnum) continue;
-
-        g_targetW   = g_glideRes[i].w;
-        g_targetH   = g_glideRes[i].h;
-        g_targetRes = glideEnum;
-
-        /* Bake the chosen mode into the DMAGlide replacement bytes. */
-        PutU32(gta2_mode_replace + MODE_H_AT,  g_targetH);
-        PutU32(gta2_mode_replace + MODE_W_AT,  g_targetW);
-        PutU32(gta2_enum_replace + ENUM_W_AT,  g_targetW);
-        PutU32(gta2_enum_replace + ENUM_H_AT,  g_targetH);
-        PutU32(gta2_enum_replace + ENUM_RES_AT, g_targetRes);
-        return 1;
-    }
-    return 0;
-}
 
 static const BytePatch gta2_dmaglide_patches[] = {
     { "advertised mode 800x600 -> 2560x1080",
@@ -428,164 +595,6 @@ static const GameProfile g_profiles[] = {
 
 static const unsigned int g_profileCount = COUNT(g_profiles);
 
-
-// ---------------------------------------------------------------------------
-// machinery
-// ---------------------------------------------------------------------------
-
-//
-// Case-insensitive tail comparison: does `path` end in `name`?  Used so a
-// profile can say "gta2.exe" and still match whatever absolute path the process
-// was launched from.  Deliberately ASCII-only and locale-independent; _stricmp
-// would drag in locale handling for no gain here.
-//
-static BOOL PathEndsWith(const char *path, const char *name)
-{
-    size_t lp, ln;
-    const char *tail;
-
-    if (!path || !name) return FALSE;
-
-    lp = strlen(path);
-    ln = strlen(name);
-    if (ln > lp) return FALSE;
-
-    tail = path + (lp - ln);
-    while (*tail) {
-        char a = *tail++;
-        char b = *name++;
-        if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
-        if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
-        if (a != b) return FALSE;
-    }
-    return TRUE;
-}
-
-//
-// Build a path to a file sitting next to the host exe.  Not the current
-// directory -- the game may have chdir'd by the time we run.
-//
-static BOOL PathBesideExe(const char *leaf, char *out)
-{
-    char *slash, *p;
-
-    out[0] = '\0';
-    if (GetModuleFileNameA(NULL, out, MAX_PATH) == 0) return FALSE;
-
-    slash = out;
-    for (p = out; *p; p++)
-        if (*p == '\\' || *p == '/') slash = p + 1;
-
-    if ((size_t)(slash - out) + lstrlenA(leaf) + 1 >= MAX_PATH) return FALSE;
-    lstrcpyA(slash, leaf);
-    return TRUE;
-}
-
-//
-// Locate a module's executable code range from its PE headers.
-//
-// Scanning only the code section keeps the search small and, more importantly,
-// keeps it off the import/data sections where a byte sequence could coincide
-// without being an instruction.  Returns nothing rather than guessing.
-//
-static BOOL GetCodeRange(HMODULE mod, unsigned char **base, unsigned int *size)
-{
-    const IMAGE_DOS_HEADER *dos = (const IMAGE_DOS_HEADER *)mod;
-    const IMAGE_NT_HEADERS *nt;
-
-    if (!mod) return FALSE;
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return FALSE;
-
-    nt = (const IMAGE_NT_HEADERS *)((const unsigned char *)mod + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE) return FALSE;
-
-    if (!nt->OptionalHeader.BaseOfCode || !nt->OptionalHeader.SizeOfCode)
-        return FALSE;
-
-    *base = (unsigned char *)mod + nt->OptionalHeader.BaseOfCode;
-    *size = (unsigned int)nt->OptionalHeader.SizeOfCode;
-    return TRUE;
-}
-
-//
-// Find `pattern` in [base, base+size).  Requires exactly one match.
-//
-// Insisting on uniqueness is the point.  A pattern that has become ambiguous in
-// some other build of the target is a pattern we no longer understand, and
-// patching the first of several candidates would be a guess.  Not patching is
-// the safe answer.
-//
-static unsigned char *FindUnique(unsigned char *base, unsigned int size,
-                                 const unsigned char *pattern, unsigned int len)
-{
-    unsigned char *hit = NULL;
-    unsigned int i;
-
-    if (len == 0 || len > size) return NULL;
-
-    for (i = 0; i <= size - len; i++) {
-        if (base[i] == pattern[0] && memcmp(base + i, pattern, len) == 0) {
-            if (hit) return NULL;          // ambiguous -- refuse
-            hit = base + i;
-        }
-    }
-    return hit;
-}
-
-//
-// Write over read-execute image pages.
-//
-// Win9x honours VirtualProtect on mapped image sections, and the pages are
-// copy-on-write, so this affects only our process.  The old protection is put
-// back rather than left writable: leaving a game's code section RWX for the
-// rest of the run would be a gratuitous change to its memory hygiene.
-//
-static BOOL WriteCode(unsigned char *at, const unsigned char *bytes,
-                      unsigned int len)
-{
-    DWORD oldProtect = 0;
-
-    if (!VirtualProtect(at, len, PAGE_EXECUTE_READWRITE, &oldProtect))
-        return FALSE;
-
-    memcpy(at, bytes, len);
-
-    VirtualProtect(at, len, oldProtect, &oldProtect);
-
-    // Harmless on the single-core boxes this targets, but correct on anything
-    // that caches decoded instructions.
-    FlushInstructionCache(GetCurrentProcess(), at, len);
-    return TRUE;
-}
-
-static void ApplyProfile(const GameProfile *profile)
-{
-    HMODULE        mod;
-    unsigned char *code = NULL;
-    unsigned int   codeSize = 0;
-    unsigned int   i;
-
-    // NULL moduleName means the host process's own main image -- for GTA2 that
-    // is the SafeDisc-decrypted GTA2.ICD, only readable this late.
-    //
-    // Otherwise: not LoadLibrary.  If the module is not already mapped we are
-    // simply too early (or this game does not use it), and forcing it in would
-    // change the game's own load order.
-    mod = GetModuleHandleA(profile->moduleName);
-    if (!mod) return;
-
-    if (!GetCodeRange(mod, &code, &codeSize)) return;
-
-    for (i = 0; i < profile->patchCount; i++) {
-        const BytePatch *p = &profile->patches[i];
-        unsigned char   *at;
-
-        at = FindUnique(code, codeSize, p->find, p->length);
-        if (!at) continue;      // already patched, absent, or ambiguous
-
-        WriteCode(at, p->replace, p->length);
-    }
-}
 
 //
 // virtual_height: the HUD/UI size knob.
@@ -1228,12 +1237,718 @@ static void ApplyMsgSites(unsigned int virtualHeight)
     }
 }
 
+//
+// Everything GTA2 needs, in one place.  Called unconditionally; the exe-name
+// tests below are what decide whether anything happens.
+//
+static void Gta2Apply(const char *exePath, const char *ini, BOOL haveIni)
+{
+    unsigned int i, vh = GTA2_VHEIGHT_DEFAULT;
+    BOOL         isGame;
+
+    isGame = PathEndsWith(exePath, "gta2.exe") ||
+             PathEndsWith(exePath, "gta2.icd");
+
+    if (haveIni)
+        vh = ReadVirtualHeight(ini);
+
+    // The DMAGlide mode list, which "gta2 manager.exe" needs too -- hence the
+    // profile table rather than the isGame test.
+    for (i = 0; i < g_profileCount; i++) {
+        if (!PathEndsWith(exePath, g_profiles[i].exeName)) continue;
+
+        ApplyProfile(&g_profiles[i]);
+    }
+
+    if (!isGame) return;
+
+    //
+    // The camera hook is not a BytePatch: its replacement contains a rel32 to
+    // memory allocated at runtime, so it cannot live in a static find/replace
+    // table.  The manager process never runs this code.
+    //
+    if (haveIni && GetPrivateProfileIntA("GTA2", "aspect_fix", 1, ini))
+        InstallCameraHook(
+            (int)GetPrivateProfileIntA("GTA2", "extra_zoom", 0, ini), vh);
+
+    //
+    // UI placement.  These three are unconditional rather than ini toggles:
+    // each is a plain correctness fix -- put the element where it belongs --
+    // and there is no configuration in which leaving it wrong is wanted.  They
+    // are not BytePatches because their stubs hold runtime-allocated tables.
+    //
+    // They are also a set.  The popup fix converts the score popup's position
+    // to real pixels, which only works because ApplyMsgSites has raised the
+    // 640x480 visibility cull to the real screen size; enabling one without the
+    // other would drop every popup outside the top-left corner.
+    //
+    InstallHudHook(vh);
+    InstallPopupScale();
+    ApplyMsgSites(vh);
+}
+
+//
+// Bake the chosen mode into the DMAGlide replacement bytes.  Called from
+// GameFix_SetResolutionEnum, which is the only thing that knows the mode and
+// deliberately knows nothing about DMAGlide.
+//
+static void Gta2AdoptResolution(void)
+{
+    PutU32(gta2_mode_replace + MODE_H_AT,   g_targetH);
+    PutU32(gta2_mode_replace + MODE_W_AT,   g_targetW);
+    PutU32(gta2_enum_replace + ENUM_W_AT,   g_targetW);
+    PutU32(gta2_enum_replace + ENUM_H_AT,   g_targetH);
+    PutU32(gta2_enum_replace + ENUM_RES_AT, g_targetRes);
+}
+
+
+// ==========================================================================
+// Turok: Dinosaur Hunter (1997, Acclaim)
+// ==========================================================================
+//
+// Far smaller than GTA2, for two reasons worth stating because each one removed
+// a whole phase of the playbook:
+//
+//   - Turok.exe is a plain unencrypted PE (.text entropy 6.53).  No SafeDisc,
+//     so no runtime dump and no address recovery from memory: everything below
+//     was read straight off the file.  It also has no .reloc section, so it can
+//     never be rebased and absolute displacements in its signatures are stable.
+//
+//   - Video_3DFx.dll is an N64 RSP/RDP emulator.  Turok PC is a port and still
+//     feeds its renderer F3D display lists, so the engine works in the N64's
+//     320x240 screen space and EVERY screen coordinate -- world vertices,
+//     texture rectangles, fill rects, the clip window -- passes through one
+//     pair of scale factors.
+//
+// The game does choose a resolution of its own (320x240 / 512x384 / 640x480 /
+// 800x600, mapped to a Glide enum at 0x10002630), but nothing here has to agree
+// with it: the driver's override decides the real screen size, and T1 writes
+// the renderer's screen-space constants absolutely.
+//
+// Timing is unusually kind.  GFXDLL_InitializeDriver (0x10004bd0) calls the
+// Glide init, which calls grGlideInit as its first instruction, and only then
+// calls the viewport init -- so by the time we are invoked the module is
+// certainly mapped (we are being called from inside it) and the function we
+// rewrite has not run yet.
+//
+
+// ---------------------------------------------------------------------------
+// T1. N64 screen space -> real pixels, in Video_3DFx.dll
+// ---------------------------------------------------------------------------
+//
+// 0x10007a30 sets the entire mapping, in five floats:
+//
+//     screen width   \  used only to re-centre a shrunken viewport
+//     screen height  /  (the size slider below)
+//     viewport size, GFXDLL_changeViewportSize
+//     sx: pixels per N64 x unit = W/320
+//     sy: pixels per N64 y unit = H/240
+//
+// 0x10007a70 derives the four values every consumer actually reads:
+//
+//     screenX = n64X * sx*S + (1-S)*W/2
+//     screenY = (H - (1-S)*H/2) - n64Y * sy*S
+//
+// so sx = W/320 and sy = H/240 make the whole renderer fill the real screen.
+// The clip window follows too: 0x10004d90 builds it from the same globals via
+// the viewport's vscale/vtrans, so grBufferClear keeps clearing the full frame.
+//
+// Nothing else in the DLL assumes a fixed size on the drawing path -- the F12
+// screen grab (0x10004a10) already asks grSstScreenWidth/Height.
+//
+// On its own this is a horizontal STRETCH -- the projection matrix still
+// assumes 4:3.  T2 is what turns it into widescreen.
+//
+// Every instruction involved names its global by absolute address and
+// Video_3DFx.dll carries relocations, so the signature is built from the
+// module's actual base rather than written out as a static table.  Nothing here
+// depends on the DLL landing at its preferred 0x10000000.
+//
+#define TUROK_VID_DLL      "Video_3DFx.dll"
+
+/* N64 framebuffer the engine lays everything out against. */
+#define TUROK_N64_W 320.0f
+#define TUROK_N64_H 240.0f
+
+//
+// The target is the retail build:
+//
+//     Turok.exe  1,154,560  (1997-11-11)
+//     Video_3DFx.dll 103,936 (1997-11-10)
+//
+// An earlier 1997 build exists (Turok.exe 1,088,000, Video_3DFx.dll 82,432) and
+// was supported for a while.  That is gone: none of the signatures below match
+// it, so it now runs unpatched -- which is what any unrecognised build should
+// do anyway.
+//
+// Despite shipping in a folder called Turok_D3D, the game carries both
+// renderers.  This patches the Glide one; Video_D3D.dll is never touched.
+//
+// The five viewport floats are contiguous, in this order:
+//
+//     +0x00 screen width   +0x04 screen height   +0x08 viewport-size slider
+//     +0x0c sx (pixels per N64 x unit)           +0x10 sy
+//
+#define TUROK_VP_W   0x00u
+#define TUROK_VP_H   0x04u
+#define TUROK_VP_S   0x08u
+#define TUROK_VP_SX  0x0cu
+#define TUROK_VP_SY  0x10u
+
+//
+// 0x10007a30 COMPUTES those five from the width and height the game chose,
+// which GFXDLL_InitializeDriver has already latched into registers before it
+// calls us -- so the mode globals cannot be patched from grGlideInit, but this
+// function has not run yet and its whole body can be replaced.  63 bytes of
+// room for the 51 we need.
+//
+#define TUROK_VP_GLOBALS    0x00019e38u
+#define TUROK_VP_SLIDER1    0x00013108u   /* 1.0f, the slider's initial value */
+#define TUROK_VP_K320       0x00013110u   /* 1/320, double */
+#define TUROK_VP_K240       0x00013118u   /* 1/240, double */
+#define TUROK_2D_SIGGLOBAL  0x00019e6cu   /* the X scale, named in its sig */
+
+// ---------------------------------------------------------------------------
+// T2. Projection aspect, in Turok.exe
+// ---------------------------------------------------------------------------
+//
+// 0x47fa70 is guPerspective(mtx, perspNorm, fovy, aspect, near, far, scale) --
+// its one call site is 0x44060d, and it writes m00 = cot(fovy/2) / aspect.
+// The aspect argument is built immediately before it:
+//
+//     0x4405bd  fld   [esi+0x158]        viewport width fraction  (1.0)
+//     0x4405c3  fmul  ds:0x48dfe0        * 320.0        <-- THE CONSTANT
+//     0x4405c9  fld   ds:0x48dfa4        1.0
+//     0x4405cf  fsub  [esi+0x2c]         - letterbox    (0.0)
+//     0x4405d2  fmul  [esi+0x15c]        * viewport height fraction (1.0)
+//     0x4405d8  fmul  ds:0x48dfe4        * 240.0
+//     0x4405de  fdivrp                   aspect = num / den
+//
+// At stock settings that is 320/240 = 4:3.  Rewriting the 320.0 to 240.0*W/H
+// makes it W/H, which is Hor+ widescreen: the vertical field of view is
+// untouched and the wider screen simply shows more to the sides.
+//
+// Doing this in the exe rather than scaling the projection matrix inside
+// Video_3DFx.dll is deliberate.  The exe culls and clips against the matrix it
+// built; widening the frustum only on the renderer's side would leave geometry
+// culled to the old 4:3 frustum, which shows up as world popping in and out at
+// the screen edges.  Fixing the aspect at its source keeps everything downstream
+// -- matrix, perspNorm, culling -- consistent by construction.
+//
+// The constant lives in .rdata, so it cannot be located by a code scan.  It is
+// reached instead through the disp32 of the `fmul` that reads it: the 35-byte
+// signature below occurs exactly once in Turok.exe, and 0x48dfe0 is referenced
+// from nowhere else in the image.
+//
+static const unsigned char turok_aspect_sig[] = {
+    0xd9, 0x86, 0x58, 0x01, 0x00, 0x00,   // fld    0x158(%esi)
+    0xd8, 0x0d, 0xe0, 0xdf, 0x48, 0x00,   // fmul   0x48dfe0      <- disp32 @8
+    0xd9, 0x05, 0xa4, 0xdf, 0x48, 0x00,   // fld    0x48dfa4
+    0xd8, 0x66, 0x2c,                     // fsub   0x2c(%esi)
+    0xd8, 0x8e, 0x5c, 0x01, 0x00, 0x00,   // fmul   0x15c(%esi)
+    0xd8, 0x0d, 0xe4, 0xdf, 0x48, 0x00,   // fmul   0x48dfe4
+    0xde, 0xf9                            // fdivrp %st,%st(1)
+};
+#define TUROK_ASPECT_DISP_AT 8
+
+// ---------------------------------------------------------------------------
+// T3. The FOV knob, in Turok.exe -- one double inside guPerspective
+// ---------------------------------------------------------------------------
+//
+// guPerspective's first act is to turn fovy into cot(fovy/2):
+//
+//     47fa70  fld   [esp+0xc]        fovy, in degrees
+//     47fa74  fmul  ds:0x48f398      * pi/180
+//     47fa7a  mov   eax,[esp+0x18]
+//     47fa7e  push  eax
+//     47fa7f  push  $1.0
+//     47fa84  fmul  ds:0x48f3a0      * 0.5           <-- THE CONSTANT
+//     47fa8a  fptan
+//     47fa8e  fdivr ds:0x48f3a8      1 / tan  ->  cot(fovy/2)
+//
+// Scaling that 0.5 scales the half-angle, so `fov` is exactly "percent of the
+// game's own field of view, in degrees" -- linear and easy to reason about.
+// Because cot(fovy/2) lands in BOTH m00 and m11, it widens the view vertically
+// and horizontally in the same proportion: no distortion at any setting, and
+// completely independent of the aspect fix above.
+//
+// 0x48f3a0 is a QWORD double referenced from exactly one instruction, and
+// guPerspective itself has exactly one call site, so nothing else in the game
+// can see the change.
+//
+// The one caveat worth stating: the game's own visibility culling uses its
+// unscaled fovy, not the matrix.  At large `fov` values geometry may be culled
+// slightly before it leaves the screen.  That is why the default is 100.
+//
+static const unsigned char turok_fov_sig[] = {
+    0xd9, 0x44, 0x24, 0x0c,               // fld    0xc(%esp)
+    0xdc, 0x0d, 0x98, 0xf3, 0x48, 0x00,   // fmull  0x48f398       (pi/180)
+    0x8b, 0x44, 0x24, 0x18,               // mov    0x18(%esp),%eax
+    0x50,                                 // push   %eax
+    0x68, 0x00, 0x00, 0x80, 0x3f,         // push   $0x3f800000
+    0xdc, 0x0d, 0xa0, 0xf3, 0x48, 0x00,   // fmull  0x48f3a0  (0.5) <- disp @22
+    0xd9, 0xf2                            // fptan
+};
+#define TUROK_FOV_DISP_AT 22
+
+// ---------------------------------------------------------------------------
+// T4. The HUD, in Video_3DFx.dll -- an inline hook on the 2D rect drawer
+// ---------------------------------------------------------------------------
+//
+// Turok's 2D -- health bar, face icon, ammo, text -- is drawn in the SAME
+// 320x240 N64 screen space as the world, through the same globals, so T1's
+// sx = W/320 stretches it by sx/sy (1.78x at 2560x1080).  A constant cannot
+// separate the two; this needs a hook.
+//
+// 0x10003a90 is the 2D rectangle drawer, reached from four display-list opcode
+// handlers (0x100058ed, 0x1000594e, 0x100059c4, 0x10005a2d).  Hooking its entry
+// covers all of them at once, which is also why the hook adjusts ARGUMENTS
+// rather than the transform: the same function has to keep working for every
+// caller.
+//
+// Argument order is (x, y, x, y), read off the function itself rather than
+// assumed.  It loads its four arguments immediately and then interleaves them:
+//
+//     flds a1 ; flds a2 ; flds a3 ; flds a4     -> st0=a4 a3 a2 a1
+//     fxch %st(3)  fmul <X scale>               -> a1 is X
+//     fxch %st(2)  fmul <X scale>               -> a3 is X
+//     ... fmul <Y scale> on a2 and a4
+//
+// The scissor opcode at 0x10005ef7 corroborates it: it builds a
+// grClipWindow(minx,miny,maxx,maxy) call -- a known signature -- and the
+// arguments it scales with the X globals are exactly the ones taken from bits
+// 8-19 of the command words, the Y ones from bits 20-31.
+//
+// The correction is applied in pre-transform N64 units, which makes it
+// independent of both the screen size and the viewport-size slider: whatever S
+// and W are, x=0 lands on the left edge of the viewport and x=320 on the right.
+//
+//     ratio = sy / sx                 (0.5625 at 2560x1080)
+//     span  = 320 * (1 - ratio)       the slack to distribute
+//     x' = x * ratio + off
+//
+// `off` is span/2 -- one offset, every rectangle, so the 320-wide layout is
+// reproduced exactly inside a centred 4:3 island.  Nothing can be split,
+// nothing can move relative to anything else.
+//
+// Rects at least TUROK_HUD_FULLWIDTH wide are passed through untouched:
+// full-screen fades and backgrounds have to keep covering the screen, and
+// stretching a solid colour is invisible.  256 is hardware-confirmed -- it is
+// what keeps the black fade in/out covering the whole screen.
+//
+// WHY THERE IS NO EDGE-ANCHORED MODE
+//
+// Two were tried, to put the HUD back in the screen corners, and both failed on
+// hardware for the same underlying reason.  Recorded here because the idea is
+// an obvious one to have again.
+//
+// Turok's 2D is drawn ONE RECTANGLE PER GLYPH, and this renderer offers no way
+// to tell one element from another: every 2D primitive arrives through this one
+// drawer from a display-list interpreter, so there is no distinguishing call
+// site (the GTA2 technique) and no semantic tag.  All that is available is the
+// rectangle's own position -- and position does not separate the cases:
+//
+//     centred text  "LOCATE THE HUB RUINS"   37.8 .. 282.2   (centre 160.0)
+//     corner HUD    ammo counter + icon     271.1 .. 307.6
+//
+// Anchoring per rectangle by which third it fell in cut strings into three
+// columns; the fragments met at exactly 106.7 and 213.3, the zone boundaries.
+// Anchoring per RUN instead -- inherit the offset from an adjacent rectangle on
+// the same row -- fixed the cutting, but then the threshold that decides a run
+// has to reach >= 33.3 units from the right edge to catch the ammo group by its
+// leading glyph, while staying < 37.8 so it does not grab the leading glyph of
+// centred text.  A 4.5-unit window out of 320, narrower than the measurement
+// error.  There is no such threshold.
+//
+// The run rule also glued unrelated things together: the pause menu's backing
+// box is one tall rectangle overlapping nearly every row, so whatever was drawn
+// next inherited its offset.
+//
+// So the 2D layer is corrected in size only, and the centred result is
+// unconditional.  Any real fix needs per-element knowledge this renderer does
+// not carry.
+//
+#define TUROK_HUD_FULLWIDTH 256.0f
+#define TUROK_2D_ENTRY_LEN  6             /* the displaced `sub $N,%esp` */
+
+//
+// Stub, reached by a `call rel32` overwriting the drawer's first 6 bytes.
+//
+// It begins `add $4,%esp` to discard the return address our own call pushed:
+// after that esp is exactly what the drawer's entry saw, so the argument
+// offsets are the original ones and the displaced `sub` can run unchanged.
+// It ends in a `jmp` back rather than a `ret` for the same reason (see
+// GAME-PATCHING.md section 5a -- getting this wrong silently shifts every
+// argument).
+//
+// The displaced instruction is COPIED FROM THE SITE rather than written out
+// here: copying is shorter than spelling it out, and stays correct if the
+// instruction ever differs.
+//
+static unsigned char turok_hud_stub[] = {
+    0x83, 0xc4, 0x04,                     // add   $0x4,%esp
+    0x60,                                 // pushad
+    0x8d, 0x44, 0x24, 0x24,               // lea   0x24(%esp),%eax   -> &arg1
+    0x50,                                 // push  %eax
+    0xe8, 0,0,0,0,                        // call  TurokFixRect2D    <- @9
+    0x83, 0xc4, 0x04,                     // add   $0x4,%esp
+    0x61,                                 // popad
+    0,0,0,0,0,0,                          // <the drawer's own first 6 bytes> @18
+    0xe9, 0,0,0,0                         // jmp   drawer+6          <- @24
+};
+#define TUROK_STUB_CALL_AT   9
+#define TUROK_STUB_DISP_AT  18
+#define TUROK_STUB_JMP_AT   24
+
+/* Live pointers into Video_3DFx.dll, so the hook follows any later change. */
+static const float *g_turokSx = NULL;
+static const float *g_turokSy = NULL;
+
+//
+// The body of the hook, in C rather than hand-assembled bytes.
+//
+// `a` points at the drawer's four float arguments: a[0] and a[2] are X, a[1]
+// and a[3] are Y.  Y is left alone -- the vertical mapping was never wrong.
+//
+// Not static, and marked used/noinline, because its only reference is the
+// rel32 written into the stub above: nothing in this translation unit calls it,
+// and it must keep a plain cdecl frame.
+//
+extern "C" void __attribute__((cdecl, used, noinline))
+TurokFixRect2D(float *a)
+{
+    float sx, sy, ratio, x0, x1, w, off;
+
+    if (!g_turokSx || !g_turokSy) return;
+
+    sx = *g_turokSx;
+    sy = *g_turokSy;
+    if (!(sx > 0.0f) || !(sy > 0.0f)) return;
+
+    ratio = sy / sx;
+    if (ratio > 0.999f) return;         // 4:3 or narrower: nothing to correct
+
+    x0 = a[0];
+    x1 = a[2];
+
+    w = x1 - x0;
+    if (w < 0.0f) w = -w;
+
+    // Full-width elements keep the stretched mapping.  A fade or a background
+    // has to span the screen; shrinking it would leave the sides uncovered,
+    // and a solid colour cannot look stretched.
+    if (w >= TUROK_HUD_FULLWIDTH) return;
+
+    // One offset for every rectangle: the 320-wide layout is reproduced
+    // exactly, centred.  Nothing can be split and nothing can move relative to
+    // anything else -- see the note above on why there is no alternative.
+    off = TUROK_N64_W * (1.0f - ratio) * 0.5f;
+
+    a[0] = x0 * ratio + off;
+    a[2] = x1 * ratio + off;
+}
+
+
+//
+// T1: replace the viewport init's body.
+//
+// 0x10007a30 computes the five viewport floats from the width and height the
+// game selected --
+//
+//     fild [esp+4] ; fild [esp+8] ; fld 1.0
+//     fst W ; fmul 1/320    fst H ; fmul 1/240
+//     fstp slider ; fstp sx ; fstp sy
+//
+// -- so sx and sy are already W/320 and H/240, just of the wrong W and H.  Its
+// arguments cannot be corrected from here: GFXDLL_InitializeDriver reads the
+// mode globals into registers BEFORE it calls grGlideInit, so by the time we
+// run they are latched.  The function itself has not run yet, and it has
+// exactly one caller, so its whole body is replaced with five absolute stores
+// holding the real numbers.  63 bytes available, 51 used, the rest nops.
+//
+// Writing absolute values also makes the result independent of whatever the
+// game's own settings dialog is set to.
+//
+#define TUROK_VP_BLOCK_LEN 50
+
+static void InstallTurokViewport(void)
+{
+    HMODULE        mod;
+    unsigned char *code = NULL, *at, *p;
+    unsigned int   codeSize = 0, base, len;
+    unsigned char  find[64], repl[64];
+
+    mod = GetModuleHandleA(TUROK_VID_DLL);
+    if (!mod) return;
+    if (!GetCodeRange(mod, &code, &codeSize)) return;
+
+    base = (unsigned int)mod;
+
+    /* The original body.  Every instruction carries an absolute address, so it
+       has to be built from the module's real base rather than written out. */
+    p = find;
+    *p++ = 0xdb; *p++ = 0x44; *p++ = 0x24; *p++ = 0x04;   // fild 0x4(%esp)
+    *p++ = 0xdb; *p++ = 0x44; *p++ = 0x24; *p++ = 0x08;   // fild 0x8(%esp)
+    *p++ = 0xd9; *p++ = 0x05; PutU32(p, base + TUROK_VP_SLIDER1); p += 4;
+    *p++ = 0xd9; *p++ = 0xca;                             // fxch %st(2)
+    *p++ = 0xd9; *p++ = 0x15; PutU32(p, base + TUROK_VP_GLOBALS + TUROK_VP_W); p += 4;
+    *p++ = 0xdc; *p++ = 0x0d; PutU32(p, base + TUROK_VP_K320);    p += 4;
+    *p++ = 0xd9; *p++ = 0xc9;                             // fxch %st(1)
+    *p++ = 0xd9; *p++ = 0x15; PutU32(p, base + TUROK_VP_GLOBALS + TUROK_VP_H); p += 4;
+    *p++ = 0xdc; *p++ = 0x0d; PutU32(p, base + TUROK_VP_K240);    p += 4;
+    *p++ = 0xd9; *p++ = 0xca;                             // fxch %st(2)
+    *p++ = 0xd9; *p++ = 0x1d; PutU32(p, base + TUROK_VP_GLOBALS + TUROK_VP_S);  p += 4;
+    *p++ = 0xd9; *p++ = 0x1d; PutU32(p, base + TUROK_VP_GLOBALS + TUROK_VP_SX); p += 4;
+    *p++ = 0xd9; *p++ = 0x1d; PutU32(p, base + TUROK_VP_GLOBALS + TUROK_VP_SY); p += 4;
+    *p++ = 0xc3;                                          // ret
+    len = (unsigned int)(p - find);                       // 63
+
+    at = FindUnique(code, codeSize, find, len);
+    if (!at) return;            // already patched, or not this build
+
+    PutMovAbsImm(repl +  0, base + TUROK_VP_GLOBALS + TUROK_VP_W,
+                 FloatBits((float)g_targetW));
+    PutMovAbsImm(repl + 10, base + TUROK_VP_GLOBALS + TUROK_VP_H,
+                 FloatBits((float)g_targetH));
+    PutMovAbsImm(repl + 20, base + TUROK_VP_GLOBALS + TUROK_VP_S,
+                 FloatBits(1.0f));
+    PutMovAbsImm(repl + 30, base + TUROK_VP_GLOBALS + TUROK_VP_SX,
+                 FloatBits((float)g_targetW / TUROK_N64_W));
+    PutMovAbsImm(repl + 40, base + TUROK_VP_GLOBALS + TUROK_VP_SY,
+                 FloatBits((float)g_targetH / TUROK_N64_H));
+    repl[TUROK_VP_BLOCK_LEN] = 0xc3;                      // ret
+    memset(repl + TUROK_VP_BLOCK_LEN + 1, 0x90,           // pad, same length
+           len - TUROK_VP_BLOCK_LEN - 1);
+
+    WriteCode(at, repl, len);
+}
+
+//
+// T2: rewrite the projection aspect constant in Turok.exe.
+//
+// A data patch, not a code patch, so it is located indirectly: find the unique
+// instruction sequence that reads the constant, take the address out of the
+// fmul's disp32, and rewrite the float there.
+//
+// Idempotent by value rather than by pattern -- the signature is code and
+// survives the patch, so a second call simply finds the constant already
+// holding the value it wants and does nothing.  Anything that is neither the
+// original 320.0 nor our target is left alone: that would mean the constant is
+// not what this code thinks it is.
+//
+//
+// Shared by T2 and T3: find the signature in the host image and hand back the
+// address named by the disp32 at `dispAt`, having checked it points inside the
+// image.  A stray match must not turn into a wild write.
+//
+static unsigned char *TurokConstAt(const unsigned char *sig, unsigned int sigLen,
+                                   unsigned int dispAt, unsigned int size)
+{
+    HMODULE                 mod;
+    const IMAGE_DOS_HEADER *dos;
+    const IMAGE_NT_HEADERS *nt;
+    unsigned char          *code = NULL, *at;
+    unsigned int            codeSize = 0, addr, imgBase, imgSize;
+
+    mod = GetModuleHandleA(NULL);
+    if (!mod) return NULL;
+    if (!GetCodeRange(mod, &code, &codeSize)) return NULL;
+
+    at = FindUnique(code, codeSize, sig, sigLen);
+    if (!at) return NULL;
+
+    addr    = ReadU32(at + dispAt);
+    dos     = (const IMAGE_DOS_HEADER *)mod;
+    nt      = (const IMAGE_NT_HEADERS *)((const unsigned char *)mod + dos->e_lfanew);
+    imgBase = (unsigned int)mod;
+    imgSize = (unsigned int)nt->OptionalHeader.SizeOfImage;
+
+    if (addr < imgBase || addr + size > imgBase + imgSize) return NULL;
+    return (unsigned char *)addr;
+}
+
+static void InstallTurokAspect(void)
+{
+    unsigned char *konst;
+    unsigned int   want, cur;
+
+    konst = TurokConstAt(turok_aspect_sig, sizeof(turok_aspect_sig),
+                         TUROK_ASPECT_DISP_AT, 4);
+    if (!konst) return;
+
+    cur  = ReadU32(konst);
+    want = FloatBits(TUROK_N64_H * (float)g_targetW / (float)g_targetH);
+
+    if (cur == want) return;                       // already applied
+    if (cur != FloatBits(TUROK_N64_W)) return;     // not the constant we expect
+
+    WriteCode(konst, (const unsigned char *)&want, 4);
+}
+
+//
+// T3: scale guPerspective's half-angle constant.
+//
+// Idempotent the same way T2 is -- by value, since the code signature survives
+// a change to the data it points at.  The original 0.5 is the only accepted
+// starting value.
+//
+static void InstallTurokFov(unsigned int fovPercent)
+{
+    unsigned char *konst;
+    double         want;
+    union { double d; unsigned char b[8]; } cur, next;
+
+    if (fovPercent == 100) return;              // exactly the shipped value
+    if (fovPercent < 50)   fovPercent = 50;
+    if (fovPercent > 200)  fovPercent = 200;
+
+    konst = TurokConstAt(turok_fov_sig, sizeof(turok_fov_sig),
+                         TUROK_FOV_DISP_AT, 8);
+    if (!konst) return;
+
+    memcpy(cur.b, konst, 8);
+    want = 0.5 * (double)fovPercent / 100.0;
+    next.d = want;
+
+    if (memcmp(cur.b, next.b, 8) == 0) return;  // already applied
+    if (cur.d != 0.5) return;                   // not the constant we expect
+
+    WriteCode(konst, next.b, 8);
+}
+
+//
+// T4: hook the 2D rect drawer in Video_3DFx.dll so the HUD keeps its aspect.
+//
+static void InstallTurokHud(void)
+{
+    HMODULE        mod;
+    unsigned char *code = NULL, *at, *stub;
+    unsigned int   codeSize = 0, base;
+    unsigned char  sig[42], call[TUROK_2D_ENTRY_LEN];
+    int            rel;
+
+    mod = GetModuleHandleA(TUROK_VID_DLL);
+    if (!mod) return;
+    if (!GetCodeRange(mod, &code, &codeSize)) return;
+
+    base = (unsigned int)mod;
+
+    //
+    // Entry signature for the drawer at 0x10003a90.  `sub $0x108,%esp` alone is
+    // nowhere near unique; what pins it is the absolute operand of the first
+    // scale multiply, which is also why the pattern has to be built from the
+    // module's real base.
+    //
+    memcpy(sig,
+           "\x81\xec\x08\x01\x00\x00"            // sub  $0x108,%esp
+           "\xd9\x84\x24\x0c\x01\x00\x00"        // flds 0x10c(%esp)
+           "\xd9\x84\x24\x10\x01\x00\x00"        // flds 0x110(%esp)
+           "\xd9\x84\x24\x14\x01\x00\x00"        // flds 0x114(%esp)
+           "\xd9\x84\x24\x18\x01\x00\x00"        // flds 0x118(%esp)
+           "\xd9\xcb"                            // fxch %st(3)
+           "\xd8\x0d\x00\x00\x00\x00",           // fmuls <X scale>
+           sizeof(sig));
+    PutU32(sig + 38, base + TUROK_2D_SIGGLOBAL);
+
+    at = FindUnique(code, codeSize, sig, sizeof(sig));
+    if (!at) return;                    // absent, ambiguous, or already hooked
+
+    g_turokSx = (const float *)(base + TUROK_VP_GLOBALS + TUROK_VP_SX);
+    g_turokSy = (const float *)(base + TUROK_VP_GLOBALS + TUROK_VP_SY);
+
+    stub = (unsigned char *)VirtualAlloc(NULL, sizeof(turok_hud_stub),
+                                         MEM_COMMIT | MEM_RESERVE,
+                                         PAGE_EXECUTE_READWRITE);
+    if (!stub) return;
+
+    memcpy(stub, turok_hud_stub, sizeof(turok_hud_stub));
+
+    // The displaced instruction, taken from the site itself.
+    memcpy(stub + TUROK_STUB_DISP_AT, at, TUROK_2D_ENTRY_LEN);
+
+    rel = (int)((unsigned char *)&TurokFixRect2D
+                - (stub + TUROK_STUB_CALL_AT + 5));
+    memcpy(stub + TUROK_STUB_CALL_AT + 1, &rel, 4);
+
+    rel = (int)((at + TUROK_2D_ENTRY_LEN) - (stub + TUROK_STUB_JMP_AT + 5));
+    memcpy(stub + TUROK_STUB_JMP_AT + 1, &rel, 4);
+
+    // call rel32 over the displaced `sub`, padded to its full 6 bytes.
+    rel     = (int)(stub - (at + 5));
+    call[0] = 0xe8;
+    memcpy(call + 1, &rel, 4);
+    call[5] = 0x90;                     // nop
+
+    if (!WriteCode(at, call, sizeof(call)))
+        VirtualFree(stub, 0, MEM_RELEASE);
+}
+
+//
+// Everything Turok needs, in one place.
+//
+// None of these is a BytePatch: T1 builds its signature from the runtime module
+// base, T2 and T3 patch .rdata rather than code, and T4 is an inline hook.
+//
+static void TurokApply(const char *exePath, const char *ini, BOOL haveIni)
+{
+    if (!PathEndsWith(exePath, "turok.exe")) return;
+
+    // Unconditional: without it the game draws a 640x480 image into the corner
+    // of the screen, which is not a preference.
+    InstallTurokViewport();
+
+    // Behind an ini key only so a hardware run can separate "fills the screen"
+    // from "fills the screen with the right geometry".  Off gives a full-screen
+    // but horizontally stretched picture -- a useful diagnostic, and a
+    // recoverable state without a rebuild.
+    if (!haveIni || GetPrivateProfileIntA("TUROK", "aspect_fix", 1, ini))
+        InstallTurokAspect();
+
+    if (haveIni)
+        InstallTurokFov(GetPrivateProfileIntA("TUROK", "fov", 100, ini));
+
+    // Unconditional, with nothing to tune.  A stretched HUD is simply wrong,
+    // and the one alternative to correcting it -- putting the elements back in
+    // the screen corners -- was tried twice on hardware and cannot be done from
+    // this renderer (see the note above T4).
+    InstallTurokHud();
+}
+
+
+// ==========================================================================
+// Public entry points
+// ==========================================================================
+
+
+int GameFix_SetResolutionEnum(unsigned int glideEnum)
+{
+    unsigned int i;
+
+    //
+    // The driver ignores anything <= 1 (gsst.c:1558 tests `> 1`), which is how
+    // "Disabled" is expressed, so we must treat those the same way or we would
+    // patch the game for a resolution the driver is not going to set.
+    //
+    if (glideEnum <= 1) return 0;
+
+    for (i = 0; i < sizeof(g_glideRes) / sizeof(g_glideRes[0]); i++) {
+        if (g_glideRes[i].res != glideEnum) continue;
+
+        g_targetW   = g_glideRes[i].w;
+        g_targetH   = g_glideRes[i].h;
+        g_targetRes = glideEnum;
+
+        Gta2AdoptResolution();
+        return 1;
+    }
+    return 0;
+}
+
 void GameFix_Apply(void)
 {
     char         exePath[MAX_PATH];
     char         ini[MAX_PATH];
     DWORD        len;
-    unsigned int i, vh = GTA2_VHEIGHT_DEFAULT;
     BOOL         haveIni;
 
     //
@@ -1260,42 +1975,7 @@ void GameFix_Apply(void)
     if (len == 0 || len >= MAX_PATH) return;
 
     haveIni = PathBesideExe(GAMEFIX_INI, ini);
-    if (haveIni)
-        vh = ReadVirtualHeight(ini);
 
-    for (i = 0; i < g_profileCount; i++) {
-        if (!PathEndsWith(exePath, g_profiles[i].exeName)) continue;
-
-        ApplyProfile(&g_profiles[i]);
-    }
-
-    //
-    // The camera hook is not a BytePatch: its replacement contains a rel32 to
-    // memory allocated at runtime, so it cannot live in a static find/replace
-    // table.  The manager process never runs this code.
-    //
-    if (haveIni &&
-        (PathEndsWith(exePath, "gta2.exe") || PathEndsWith(exePath, "gta2.icd")) &&
-        GetPrivateProfileIntA("GTA2", "aspect_fix", 1, ini))
-    {
-        InstallCameraHook(
-            (int)GetPrivateProfileIntA("GTA2", "extra_zoom", 0, ini), vh);
-    }
-
-    //
-    // UI placement.  These three are unconditional rather than ini toggles:
-    // each is a plain correctness fix -- put the element where it belongs --
-    // and there is no configuration in which leaving it wrong is wanted.  They
-    // are not BytePatches because their stubs hold runtime-allocated tables.
-    //
-    // They are also a set.  The popup fix converts the score popup's position
-    // to real pixels, which only works because ApplyMsgSites has raised the
-    // 640x480 visibility cull to the real screen size; enabling one without the
-    // other would drop every popup outside the top-left corner.
-    //
-    if (PathEndsWith(exePath, "gta2.exe") || PathEndsWith(exePath, "gta2.icd")) {
-        InstallHudHook(vh);
-        InstallPopupScale();
-        ApplyMsgSites(vh);
-    }
-}
+    Gta2Apply(exePath, ini, haveIni);
+    TurokApply(exePath, ini, haveIni);
+}
