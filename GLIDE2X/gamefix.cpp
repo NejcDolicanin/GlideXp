@@ -2284,6 +2284,203 @@ static void InstallIgnWipe(unsigned char *code, unsigned int codeSize)
 }
 
 //
+// F6.  Scale the 2D layer up when it is smaller than the screen.
+//
+// The menu, the loading screen and the attract-mode race behind the menu all
+// run before 0x43C8A0 has switched the screen size, so they render into a
+// 640x400 corner of a much larger framebuffer.  The artwork is fixed-size and
+// the loader writes it with a hardcoded 640 pitch, so the layout itself cannot
+// be widened -- but the finished picture can be scaled on its way out.
+//
+// Everything 2D reaches the screen through one place.  0x454310 is a nine
+// argument pass-through to the device blit,
+//
+//     Blit(src, srcPitch, srcX, srcY, w, h, dstSurface, dstX, dstY)
+//
+// and its `call *0x4F3348` is the single site every surface-to-surface copy
+// goes through -- menu art into the 8bpp overlay, and the overlay out to the
+// Glide LFB.  Replacing that one call with our own lets us take the second
+// case and hand back the first untouched.
+//
+// The guard is deliberately narrow: we act only when the destination is one of
+// the two screen surfaces AND the source rectangle is smaller than the real
+// screen.  In a race the game passes the full W x H, so the test fails and the
+// game's own blit runs exactly as before -- this cannot touch the HUD.
+//
+// Aspect is preserved rather than stretched to fill.  640x400 is 1.6 and the
+// screen is 2.37 at 2560x1080, so stretching would make everything 48% too
+// wide; scaling to fit gives 1728x1080 with pillarbox bars, which are cleared
+// to black so nothing stale shows at the edges.  Transparent source pixels
+// (index 0) are still skipped inside the image, exactly as the game's blit
+// does, so anything drawn underneath still shows through.
+//
+#define IGN_RVA_VT_BLIT     0x0F3348u   /* the device blit vtable slot   */
+#define IGN_RVA_VT_LOCK     0x0F3358u   /* Lock(surface, type)           */
+#define IGN_RVA_VT_UNLOCK   0x0F335Cu   /* Unlock(surface)               */
+#define IGN_RVA_SCREEN_A    0x0F2F40u   /* the two screen surfaces       */
+#define IGN_RVA_SCREEN_B    0x0F2E50u
+#define IGN_RVA_PALETTE     0x21E520u   /* 256 x u16, index -> 16bpp     */
+
+/* Fields of the surface descriptor, read off 0x458A60 and 0x458780. */
+#define IGN_SURF_LOCKTYPE   0x0C        /* 0 = none, 1 = read, 3 = write */
+#define IGN_SURF_WRITEPTR   0x14        /* LFB pointer while write-locked */
+#define IGN_SURF_STRIDE     0x18        /* strideInBytes, from grLfbLock  */
+
+#define IGN_LOCK_WRITE      3
+
+typedef int (*IgnBlitFn)(const unsigned char *, int, int, int, int, int,
+                         void *, int, int);
+typedef int (*IgnLockFn)(void *, int);
+typedef int (*IgnUnlockFn)(void *);
+
+static unsigned int g_ignImage = 0;     /* the game's module base */
+
+static unsigned int IgnField(void *surf, unsigned int off)
+{
+    return ReadU32((const unsigned char *)surf + off);
+}
+
+//
+// Not static, and marked used/noinline, for the same reason as TurokFixRect2D:
+// its only reference is the rel32 written into the game's code, so it has to
+// keep a plain cdecl frame that nothing is allowed to specialise away.
+//
+extern "C" int __attribute__((cdecl, used, noinline))
+IgnPresentScaled(const unsigned char *src, int pitch, int sx, int sy,
+                 int w, int h, void *dst, int dx, int dy)
+{
+    IgnBlitFn             orig;
+    IgnLockFn             lock;
+    IgnUnlockFn           unlock;
+    const unsigned short *pal;
+    const unsigned char  *srcTop;
+    unsigned char        *base;
+    unsigned int          stride, prevLock;
+    int                   scale, outW, outH, ox, oy, stepX, stepY, x, y;
+    int                   screenW = (int)g_targetW;
+    int                   screenH = (int)g_targetH;
+
+    // Unreachable -- the hook is written only after g_ignImage is set -- but
+    // the alternative to checking is a wild read at 0x000F3348.
+    if (!g_ignImage) return 0;
+
+    orig   = *(IgnBlitFn *)  (g_ignImage + IGN_RVA_VT_BLIT);
+    lock   = *(IgnLockFn *)  (g_ignImage + IGN_RVA_VT_LOCK);
+    unlock = *(IgnUnlockFn *)(g_ignImage + IGN_RVA_VT_UNLOCK);
+
+    //
+    // Not ours: hand it straight back.  Note this also covers the case where
+    // the vtable is not populated yet, since `orig` is then NULL and the game
+    // would have crashed on the original instruction too.
+    //
+    if (!dst || !orig || w <= 0 || h <= 0 ||
+        ((unsigned int)dst != g_ignImage + IGN_RVA_SCREEN_A &&
+         (unsigned int)dst != g_ignImage + IGN_RVA_SCREEN_B) ||
+        (w >= screenW && h >= screenH))
+        return orig ? orig(src, pitch, sx, sy, w, h, dst, dx, dy) : 0;
+
+    /* Largest scale that fits, 16.16. */
+    scale = (screenW << 16) / w;
+    y     = (screenH << 16) / h;
+    if (y < scale) scale = y;
+
+    outW = (int)(((unsigned int)w * (unsigned int)scale) >> 16);
+    outH = (int)(((unsigned int)h * (unsigned int)scale) >> 16);
+    if (outW <= 0 || outH <= 0 || outW > screenW || outH > screenH)
+        return orig(src, pitch, sx, sy, w, h, dst, dx, dy);
+
+    ox = (screenW - outW) / 2;
+    oy = (screenH - outH) / 2;
+
+    stepX = (w << 16) / outW;
+    stepY = (h << 16) / outH;
+
+    //
+    // Take a write lock the same way the game's own blit does, and put the
+    // previous state back afterwards.  Leaving the surface locked differently
+    // from how we found it would strand the caller.
+    //
+    prevLock = IgnField(dst, IGN_SURF_LOCKTYPE);
+    if (prevLock != IGN_LOCK_WRITE) {
+        if (prevLock && unlock) unlock(dst);
+        if (!lock || !lock(dst, IGN_LOCK_WRITE)) return 0;
+    }
+
+    base   = (unsigned char *)IgnField(dst, IGN_SURF_WRITEPTR);
+    stride = IgnField(dst, IGN_SURF_STRIDE);
+
+    if (base && stride) {
+        pal    = (const unsigned short *)(g_ignImage + IGN_RVA_PALETTE);
+        srcTop = src + (unsigned int)pitch * (unsigned int)sy + sx;
+
+        for (y = 0; y < screenH; y++) {
+            unsigned short      *row = (unsigned short *)(base + stride * (unsigned int)y);
+            const unsigned char *srow;
+            int                  acc;
+
+            if (y < oy || y >= oy + outH) {          /* top / bottom bar */
+                for (x = 0; x < screenW; x++) row[x] = 0;
+                continue;
+            }
+
+            srow = srcTop + (unsigned int)pitch
+                          * (unsigned int)((((y - oy) * stepY) >> 16));
+
+            for (x = 0; x < ox; x++) row[x] = 0;     /* left bar */
+
+            acc = 0;
+            for (x = 0; x < outW; x++) {
+                unsigned char b = srow[acc >> 16];
+                row[ox + x] = b ? pal[b] : 0;
+                acc += stepX;
+            }
+
+            for (x = ox + outW; x < screenW; x++) row[x] = 0;   /* right bar */
+        }
+    }
+
+    if (prevLock != IGN_LOCK_WRITE) {
+        if (unlock) unlock(dst);
+        if (prevLock && lock) lock(dst, (int)prevLock);
+    }
+    return 1;
+}
+
+//
+// The hook itself.  `call *0x4F3348` is six bytes, `call rel32` is five, so it
+// is replaced in place with one nop of padding -- no code cave, and the
+// caller's `add $0x24,%esp` still balances because our function is cdecl too.
+//
+static const unsigned char ign_present[] =          /* 0x454336 */
+    "\x8b\x54\x24\x1c\x50\x51\x52\xff\x15\x48"
+    "\x33\x4f\x00\x83\xc4\x24\xc3";
+#define IGN_PRESENT_CALL_AT   7     /* offset of the `ff 15` within it */
+
+static void InstallIgnPresent(unsigned char *code, unsigned int codeSize,
+                              unsigned int imageBase)
+{
+    unsigned char  repl[sizeof(ign_present)];
+    unsigned char *at;
+    int            rel;
+
+    at = FindUnique(code, codeSize, ign_present, sizeof(ign_present) - 1);
+    if (!at) return;                    // already applied, or not this build
+
+    g_ignImage = imageBase;
+
+    memcpy(repl, ign_present, sizeof(ign_present) - 1);
+
+    rel = (int)((unsigned char *)&IgnPresentScaled
+                - (at + IGN_PRESENT_CALL_AT + 5));
+
+    repl[IGN_PRESENT_CALL_AT] = 0xE8;
+    PutU32(repl + IGN_PRESENT_CALL_AT + 1, (unsigned int)rel);
+    repl[IGN_PRESENT_CALL_AT + 5] = 0x90;       // pad the sixth byte
+
+    WriteCode(at, repl, sizeof(ign_present) - 1);
+}
+
+//
 // Everything Ignition needs.
 //
 // The order is load-bearing exactly once: F1 has to come first and, if it
@@ -2314,6 +2511,8 @@ static void IgnitionApply(const char *exePath)
     InstallIgnFocal(code, codeSize);
     InstallIgnAspect(code, codeSize);
     InstallIgnWipe(code, codeSize);
+    InstallIgnPresent(code, codeSize, (unsigned int)mod);
+
 }
 
 
