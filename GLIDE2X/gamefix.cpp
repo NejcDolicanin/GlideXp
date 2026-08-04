@@ -1916,6 +1916,408 @@ static void TurokApply(const char *exePath, const char *ini, BOOL haveIni)
 
 
 // ==========================================================================
+// Ignition (UDS / Virgin Interactive, 1997)
+// ==========================================================================
+//
+// Ign_3dfx.exe is a plain unencrypted PE (.text entropy 6.66) with relocations
+// stripped, so it can never be rebased and the absolute addresses in its own
+// code are stable.  It links glide2x.dll directly -- 34 imports, including
+// guDrawTriangleWithClip and grLfbLock -- and there is no separate video device
+// DLL: the game is its own renderer.
+//
+// Requirements 1 and 2 of the playbook are free here.  The single grSstWinOpen
+// call passes a hardcoded `push $0x6` (GR_RESOLUTION_640x400) and the mode
+// table at 0x46E7D8 has exactly one entry, so the game never asks for anything
+// else -- and does not need to, because the driver override decides the real
+// screen size regardless.  All that is left is convincing the game of it.
+//
+// The engine turns out to be almost entirely resolution-parametric, which is
+// what keeps this small.  Two globals hold the screen size --
+//
+//     0x536EEC   screen width      ~115 read sites
+//     0x547B18   screen height     ~80  read sites
+//
+// -- and the Glide clip window, the viewport rectangles, the projection centre
+// and the sprite scales are all derived from them.  Setting those two is most
+// of the fix.  What is NOT derived is the aspect: the engine was written for a
+// 320x200 virtual space on a 4:3 display, so it carries a fixed 1.2 pixel
+// aspect that has to be taken back out on a square-pixel panel.
+//
+// Four patches, in this order:
+//
+//   F1  relocate the 8bpp overlay buffer   (must succeed before any of the rest)
+//   F2  screen size globals   -> the real W,H
+//   F3  in-game camera focal lengths 425/348 -> derived from H
+//   F4  the two remaining aspect divisors    -> derived from H
+//
+
+#define IGN_EXE          "ign_3dfx.exe"
+
+/* The static 8bpp overlay buffer, and how many times .text names it. */
+#define IGN_FB_ADDR      0x547CA0u
+#define IGN_FB_SITES     64
+
+/* The mode the engine was written for, and the display it assumed. */
+#define IGN_NATIVE_W     640.0
+#define IGN_NATIVE_H     400.0
+#define IGN_NATIVE_ASPECT (4.0 / 3.0)
+
+/*
+ * How much narrower than tall one of the game's pixels was.  Everything that
+ * mixes an X quantity with a Y one has this baked into it, and on a
+ * square-pixel panel it has to come back out.
+ */
+#define IGN_PAR          (IGN_NATIVE_ASPECT / (IGN_NATIVE_W / IGN_NATIVE_H))
+
+/* The per-view focal lengths 0x43C8A0 hardcodes, in 640x400 pixels. */
+#define IGN_FOCAL_X      425.0
+#define IGN_FOCAL_Y      348.0
+
+/* The double 240.0 already sitting in .rdata -- 320.0 * IGN_PAR. */
+#define IGN_K240         0x46A568u
+
+//
+// F1.  The 8bpp overlay buffer is a fixed-size static array.
+//
+// Ignition's 2D layer -- HUD, text, menus, the loading screen -- is
+// software-rendered into an 8bpp buffer and colour-key blitted into the Glide
+// LFB through a 16-bit palette (the blit is at 0x458780; note its
+// `or %al,%al ; je skip`, which is what makes it an overlay rather than a
+// background).  That buffer is not allocated: it is the static array at
+// 0x547CA0, and the engine memsets W*H bytes of it every time the screen size
+// changes.  640x400 is 256,000 bytes; the next referenced global sits at
+// 0x5BEEE0, so there is room for 487,488 and no more.  2560x1080 wants
+// 2,764,800.
+//
+// So the buffer has to move before the screen size may be raised, and if it
+// cannot move then nothing else may be applied either -- a larger W*H over the
+// old array would memset straight through the rest of .data.
+//
+// Moving it is mechanical and, unusually for this kind of edit, provably safe.
+// The four bytes A0 7C 54 00 occur exactly 64 times in .text, and
+// disassembling the whole section shows all 64 are genuine instruction
+// operands: immediates of push/mov/add/sub, and disp32s of forms like
+// `mov 0x547ca0(%esi,%ecx,1),%dl`.  Not one is a mid-instruction coincidence,
+// and the value appears in no other section.  A flat scan-and-replace is
+// therefore exactly equivalent to rewriting the 64 operands one at a time, and
+// the count doubles as the build check -- any other build fails it and the
+// game runs unpatched.
+//
+static unsigned char *g_ignFrameBuffer = NULL;
+
+static BOOL InstallIgnFrameBuffer(unsigned char *code, unsigned int codeSize)
+{
+    unsigned char find[4], repl[4];
+    unsigned int  i, count, need;
+
+    if (g_ignFrameBuffer) return TRUE;          // already relocated
+
+    PutU32(find, IGN_FB_ADDR);
+
+    count = 0;
+    for (i = 0; i + 4 <= codeSize; ) {
+        if (memcmp(code + i, find, 4) == 0) { count++; i += 4; }
+        else                                          i += 1;
+    }
+    if (count != IGN_FB_SITES) return FALSE;    // not the build this describes
+
+    //
+    // One spare page.  The engine's clears round W*H up to a multiple of four
+    // and its row loops are written in terms of the surface pitch, so a little
+    // slack costs nothing and removes a class of off-by-a-few.
+    //
+    need = g_targetW * g_targetH + 0x1000;
+
+    g_ignFrameBuffer = (unsigned char *)VirtualAlloc(NULL, need,
+                                                     MEM_COMMIT | MEM_RESERVE,
+                                                     PAGE_READWRITE);
+    if (!g_ignFrameBuffer) return FALSE;
+
+    memset(g_ignFrameBuffer, 0, need);
+    PutU32(repl, (unsigned int)g_ignFrameBuffer);
+
+    for (i = 0; i + 4 <= codeSize; ) {
+        if (memcmp(code + i, find, 4) == 0) {
+            WriteCode(code + i, repl, 4);
+            i += 4;
+        } else {
+            i += 1;
+        }
+    }
+    return TRUE;
+}
+
+//
+// F2.  The screen size.
+//
+// 0x43C8A0 is the 3dfx screen init.  It writes the Glide clip window
+// (0x48EB38 / 0x48EB3C), calls the device set-mode -- which is literally
+// grBufferClear twice plus grClipWindow(0,0,W,H) -- then sets the two screen
+// globals and re-creates the 8bpp surface at W x H.
+//
+// The loader/intro path (0x411F00, and the 320x200 pixel-doubler at 0x412580)
+// is deliberately left alone.  It writes into the overlay buffer with a
+// hardcoded 640 pitch, so widening it there would smear the loading screen
+// rather than scale it.  It runs strictly before 0x43C8A0 -- the two are
+// consecutive states of the one machine at 0x445680 -- so the 640x400
+// transient is confined to start-up.
+//
+// 0x412510 is patched even so.  All it does is set the clip window and clear,
+// and the full screen is never a worse answer than the top-left 640x400 of it.
+//
+static const unsigned char ign_size_main[] =        /* 0x43C8AB */
+    "\xbf\x80\x02\x00\x00\xbd\x01\x00\x00\x00"
+    "\x89\x3d\x38\xeb\x48\x00\xc7\x05\x3c\xeb"
+    "\x48\x00\x90\x01\x00\x00";
+#define IGN_SIZE_MAIN_W_AT   1
+#define IGN_SIZE_MAIN_H_AT  22
+
+static const unsigned char ign_size_global[] =      /* 0x43C907 */
+    "\x89\x3d\xec\x6e\x53\x00\xc7\x05\x18\x7b"
+    "\x54\x00\x90\x01\x00\x00";
+#define IGN_SIZE_GLOBAL_H_AT 12
+
+static const unsigned char ign_size_clip[] =        /* 0x412510 */
+    "\xc7\x05\x38\xeb\x48\x00\x80\x02\x00\x00"
+    "\xc7\x05\x3c\xeb\x48\x00\x90\x01\x00\x00"
+    "\xc7\x05\x40\xeb\x48\x00\x08\x00\x00\x00"
+    "\xc7\x05\x44\xeb\x48\x00\x01\x00\x00\x00"
+    "\xe8\x43\x1e\x04\x00";
+#define IGN_SIZE_CLIP_W_AT   6
+#define IGN_SIZE_CLIP_H_AT  16
+
+static void IgnPatchSize(unsigned char *code, unsigned int codeSize,
+                         const unsigned char *sig, unsigned int len,
+                         int wAt, int hAt)
+{
+    unsigned char  repl[64];
+    unsigned char *at;
+
+    at = FindUnique(code, codeSize, sig, len);
+    if (!at) return;                    // already applied, or not this build
+
+    memcpy(repl, sig, len);
+    if (wAt >= 0) PutU32(repl + wAt, g_targetW);
+    if (hAt >= 0) PutU32(repl + hAt, g_targetH);
+
+    WriteCode(at, repl, len);
+}
+
+static void InstallIgnScreenSize(unsigned char *code, unsigned int codeSize)
+{
+    /* sizeof-1 throughout: these are string literals, so drop the NUL. */
+    IgnPatchSize(code, codeSize, ign_size_main,   sizeof(ign_size_main)   - 1,
+                 IGN_SIZE_MAIN_W_AT,   IGN_SIZE_MAIN_H_AT);
+    IgnPatchSize(code, codeSize, ign_size_global, sizeof(ign_size_global) - 1,
+                 -1,                   IGN_SIZE_GLOBAL_H_AT);
+    IgnPatchSize(code, codeSize, ign_size_clip,   sizeof(ign_size_clip)   - 1,
+                 IGN_SIZE_CLIP_W_AT,   IGN_SIZE_CLIP_H_AT);
+}
+
+//
+// F3.  The in-game camera's focal lengths.
+//
+// The projection is integer 8.8 fixed point around a camera struct
+// ([0x620368]) whose fields are focal-X (+0x80), focal-Y (+0x84), centre-X
+// (+0x9C) and centre-Y (+0xA0).  That reading is not inferred from the names
+// of anything: the frustum-plane builder at 0x44BE6F forms
+// (clipEdge - centre) against each focal, once per edge, and 0x44C53E caches
+// the two centres as `<< 8` into 0x4A24C4 / 0x4A24C8.
+//
+// The centres come from 0x44AB30 as W/2 and H/2, so they follow F2 for free.
+// The focal lengths do not: 0x43C8A0 hardcodes 425 and 348 into every view
+// (0x5BEEE4[i] + 0x58 / 0x5C), from where 0x41EE54 copies them into the camera
+// on each update.  Both are pixel counts for 640x400.
+//
+//     fy = 348 * H/400        -- so the vertical FOV comes out independent of H
+//     fx = fy * (425/348) * IGN_PAR
+//
+// Taking fy straight from the height is what makes this Hor+: the vertical
+// view is exactly what it always was, and a wider screen becomes more world at
+// the sides rather than a stretch.  On a square-pixel panel fx lands 1.8%
+// above fy, which is the engine's own small deviation from a true 1.2 and is
+// preserved rather than rounded away.
+//
+static const unsigned char ign_focal[] =            /* 0x43C91B */
+    "\xbf\xa9\x01\x00\x00\xba\x00\x00\x24\x40"
+    "\x8b\x2d\xe4\xee\x5b\x00\x41\x89\x7c\x28"
+    "\x58\x8b\x2d\xe4\xee\x5b\x00\xc7\x44\x28"
+    "\x5c\x5c\x01\x00\x00";
+#define IGN_FOCAL_X_AT    1
+#define IGN_FOCAL_Y_AT   31
+
+static void InstallIgnFocal(unsigned char *code, unsigned int codeSize)
+{
+    unsigned char  repl[sizeof(ign_focal)];
+    unsigned char *at;
+    double         scale;
+    unsigned int   fx, fy;
+
+    at = FindUnique(code, codeSize, ign_focal, sizeof(ign_focal) - 1);
+    if (!at) return;
+
+    scale = (double)g_targetH / IGN_NATIVE_H;
+    fy    = (unsigned int)(IGN_FOCAL_Y * scale + 0.5);
+    fx    = (unsigned int)(IGN_FOCAL_X * scale * IGN_PAR + 0.5);
+
+    memcpy(repl, ign_focal, sizeof(ign_focal) - 1);
+    PutU32(repl + IGN_FOCAL_X_AT, fx);
+    PutU32(repl + IGN_FOCAL_Y_AT, fy);
+
+    WriteCode(at, repl, sizeof(ign_focal) - 1);
+}
+
+//
+// F4.  The two remaining aspect divisors.
+//
+// Both compute an X quantity from the screen WIDTH against a 320-unit virtual
+// space, while the Y counterpart three instructions later uses the HEIGHT
+// against 200:
+//
+//   0x43CAC3   sprite / particle scale, 16.16 pixels per virtual unit,
+//              into 0x536C50 (X) and 0x536E3C (Y)
+//   0x44AB43   the menu and car-preview camera's focal-X, into camera +0x80
+//
+// On a square-pixel screen the X one should come from the height as well, over
+// 320 * IGN_PAR = 240 -- and 240.0 already exists in .rdata at 0x46A568, one
+// instruction away from the 320.0 being replaced.  So each site is a two-field
+// edit: change the esp displacement so the height is loaded instead of the
+// width, and repoint the divide at 240.0.  Same length, nothing relocates, and
+// no new constant has to be found room for.
+//
+// Neither depends on the target resolution -- they express "pixels are square"
+// and nothing else.  320.0 at 0x46A850 has exactly two references image-wide
+// and these are both of them, so afterwards it is unreferenced.
+//
+static const unsigned char ign_sprite_scale[] =     /* 0x43CAC3 */
+    "\xdd\x44\x24\x10\xdc\x0d\x58\xa8\x46\x00"
+    "\xa3\x30\x6e\x53\x00\xdc\x35\x50\xa8\x46"
+    "\x00\xe8\xb7\x1a\x02\x00";
+#define IGN_SPRITE_DISP_AT    3     /* fldl 0x10(%esp) -> 0x18(%esp) */
+#define IGN_SPRITE_DIV_AT    17     /* fdivl 320.0     -> 240.0      */
+
+static const unsigned char ign_menu_focal[] =       /* 0x44AB43 */
+    "\xd9\x44\x24\x00\xdc\x35\x50\xa8\x46\x00"
+    "\xdd\x5c\x24\x04\xdd\x44\x24\x04\xdc\x0d"
+    "\xf8\xa8\x46\x00";
+#define IGN_MENU_DISP_AT      3     /* flds 0x0(%esp)  -> 0x10(%esp) */
+#define IGN_MENU_DIV_AT       6     /* fdivl 320.0     -> 240.0      */
+
+static void InstallIgnAspect(unsigned char *code, unsigned int codeSize)
+{
+    unsigned char  repl[sizeof(ign_sprite_scale)];
+    unsigned char *at;
+
+    at = FindUnique(code, codeSize, ign_sprite_scale,
+                    sizeof(ign_sprite_scale) - 1);
+    if (at) {
+        memcpy(repl, ign_sprite_scale, sizeof(ign_sprite_scale) - 1);
+        repl[IGN_SPRITE_DISP_AT] = 0x18;            /* the height slot */
+        PutU32(repl + IGN_SPRITE_DIV_AT, IGN_K240);
+        WriteCode(at, repl, sizeof(ign_sprite_scale) - 1);
+    }
+
+    at = FindUnique(code, codeSize, ign_menu_focal,
+                    sizeof(ign_menu_focal) - 1);
+    if (at) {
+        memcpy(repl, ign_menu_focal, sizeof(ign_menu_focal) - 1);
+        repl[IGN_MENU_DISP_AT] = 0x10;              /* the height slot */
+        PutU32(repl + IGN_MENU_DIV_AT, IGN_K240);
+        WriteCode(at, repl, sizeof(ign_menu_focal) - 1);
+    }
+}
+
+//
+// F5.  Skip the race-start wipe.  It is 640x400-only and cannot be widened.
+//
+// This is what crashed a few frames into the first successful 2560x1080 race,
+// at 0x436DAA, reading 0x954 bytes past the end of a heap block.
+//
+// 0x436C10 draws a transition wipe: it locks the LFB and, for each screen row,
+// paints black wherever a stencil byte still holds its initial 0x14.  The
+// stencil is `malloc(0x4F1A0)` at 0x41C1E6 -- exactly 800 x 405 bytes -- and
+// the track is drawn into it as value 5.  Its callers gate on a 0..100 float
+// progress at 0x536D18 and on a countdown at 0x536E2C, so this runs only for
+// the second or so of the race intro.  Nothing else depends on it: the
+// countdown and the state change that follows it live in the caller.
+//
+// 800 is 640 plus an 80-pixel margin each side, and the routine centres the
+// screen on it: stencil column = screenColumn + 400 - W/2.  That is exact at
+// 640 and holds for any width up to 800.  At 2560 it starts at -880 and runs
+// to +1680.  The row index is no better -- it is scaled by W/320 AND again by
+// W/H, both of which were 640x400 constants in disguise, and it is bounded
+// against W/2+4 rather than against the stencil's 405 rows.
+//
+// The give-away is the twin routine at 0x406450, which does the identical job
+// with every one of those quantities written out as a literal: `cmp $0x280`
+// for the column loop, `0x50` for the margin, `cmp $0x144` for the row bound,
+// and `640.0 / 400.0` where 0x436C10 computes W/H.  So W/320 was meant to read
+// "the resolution multiplier, 2" and W/H "the aspect, 1.6".
+//
+// Correcting those scales is not enough, because the stencil has no data
+// outside 800 columns -- widening the effect means regenerating the stencil at
+// the new size, and the code that fills it is hardcoded to 800 as well.  The
+// alternatives were to clamp it, which paints a 640x400 black rectangle into
+// the corner of the screen for a second, or to drop it.  Dropping a transient
+// effect that cannot be made correct is the smaller lie.
+//
+// One byte: `ret` over the prologue.  The callers are cdecl (`add $0x4,%esp`)
+// and neither looks at the return value, and the grLfbLock/grLfbUnlock pair
+// this function owns is skipped as a pair.
+//
+static const unsigned char ign_wipe[] =             /* 0x436C10 */
+    "\x55\x8b\xec\x83\xe4\xf8\x83\xec\x24\x8b"
+    "\x0d\xec\x6e\x53\x00\xb8";
+
+static void InstallIgnWipe(unsigned char *code, unsigned int codeSize)
+{
+    unsigned char  repl[sizeof(ign_wipe)];
+    unsigned char *at;
+
+    at = FindUnique(code, codeSize, ign_wipe, sizeof(ign_wipe) - 1);
+    if (!at) return;                    // already applied, or not this build
+
+    memcpy(repl, ign_wipe, sizeof(ign_wipe) - 1);
+    repl[0] = 0xC3;                     // ret
+
+    WriteCode(at, repl, sizeof(ign_wipe) - 1);
+}
+
+//
+// Everything Ignition needs.
+//
+// The order is load-bearing exactly once: F1 has to come first and, if it
+// fails, everything else has to be skipped.  Raising the screen size over the
+// original 256,000-byte overlay array would have the engine memset through the
+// rest of .data on the first mode change.  Failing closed leaves the game
+// running stock, which is the correct outcome for a binary this code does not
+// recognise.
+//
+// No ini keys.  A game drawing into the corner of the screen, or drawing it
+// with the wrong aspect, is not a preference.
+//
+static void IgnitionApply(const char *exePath)
+{
+    HMODULE        mod;
+    unsigned char *code = NULL;
+    unsigned int   codeSize = 0;
+
+    if (!PathEndsWith(exePath, IGN_EXE)) return;
+
+    mod = GetModuleHandleA(NULL);
+    if (!mod) return;
+    if (!GetCodeRange(mod, &code, &codeSize)) return;
+
+    if (!InstallIgnFrameBuffer(code, codeSize)) return;
+
+    InstallIgnScreenSize(code, codeSize);
+    InstallIgnFocal(code, codeSize);
+    InstallIgnAspect(code, codeSize);
+    InstallIgnWipe(code, codeSize);
+}
+
+
+// ==========================================================================
 // Public entry points
 // ==========================================================================
 
@@ -1977,5 +2379,6 @@ void GameFix_Apply(void)
     haveIni = PathBesideExe(GAMEFIX_INI, ini);
 
     Gta2Apply(exePath, ini, haveIni);
+    IgnitionApply(exePath);
     TurokApply(exePath, ini, haveIni);
 }
