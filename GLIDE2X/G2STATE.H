@@ -151,6 +151,17 @@ struct NonStateInfo {
 		#endif
 	} tmu_state[GLIDE_NUM_TMU];
 
+	// Real display height, cached at grSstWinOpen.  Only grSstVRetraceOn uses
+	// it, and it is cached rather than queried because the caller is a spin
+	// loop -- see the comment there.  Zero means "not known yet".
+	FxU32 screen_height;
+
+	// Does the Glide3 underneath us answer GR_VIDEO_POSITION?  Probed once at
+	// grSstWinOpen, because it is optional: a stock glide3x declines it and
+	// grSstVRetraceOn must then fall back rather than wait for a beam nobody
+	// is reporting.
+	FxBool have_video_position;
+
 	// Reset the nsinfo. Can only be called AFTER grGlideInit
 	inline void Reset() {
 	#define FN_NAME "NonStateInfo::Reset"
@@ -158,6 +169,8 @@ struct NonStateInfo {
 		// Reset basic things
 		current_sst = 0;
 		num_tmus = 1;
+		screen_height = 0;
+		have_video_position = FXFALSE;
 
 		// This will reset all of the Glide Utils Texture Management stuff
 		guTexMemReset();

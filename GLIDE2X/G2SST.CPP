@@ -319,6 +319,21 @@ FxBool FX_CALL grSstWinOpenExt(
 	theState.clipwindowf_xmax = (float) viewport[2];
 	theState.clipwindowf_ymax = (float) viewport[3];
 
+	// Cached for grSstVRetraceOn.  Note this is the resolution the DRIVER
+	// actually opened, so it already accounts for any override.
+	nsInfo.screen_height = (FxU32) viewport[3];
+
+	// grSstVRetraceOn has no Glide3 entry point to forward to -- Glide3 keeps
+	// _grSstVRetraceOn as an internal FX_CSTYLE routine and does not export it
+	// -- so it is synthesised from the beam position.  That query is optional,
+	// so probe it once here rather than per call: grGet answers with the length
+	// it wrote, i.e. 4 on success and 0 when it declines.
+	{
+		FxI32 probe = 0;
+		nsInfo.have_video_position =
+			(Glide3::grGet(GR_VIDEO_POSITION, 4, &probe) == 4) ? FXTRUE : FXFALSE;
+	}
+
 	// Get Number of TMUs
 	if (!nsInfo.environment.no_multitexture)
 		Glide3::grGet(GR_NUM_TMU,4, &nsInfo.num_tmus);				
@@ -502,8 +517,14 @@ FxU32 FX_CALL grSstStatus( void )
 
 	// 5:0		PCI FIFO free space (0x3F=FIFO empty) 
 
-	// 6		Vertical retrace (0=vertical retrace active; 1=vertical retrace inactive). 
-	if(grSstVRetraceOn()) ret |= 1 << 6;
+	// 6		Vertical retrace (0=vertical retrace active; 1=vertical retrace inactive).
+	//
+	// Note the inversion, which this used to get backwards: the bit is CLEAR
+	// while retrace is active, which is why 3dfx's own Glide2 answers
+	// grSstVRetraceOn with `(status & SST_VRETRACE) == 0`
+	// (H5/GLIDE/SRC/GSST.C:2759, and the shipped glide2x.dll does `test $0x40`
+	// / `sete`).  So the bit is set when retrace is NOT on.
+	if(!grSstVRetraceOn()) ret |= 1 << 6;
 
 	// 7		Pixelfx graphics engine busy (0=engine idle; 1=engine busy)
 	// 8		TMU busy (0=engine idle; 1=engine busy)
@@ -544,14 +565,66 @@ FxU32 FX_CALL grSstVideoLine()
 //
 // grSstVRetraceOn
 //
+// "Is the beam in vertical retrace?"  3dfx's own Glide2 answers it from a
+// status bit that stays asserted for the whole retrace interval:
+//
+//     H5/GLIDE/SRC/GSST.C:2751
+//     return ((grSstStatus() & SST_VRETRACE) == 0);
+//
+// This used to compare grGet(GR_VIDEO_POSITION) against 0, which is true for
+// exactly one scanline out of the vertical total -- the same question, a
+// completely different duty cycle.
+//
+// It matters because games use this to pace themselves against the display.
+// Ignition does exactly that: on its 2D-only screens it does not swap buffers
+// at all, it spins here until retrace begins and then writes straight into the
+// visible buffer (Ign_3dfx.exe 0x405E50, six callers).  With a one-scanline
+// window that sync lands in the wrong place, and hand-drawn 2D tears while
+// geometry, which goes through the FIFO, does not.
+//
+// The window is the retrace interval plus a small margin at the bottom of the
+// visible area.  The margin is there for safety as much as fidelity: the
+// caller is a spin loop, so a window the scanline counter could step over
+// without us observing it would hang the game.  For the same reason an unknown
+// screen height answers FXTRUE rather than risking a wait that never ends.
+//
+// Answering FXTRUE is always the safe answer here, because the caller is a spin
+// loop -- see the three guards below.
 FxBool FX_CALL grSstVRetraceOn()
 {
 #define FN_NAME "grSstVRetraceOn"
     GDBG_INFO(80, "%s\n", FN_NAME);
 
-	FxU32	ret;
-	Glide3::grGet(GR_VIDEO_POSITION,4,&ret);
-	return ret==0?FXTRUE:FXFALSE;
+	static FxU32	lastPos = 0xFFFFFFFFu;
+	static FxU32	stuck   = 0;
+
+	FxI32	pos = 0;
+
+	// 1. Nothing to compare against yet.
+	if (!nsInfo.screen_height || !nsInfo.have_video_position) return FXTRUE;
+
+	// 2. GR_VIDEO_POSITION is not a required Glide3 query and it is NOT
+	//    answered by a stock glide3x: 3dfx's own code accepts plength 8 only
+	//    and reports a constant 0,0 without ever reading the hardware, so a
+	//    beam wait built on it spins forever.  grGet returns 0 when it declines
+	//    to answer, and `pos` is then left untouched -- taking the return value
+	//    on trust would be reading an uninitialised local.
+	if (Glide3::grGet(GR_VIDEO_POSITION, 4, &pos) != 4) return FXTRUE;
+
+	// 3. Belt and braces for a driver that answers but reports a frozen beam.
+	//    A scanline lasts ~15us and this call costs an uncached register read,
+	//    so a genuine wait never sees the same line this many times; a driver
+	//    that is not tracking the beam degrades to "always in retrace" instead
+	//    of hanging the game.
+	if ((FxU32)pos == lastPos) {
+		if (++stuck > 200000u) return FXTRUE;
+	} else {
+		lastPos = (FxU32)pos;
+		stuck   = 0;
+	}
+
+	return ((FxU32)pos >= nsInfo.screen_height - (nsInfo.screen_height >> 4))
+	           ? FXTRUE : FXFALSE;
 
 #undef FN_NAME
 }
