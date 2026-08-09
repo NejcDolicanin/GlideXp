@@ -44,6 +44,10 @@ void GameFix_Apply(void);
 // exactly as it would unpatched.
 int GameFix_SetResolutionEnum(unsigned int glideEnum);
 
+// TEMPORARY.  Called once per grBufferSwap so the MDK diagnostic has somewhere
+// to flush from.  Goes when the diagnostic goes -- see gamefix.cpp.
+void GameFix_Tick(void);
+
 #ifdef __cplusplus
 }
 #endif

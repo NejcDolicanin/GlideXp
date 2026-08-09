@@ -35,9 +35,14 @@
 //
 
 #include <windows.h>
+#include <stdarg.h>
 #include <string.h>
 
 #include "gamefix.h"
+
+/* TEMPORARY -- forward declaration for the MDK diagnostic, defined below. */
+static void MdkDiag(const char *fmt, ...);
+static BOOL MdkDiagFresh(unsigned int key);
 
 //
 // A single patch.  `find` and `replace` are the same length by construction;
@@ -2004,6 +2009,7 @@ static void TurokApply(const char *exePath, const char *ini, BOOL haveIni)
 // game runs unpatched.
 //
 static unsigned char *g_ignFrameBuffer = NULL;
+static unsigned int   g_ignFrameBytes  = 0;     /* TEMPORARY: for the diagnostic */
 
 static BOOL InstallIgnFrameBuffer(unsigned char *code, unsigned int codeSize)
 {
@@ -2034,6 +2040,7 @@ static BOOL InstallIgnFrameBuffer(unsigned char *code, unsigned int codeSize)
     if (!g_ignFrameBuffer) return FALSE;
 
     memset(g_ignFrameBuffer, 0, need);
+    g_ignFrameBytes = need;
     PutU32(repl, (unsigned int)g_ignFrameBuffer);
 
     for (i = 0; i + 4 <= codeSize; ) {
@@ -2320,6 +2327,10 @@ static void InstallIgnWipe(unsigned char *code, unsigned int codeSize)
 #define IGN_RVA_SCREEN_A    0x0F2F40u   /* the two screen surfaces       */
 #define IGN_RVA_SCREEN_B    0x0F2E50u
 #define IGN_RVA_PALETTE     0x21E520u   /* 256 x u16, index -> 16bpp     */
+#define IGN_RVA_CLIP_W      0x08EB38u   /* Glide clip window, 0x48EB38   */
+#define IGN_RVA_CLIP_H      0x08EB3Cu
+#define IGN_RVA_SCREEN_W    0x136EECu   /* screen globals, 0x536EEC      */
+#define IGN_RVA_SCREEN_H    0x147B18u
 
 /* Fields of the surface descriptor, read off 0x458A60 and 0x458780. */
 #define IGN_SURF_LOCKTYPE   0x0C        /* 0 = none, 1 = read, 3 = write */
@@ -2367,6 +2378,9 @@ IgnPresentScaled(const unsigned char *src, int pitch, int sx, int sy,
     orig   = *(IgnBlitFn *)  (g_ignImage + IGN_RVA_VT_BLIT);
     lock   = *(IgnLockFn *)  (g_ignImage + IGN_RVA_VT_LOCK);
     unlock = *(IgnUnlockFn *)(g_ignImage + IGN_RVA_VT_UNLOCK);
+
+    // (The loading screen arrives here as a plain 640x400 source, because F8
+    // puts the screen globals back to 640x400 for the duration of the load.)
 
     //
     // Not ours: hand it straight back.  Note this also covers the case where
@@ -2481,6 +2495,289 @@ static void InstallIgnPresent(unsigned char *code, unsigned int codeSize,
 }
 
 //
+// F7.  The other screen-sized buffer.
+//
+// This is the second-race crash, and it is ours: the first race is fine, the
+// second always dies, in championship mode too -- so it is the second run of
+// the load path, not the menu.
+//
+// 0x412580 is the loading-screen builder (the 320x200 pixel-doubler).  It ends
+// with two loops over the whole screen, both counting W*H out of the live
+// globals:
+//
+//   0x4127A5   overlay[i] = table[src[i]][overlay[i]]      (reads src)
+//   0x4127DC   src[i]     = constant                       (writes src)
+//
+// where `src` is the buffer whose pointer lives at 0x547C40.  That buffer is a
+// single allocation of 0x77240 = 487,488 bytes, made once at 0x412AE1 -- which
+// is 800x600 rounded up, i.e. the engine's largest stock mode.  So the game's
+// own invariant is `W*H <= 487,488`, and it holds for every resolution
+// Ignition ever shipped with.
+//
+// F2 breaks it.  At start-up the loader has just set the globals to 640x400,
+// so the first pass counts 256,000 and fits.  On the second race the globals
+// are still W x H from the first one -- the standing note that the 640x400
+// transient is "confined to start-up" is simply wrong, because the loader runs
+// again for every race -- so the count becomes 1,536,000 at 1920x800 and both
+// loops run off the end.  The read faulted first, 4KB past the block at the
+// first unmapped page, which is exactly what the crash log showed:
+//
+//   at=004127b1 exe+000127b1   read at 01bc8000   fb+00b08000
+//   eax=00177000 (= 1920*800)  live W=1920 H=800  clip=640x400
+//
+// GROWING THAT ALLOCATION WAS THE WRONG FIX, AND IT IS RECORDED HERE BECAUSE
+// THE REASON IS NOT OBVIOUS.  Enlarging the 0x77240 request to W*H did stop
+// this fault -- and moved it four instructions along, to 0x4127CA, with the
+// table pointer 0x5C3D60 reading NULL.  That pointer is allocated from the
+// SAME arena (handle 0x536F78, at 0x412E05), so taking an extra megabyte for
+// `src` exhausted the arena and the next allocation out of it failed.  The
+// size constant being unique in the image said nothing about the pool it comes
+// out of.  Do not try to grow it again.
+//
+// The right fix needs no allocation at all.  The first race already works, and
+// what makes it work is that the loader has just set the globals to 640x400,
+// so these loops count 640*400 = 256,000.  That is not a coincidence of the
+// stock resolution -- it is the size of the thing being processed.  The
+// loading screen is 640x400 artwork written at a hardcoded 640 pitch (the
+// pixel-doubler this routine is built around), so 256,000 contiguous bytes is
+// exactly the image, at any screen size.
+//
+// So both counts are pinned to 640x400, which reproduces the known-good first
+// pass on every subsequent one, fits the stock buffer with 231,488 bytes to
+// spare, and leaves every allocation exactly as the game made it.
+//
+// Only these two sites need it.  Of the nine W*H products in the image the
+// other six that touch a buffer all feed `mov edi,0x547CA0` -- overlay memsets
+// -- and the overlay is W*H+4096 by F1, so they are correct as they stand.
+//
+static const unsigned char ign_loop_read[] =        /* 0x412785 */
+    "\x0f\xaf\x05\xec\x6e\x53\x00";
+static const unsigned char ign_loop_write[] =       /* 0x4127EC */
+    "\x0f\xaf\x15\xec\x6e\x53\x00";
+
+/* imul <reg>,ds:W  ->  mov <reg>,imm32 + 2 nops.  Same 7 bytes. */
+#define IGN_LOOP_MOV_EAX   0xB8
+#define IGN_LOOP_MOV_EDX   0xBA
+
+static void IgnPinLoop(unsigned char *code, unsigned int codeSize,
+                       const unsigned char *sig, unsigned char movOp,
+                       unsigned int count)
+{
+    unsigned char  repl[7];
+    unsigned char *at;
+
+    at = FindUnique(code, codeSize, sig, 7);
+    if (!at) return;                    // already applied, or not this build
+
+    repl[0] = movOp;
+    PutU32(repl + 1, count);
+    repl[5] = 0x90;
+    repl[6] = 0x90;
+
+    WriteCode(at, repl, 7);
+}
+
+static void InstallIgnLoadLoops(unsigned char *code, unsigned int codeSize)
+{
+    unsigned int count = 640u * 400u;
+
+    /* Cannot exceed the overlay, for a target smaller than the stock mode. */
+    if (count > g_targetW * g_targetH) count = g_targetW * g_targetH;
+
+    IgnPinLoop(code, codeSize, ign_loop_read,  IGN_LOOP_MOV_EAX, count);
+    IgnPinLoop(code, codeSize, ign_loop_write, IGN_LOOP_MOV_EDX, count);
+}
+
+//
+// F8.  The loading screen is a 640x400 screen, so say so.
+//
+// The screen globals 0x536EEC / 0x547B18 have exactly TWO writers in the whole
+// image: the start-up loader 0x411F00, which sets 640x400 and runs once, and
+// the race init 0x43C907, which F2 makes W x H.  Nothing ever puts them back.
+//
+// The per-load state handler is 0x412E70.  It is reached through the state
+// table -- which is why nothing calls it directly, and why this file long
+// recorded it as "dead"; in this exe "no direct callers" does not mean dead.
+// It resets the Glide clip window to 640x400 and calls the loading-screen
+// builder at 0x412EF2, but it leaves the screen globals alone.
+//
+// So the first load runs with globals 640x400 (start-up had just set them) and
+// every later one runs with W x H, while the artwork is still written at a
+// hardcoded 640 pitch.  Two things came out of that, and both were reported:
+//
+//   * the present takes its source rect AND pitch from those globals, so the
+//     background was read at a 1920 stride and appeared as three squashed
+//     copies across each row -- 1920/640 = 3;
+//   * the loading indicator is drawn at the same stale pitch, so its rows land
+//     three apart instead of one, which is the interlacing.
+//
+// Both are the one fault, so both get one fix: reproduce the first load.  The
+// call at 0x412EF2 is redirected to a stub that sets the globals to 640x400
+// and jumps to the builder, and the race init sets them back to W x H when the
+// race actually starts -- which is the existing, already-correct behaviour.
+//
+// The stub writes two immediates and jumps.  `mov [mem],imm32` touches no
+// register and no flag, and the jump keeps the caller's return address, so
+// nothing else has to be preserved.
+//
+static const unsigned char ign_load_call[] =        /* 0x412EEA */
+    "\x33\xc0\x5f\x5e\x83\xc4\x70\xc3\xe8\x89"
+    "\xf6\xff\xff\x68\x20\x6e\x53\x00";
+#define IGN_LOAD_CALL_AT     8
+
+static unsigned char *g_ignLoadStub = NULL;
+
+static void InstallIgnLoadState(unsigned char *code, unsigned int codeSize,
+                                unsigned int imageBase)
+{
+    unsigned char  repl[sizeof(ign_load_call)];
+    unsigned char *at, *stub;
+    unsigned int   builder;
+    int            rel;
+
+    at = FindUnique(code, codeSize, ign_load_call, sizeof(ign_load_call) - 1);
+    if (!at) return;                    // already applied, or not this build
+
+    /* Where the original call was going. */
+    builder = (unsigned int)(at + IGN_LOAD_CALL_AT + 5)
+            + ReadU32(at + IGN_LOAD_CALL_AT + 1);
+
+    stub = (unsigned char *)VirtualAlloc(NULL, 64, MEM_COMMIT | MEM_RESERVE,
+                                         PAGE_EXECUTE_READWRITE);
+    if (!stub) return;
+    g_ignLoadStub = stub;
+
+    /* mov dword [screenW], 640 */
+    stub[0] = 0xC7; stub[1] = 0x05;
+    PutU32(stub + 2, imageBase + IGN_RVA_SCREEN_W);
+    PutU32(stub + 6, 640);
+    /* mov dword [screenH], 400 */
+    stub[10] = 0xC7; stub[11] = 0x05;
+    PutU32(stub + 12, imageBase + IGN_RVA_SCREEN_H);
+    PutU32(stub + 16, 400);
+    /* jmp builder */
+    stub[20] = 0xE9;
+    PutU32(stub + 21, (unsigned int)(builder - ((unsigned int)stub + 25)));
+
+    memcpy(repl, ign_load_call, sizeof(ign_load_call) - 1);
+    rel = (int)((unsigned int)stub - ((unsigned int)at + IGN_LOAD_CALL_AT + 5));
+    PutU32(repl + IGN_LOAD_CALL_AT + 1, (unsigned int)rel);
+
+    WriteCode(at, repl, sizeof(ign_load_call) - 1);
+}
+
+// ==========================================================================
+// TEMPORARY DIAGNOSTIC -- remove once the second-race crash is understood.
+// ==========================================================================
+//
+// Symptom: the first race is fine; loading a SECOND one crashes to desktop.
+// Through the menu or straight on in championship mode, same result -- so it
+// is the second execution of the load path, not anything about the menu.  Only
+// with the resolution override active, but that only says "one of F1-F6",
+// since nothing is patched at all without a target resolution.
+//
+// The reason this is a filter rather than a guess: the standing model of the
+// load path says the 640x400 transient is "confined to start-up", and the
+// repro proves that wrong -- the loader runs for every race, and on the second
+// one it is entered with the screen globals already at W x H rather than
+// 640x400.  That makes a whole class of routines suspect and names none of
+// them.  One faulting address ends the argument.
+//
+// Reported three ways, because each names a different cause:
+//   * as an RVA into Ign_3dfx.exe          -- which routine died
+//   * as an offset into our relocated overlay buffer, with its size beside it
+//     -- a small positive value means an F1 overrun, anything else means F1 is
+//     not involved
+//   * the register set, for an obviously wrong index
+//
+// Plus the live screen globals, which say whether the loader had already reset
+// them to 640x400 when it died.
+//
+static char  g_ignLog[4096];
+static int   g_ignLogLen = 0;
+static LPTOP_LEVEL_EXCEPTION_FILTER g_ignPrevFilter = NULL;
+
+static void IgnDiag(const char *fmt, ...)
+{
+    char    line[256];
+    int     n;
+    va_list ap;
+
+    va_start(ap, fmt);
+    n = wvsprintfA(line, fmt, ap);
+    va_end(ap);
+
+    if (n < 0 || g_ignLogLen + n + 2 >= (int)sizeof(g_ignLog)) return;
+
+    memcpy(g_ignLog + g_ignLogLen, line, n);
+    g_ignLogLen += n;
+    g_ignLog[g_ignLogLen++] = '\r';
+    g_ignLog[g_ignLogLen++] = '\n';
+}
+
+static void IgnDiagFlush(void)
+{
+    char   path[MAX_PATH];
+    HANDLE h;
+    DWORD  wrote = 0;
+
+    if (!g_ignLogLen) return;
+    if (!PathBesideExe("gxp_ign.txt", path)) return;
+
+    h = CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                    FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return;
+
+    WriteFile(h, g_ignLog, (DWORD)g_ignLogLen, &wrote, NULL);
+    CloseHandle(h);
+}
+
+static LONG WINAPI IgnCrashFilter(EXCEPTION_POINTERS *ep)
+{
+    unsigned int pc, addr;
+
+    if (ep && ep->ExceptionRecord && ep->ContextRecord) {
+        pc = (unsigned int)ep->ExceptionRecord->ExceptionAddress;
+
+        IgnDiag("CRASH code=%08lx at=%08lx  exe+%08lx",
+                (long)ep->ExceptionRecord->ExceptionCode, (long)pc,
+                (long)(pc - g_ignImage));
+
+        if (ep->ExceptionRecord->NumberParameters >= 2) {
+            addr = (unsigned int)ep->ExceptionRecord->ExceptionInformation[1];
+            IgnDiag("  %s at %08lx",
+                    ep->ExceptionRecord->ExceptionInformation[0] ? "wrote"
+                                                                 : "read",
+                    (long)addr);
+            if (g_ignFrameBuffer)
+                IgnDiag("  fb+%08lx  (fb=%08lx size=%08lx)",
+                        (long)(addr - (unsigned int)g_ignFrameBuffer),
+                        (long)(unsigned int)g_ignFrameBuffer,
+                        (long)g_ignFrameBytes);
+        }
+
+        IgnDiag("  eax=%08lx ebx=%08lx ecx=%08lx edx=%08lx",
+                (long)ep->ContextRecord->Eax, (long)ep->ContextRecord->Ebx,
+                (long)ep->ContextRecord->Ecx, (long)ep->ContextRecord->Edx);
+        IgnDiag("  esi=%08lx edi=%08lx ebp=%08lx esp=%08lx",
+                (long)ep->ContextRecord->Esi, (long)ep->ContextRecord->Edi,
+                (long)ep->ContextRecord->Ebp, (long)ep->ContextRecord->Esp);
+
+        if (g_ignImage) {
+            IgnDiag("  live W=%ld H=%ld  clip=%ldx%ld",
+                    (long)*(int *)(g_ignImage + IGN_RVA_SCREEN_W),
+                    (long)*(int *)(g_ignImage + IGN_RVA_SCREEN_H),
+                    (long)*(int *)(g_ignImage + IGN_RVA_CLIP_W),
+                    (long)*(int *)(g_ignImage + IGN_RVA_CLIP_H));
+        }
+    }
+
+    IgnDiagFlush();
+    if (g_ignPrevFilter) return g_ignPrevFilter(ep);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+//
 // Everything Ignition needs.
 //
 // The order is load-bearing exactly once: F1 has to come first and, if it
@@ -2505,14 +2802,1911 @@ static void IgnitionApply(const char *exePath)
     if (!mod) return;
     if (!GetCodeRange(mod, &code, &codeSize)) return;
 
-    if (!InstallIgnFrameBuffer(code, codeSize)) return;
+    g_ignImage = (unsigned int)mod;             /* TEMPORARY: for the filter */
 
+    if (!InstallIgnFrameBuffer(code, codeSize)) {
+        IgnDiag("ign F1 FAILED -- nothing else applied");
+        IgnDiagFlush();
+        return;
+    }
+
+    InstallIgnLoadLoops(code, codeSize);
     InstallIgnScreenSize(code, codeSize);
     InstallIgnFocal(code, codeSize);
     InstallIgnAspect(code, codeSize);
     InstallIgnWipe(code, codeSize);
+    InstallIgnLoadState(code, codeSize, (unsigned int)mod);
     InstallIgnPresent(code, codeSize, (unsigned int)mod);
 
+    /* TEMPORARY diagnostic -- goes with the block above it. */
+    IgnDiag("ign mod=%08lx res=%ld %ldx%ld",
+            (long)(unsigned int)mod, (long)g_targetRes,
+            (long)g_targetW, (long)g_targetH);
+    IgnDiag("ign fb=%08lx size=%08lx",
+            (long)(unsigned int)g_ignFrameBuffer, (long)g_ignFrameBytes);
+    IgnDiagFlush();
+
+    g_ignPrevFilter = SetUnhandledExceptionFilter(IgnCrashFilter);
+}
+
+
+// ==========================================================================
+// MDK (1997, Shiny Entertainment) -- MDK3DFX.EXE
+// ==========================================================================
+//
+// MDK shipped as a DOS/4GW game (MDK.EXE is an LE binary) with four separate
+// Win32 renderers beside it.  Only MDK3DFX.EXE is touched here; it is the Glide
+// one and it imports glide2x.dll directly, so this wrapper is in its call path
+// and grGlideInit is a valid hook point.  MDK95 / MDKD3D / Mdka3d3d are a
+// software rasteriser and two Direct3D builds and are never in ours.
+//
+// MDK3DFX.EXE is a plain unencrypted PE built with Watcom (sections AUTO /
+// DGROUP / .bss rather than .text / .data), so everything below was read
+// straight off the file -- no runtime dump, no protection to work around.
+//
+// Requirements 1 and 2 of the playbook are free, as they were for Turok and
+// Ignition: the single grSstWinOpen (0x470EA8) passes a hardcoded push $0x7
+// (GR_RESOLUTION_640x480), so there is no mode list to patch and the driver's
+// override alone decides the real screen size.
+//
+// What is left is the projection, and MDK's screen model is unusual enough to
+// state in full.  It does NOT render to the whole 640x480 frame: the 3D view is
+// a 600x360 window at (20,60), leaving a black border.  The window's ORIGIN is
+// a pair of globals (0x492BE0 / 0x492BE4) that the game moves; its SIZE is
+// hardcoded as `origin + 600` / `origin + 360` immediates at every site that
+// builds a grClipWindow call.
+//
+// That window holds the HUD as well as the world.  0x470F78 locks the LFB and
+// hands back `lfbPtr + strideInBytes*originY + 2*originX`, so the entire 2D
+// layer is drawn relative to the same origin -- and it takes the stride from
+// grLfbLock at runtime, so unlike a fixed-pitch 2D layer there is no stride
+// constant here that a resolution change would falsify.
+//
+// So three things, and they are independent:
+//
+//   K1  the 3D window becomes the whole screen:  size 600x360 -> W x H and
+//       origin (20,60) -> (0,0), which makes every clip window (0,0,W,H)
+//   K2  the projection's pixel extents, so the world spans that window
+//   K3  the frustum aspect, so it is not stretched
+//
+// K1 alone gives a full-screen but horizontally STRETCHED picture; K3 is what
+// turns it into widescreen.
+//
+// K2 and K3 are exact no-ops at the stock 600x360 -- they are written as ratios
+// against it rather than as fresh values, so they reproduce the shipped
+// constants bit for bit.  K1 is deliberately not: it removes MDK's border, and
+// there is no size at which "the 3D window is the whole screen" and "the 3D
+// window is 600x360 at (20,60)" are the same statement.  That is the intended
+// change, not an oversight, and it is the reason none of this may run with the
+// override disabled.
+//
+// The HUD is deliberately NOT addressed here.  The 2D layer clips itself to
+// 600x360 in software (0x40A940) and its background blitter walks 600-pixel
+// rows (0x46F52A), so with the origin at (0,0) it lands as a 600x360 island in
+// the top-left corner.  That is the predicted outcome of this change, not a
+// failure of it -- moving the island is a separate patch on 0x470F78, and
+// mixing the two would make the first hardware result unattributable.
+//
+#define MDK_EXE          "mdk3dfx.exe"
+
+//
+// Every signature below carries absolute addresses in its instruction
+// operands, and MDK3DFX.EXE -- unlike Turok.exe -- does have a .reloc section,
+// so it is not structurally impossible for it to be rebased.  In practice the
+// main image of a process is always placed at its preferred base, because
+// nothing else is mapped yet.  Rather than rebuild 37 displacements at runtime
+// for a case that cannot occur, the base is simply checked and the whole game
+// skipped if it is ever wrong.
+//
+#define MDK_IMAGE_BASE   0x00400000u
+
+/* The stock 3D window: what every constant below is being scaled away from. */
+#define MDK_VIEW_W       600
+#define MDK_VIEW_H       360
+
+/* K9's entry point -- MDK's own clip+clear routine.  See the note above it. */
+static void (*g_mdkClear)(void) = NULL;
+
+// ---------------------------------------------------------------------------
+// K1.  The 3D window becomes the whole screen
+// ---------------------------------------------------------------------------
+//
+// Thirty-seven immediates in fifteen spans.  They are all one of five things:
+//
+//     600 / 601   the window width  (the +1 form is a max-corner)
+//     360 / 361   the window height
+//     20 / 60     the window origin, written to 0x492BE0 / 0x492BE4 and pushed
+//                 as the min corner of the same grClipWindow call
+//
+// Setting the origin to (0,0) and the size to W x H makes every one of the
+// twelve grClipWindow calls (0,0,W,H).  It also settles the 3D vertex path for
+// free: 0x470074 and its siblings add `fild 0x492BE0` to each vertex's x, so
+// with the origin at zero the projection's own output is used unmodified.
+//
+// Two consequences worth naming because they are load-bearing rather than
+// incidental:
+//
+//   - grBufferClear is bounded by the clip window, so a full-screen clip is
+//     also what stops an uncleared border appearing round the picture.
+//   - 0x471D28 clears the strip exposed when the window moves, by comparing
+//     0x492BE0 against its previous value 0x492BE8.  With the origin constant
+//     that path simply never fires; its two immediates are patched anyway so
+//     the module cannot end up half-converted.
+//
+// Each span was grown until it occurs exactly once in the code section, which
+// is why several of them start mid-instruction-stream on a `call rel32`: the
+// six-byte tails that actually carry the immediates repeat verbatim four times
+// over, and only the neighbouring call displacement separates them.  Note the
+// rel32s are relative and so survive rebasing even though the absolute
+// displacements do not.
+//
+enum {
+    MDK_W = 0,      /* screen width                                        */
+    MDK_H,          /* screen height                                       */
+    MDK_W1,         /* screen width  + 1                                   */
+    MDK_H1,         /* screen height + 1                                   */
+    MDK_ZERO,       /* the window origin                                   */
+    MDK_SCALE_H     /* the signature's own value, scaled by H/360 (see K6) */
+};
+
+struct MdkField {
+    unsigned short at;          /* byte offset of the imm32 within the span */
+    unsigned short kind;
+};
+
+struct MdkSpan {
+    const unsigned char *sig;
+    unsigned int         len;
+    const MdkField      *fields;
+    unsigned int         fieldCount;
+};
+
+static const unsigned char mdk_win00[] =    /* 0x0046e385 */
+    "\x8d\x8a\x68\x01\x00\x00\x89\x7d\xf4\xe8"
+    "\x95\x39\x00\x00\x8b\x7d\xf4\x8b\x0d\xec"
+    "\x2b\x49\x00\x81\xc7\x58\x02\x00\x00";
+static const MdkField mdk_win00_f[] = { {2,MDK_H}, {25,MDK_W} };
+
+static const unsigned char mdk_win01[] =    /* 0x0046e3e2 */
+    "\x05\x68\x01\x00\x00\x50\x8b\x45\xf0\x05"
+    "\x58\x02\x00\x00";
+static const MdkField mdk_win01_f[] = { {1,MDK_H}, {10,MDK_W} };
+
+static const unsigned char mdk_win02[] =    /* 0x0046e407 */
+    "\x8d\x9a\x59\x02\x00\x00\x8d\x86\x58\x02"
+    "\x00\x00\x8b\x15\xe4\x2b\x49\x00\x89\xdf"
+    "\x8d\x8a\x68\x01\x00\x00";
+static const MdkField mdk_win02_f[] = { {2,MDK_W1}, {8,MDK_W}, {22,MDK_H} };
+
+static const unsigned char mdk_win03[] =    /* 0x0046e43c */
+    "\x8d\x90\x68\x01\x00\x00\x81\xc1\x69\x01"
+    "\x00\x00";
+static const MdkField mdk_win03_f[] = { {2,MDK_H}, {8,MDK_H1} };
+
+static const unsigned char mdk_win04[] =    /* 0x0046e46f */
+    "\xba\x14\x00\x00\x00\xb9\x3c\x00\x00\x00";
+static const MdkField mdk_win04_f[] = { {1,MDK_ZERO}, {6,MDK_ZERO} };
+
+static const unsigned char mdk_win05[] =    /* 0x0046e49b */
+    "\xe8\x6a\xb3\x01\x00\xa1\xe4\x2b\x49\x00"
+    "\x05\x68\x01\x00\x00\x50\xa1\xe0\x2b\x49"
+    "\x00\x05\x58\x02\x00\x00\x50\x8b\x1d\xe4"
+    "\x2b\x49\x00";
+static const MdkField mdk_win05_f[] = { {11,MDK_H}, {22,MDK_W} };
+
+static const unsigned char mdk_win06[] =    /* 0x0046e4e2 */
+    "\xba\x14\x00\x00\x00\x68\xe0\x01\x00\x00"
+    "\xb9\x3c\x00\x00\x00\xa1\xe0\x2b\x49\x00"
+    "\x68\x80\x02\x00\x00";
+static const MdkField mdk_win06_f[] = { {1,MDK_ZERO}, {6,MDK_H}, {11,MDK_ZERO}, {21,MDK_W} };
+
+static const unsigned char mdk_win07[] =    /* 0x0046e629 */
+    "\x68\xa4\x01\x00\x00\xa3\xe8\x2b\x49\x00"
+    "\xa1\xe4\x2b\x49\x00\x68\x6c\x02\x00\x00"
+    "\xa3\xec\x2b\x49\x00\xb8\x3c\x00\x00\x00"
+    "\x50\xbf\x14\x00\x00\x00";
+static const MdkField mdk_win07_f[] = { {1,MDK_H}, {16,MDK_W}, {26,MDK_ZERO}, {32,MDK_ZERO} };
+
+static const unsigned char mdk_win08[] =    /* 0x0046e66c */
+    "\x52\x68\xe0\x01\x00\x00\x68\x80\x02\x00"
+    "\x00\x6a\x00";
+static const MdkField mdk_win08_f[] = { {2,MDK_H}, {7,MDK_W} };
+
+static const unsigned char mdk_win09[] =    /* 0x0046e6a4 */
+    "\x68\xa4\x01\x00\x00\xba\x14\x00\x00\x00"
+    "\xa1\xe0\x2b\x49\x00\x68\x6c\x02\x00\x00"
+    "\xb9\x3c\x00\x00\x00";
+static const MdkField mdk_win09_f[] = { {1,MDK_H}, {6,MDK_ZERO}, {16,MDK_W}, {21,MDK_ZERO} };
+
+static const unsigned char mdk_win10[] =    /* 0x0046e6eb */
+    "\x53\x51\x52\x56\xa1\xe4\x2b\x49\x00\x05"
+    "\x68\x01\x00\x00\x50\xa1\xe0\x2b\x49\x00"
+    "\x05\x58\x02\x00\x00\x50\x8b\x15\xe4\x2b"
+    "\x49\x00\x52\x8b\x0d\xe0\x2b\x49\x00\x51"
+    "\xe8\xec\xb0\x01\x00";
+static const MdkField mdk_win10_f[] = { {10,MDK_H}, {21,MDK_W} };
+
+static const unsigned char mdk_win11[] =    /* 0x0046e71e */
+    "\xe8\xdb\xb0\x01\x00\xa1\xe4\x2b\x49\x00"
+    "\x05\x68\x01\x00\x00\x50\xa1\xe0\x2b\x49"
+    "\x00\x05\x58\x02\x00\x00\x50\x8b\x1d\xe4"
+    "\x2b\x49\x00";
+static const MdkField mdk_win11_f[] = { {11,MDK_H}, {22,MDK_W} };
+
+static const unsigned char mdk_win12[] =    /* 0x0046e75b */
+    "\x53\x51\x52\x56\xa1\xe4\x2b\x49\x00\x05"
+    "\x68\x01\x00\x00\x50\xa1\xe0\x2b\x49\x00"
+    "\x05\x58\x02\x00\x00\x50\x8b\x15\xe4\x2b"
+    "\x49\x00\x52\x8b\x0d\xe0\x2b\x49\x00\x51"
+    "\x31\xdb";
+static const MdkField mdk_win12_f[] = { {10,MDK_H}, {21,MDK_W} };
+
+static const unsigned char mdk_win13[] =    /* 0x0046e7a9 */
+    "\xe8\x50\xb0\x01\x00\xa1\xe4\x2b\x49\x00"
+    "\x05\x68\x01\x00\x00\x50\xa1\xe0\x2b\x49"
+    "\x00\x05\x58\x02\x00\x00\x50\x8b\x1d\xe4"
+    "\x2b\x49\x00";
+static const MdkField mdk_win13_f[] = { {11,MDK_H}, {22,MDK_W} };
+
+static const unsigned char mdk_win14[] =    /* 0x00471d41 */
+    "\xa1\xe4\x2b\x49\x00\x05\x68\x01\x00\x00"
+    "\x50\xa1\xe0\x2b\x49\x00\x05\x58\x02\x00"
+    "\x00\x50\x8b\x0d\xe4\x2b\x49\x00";
+static const MdkField mdk_win14_f[] = { {6,MDK_H}, {17,MDK_W} };
+
+static const MdkSpan mdk_window[] = {
+    { mdk_win00, 29, mdk_win00_f, 2 },   /* 0x0046e385 */
+    { mdk_win01, 14, mdk_win01_f, 2 },   /* 0x0046e3e2 */
+    { mdk_win02, 26, mdk_win02_f, 3 },   /* 0x0046e407 */
+    { mdk_win03, 12, mdk_win03_f, 2 },   /* 0x0046e43c */
+    { mdk_win04, 10, mdk_win04_f, 2 },   /* 0x0046e46f */
+    { mdk_win05, 33, mdk_win05_f, 2 },   /* 0x0046e49b */
+    { mdk_win06, 25, mdk_win06_f, 4 },   /* 0x0046e4e2 */
+    { mdk_win07, 36, mdk_win07_f, 4 },   /* 0x0046e629 */
+    { mdk_win08, 13, mdk_win08_f, 2 },   /* 0x0046e66c */
+    { mdk_win09, 25, mdk_win09_f, 4 },   /* 0x0046e6a4 */
+    { mdk_win10, 45, mdk_win10_f, 2 },   /* 0x0046e6eb */
+    { mdk_win11, 33, mdk_win11_f, 2 },   /* 0x0046e71e */
+    { mdk_win12, 42, mdk_win12_f, 2 },   /* 0x0046e75b */
+    { mdk_win13, 33, mdk_win13_f, 2 },   /* 0x0046e7a9 */
+    { mdk_win14, 28, mdk_win14_f, 2 },   /* 0x00471d41 */
+};
+#define MDK_WINDOW_SPANS  (sizeof(mdk_window) / sizeof(mdk_window[0]))
+#define MDK_SPAN_MAX      64        /* longest span in this section, rounded up */
+
+// ---------------------------------------------------------------------------
+// K2.  The projection's pixel extents
+// ---------------------------------------------------------------------------
+//
+// MDK keeps five world->screen routines, one per viewport preset, and picks
+// between them through a function pointer at 0x492B38 that 0x46CB30 sets:
+//
+//     mode 0 (default)  0x46C9F0   600x360 @ (0,0)   <- the game view
+//     mode 1            0x46CA28   384x280 @ (108,80)
+//     modes 2/3/4       0x46CA6C..  140x70 inset panels
+//
+// Each is a dozen instructions long and carries its own viewport rectangle as
+// doubles in DGROUP.  Mode 0 is the whole of the main view:
+//
+//     screenX = (x/z + 1) * 299.95 + 0.05
+//     screenY = (y/z + 1) * 180.4  + 0.05
+//
+// -- the clip-space frustum is |x| <= z and |y| <= z, so (coord/z + 1) runs
+// 0..2 and the multiplier is the viewport's half extent.  (299.95 and 180.4
+// rather than 300 and 180: the shipped game insets horizontally by a twentieth
+// of a pixel and overscans vertically by just under one.  Scaling both by the
+// same ratio preserves that exactly and makes the patch a true no-op at the
+// stock size, rather than merely an inert one.)
+//
+// The other four routines are left alone.  They are inset panels drawn inside
+// the main view during cutscenes; their rectangles stay valid, and their own
+// aspect group (280 / (1/384), against the main view's 360 / (1/600)) is
+// untouched by K3 for the same reason.
+//
+// Both constants are QWORD doubles referenced from exactly one instruction
+// each, so they cannot be found by scanning code.  They are reached instead
+// through the disp32s of the two `fmull`s inside the 54-byte routine, which
+// occurs exactly once in the image.  Idempotency is by value: the code
+// signature survives a change to the data it points at, so re-running would
+// find the routine again and then decline on the constant.
+//
+static const unsigned char mdk_proj_sig[] =    /* 0x0046c9f0, mode 0 */
+    "\x55\x89\xe5\xd9\x00\xd8\x40\x08\xd8\x70"
+    "\x08\xdc\x0d\x84\xfc\x48\x00\xdd\x05\x8c"
+    "\xfc\x48\x00\xd9\xc9\xd8\xc1\xd9\x58\x0c"
+    "\xd9\x40\x04\xd8\x40\x08\xd8\x70\x08\xdc"
+    "\x0d\x94\xfc\x48\x00\xde\xc1\xd9\x58\x10"
+    "\x89\xec\x5d\xc3";
+#define MDK_PROJ_KX_AT   13
+#define MDK_PROJ_KY_AT   41
+#define MDK_PROJ_KX      299.95     /* half width  of the stock 600x360 view */
+#define MDK_PROJ_KY      180.4      /* half height                          */
+
+// ---------------------------------------------------------------------------
+// K3.  The frustum aspect
+// ---------------------------------------------------------------------------
+//
+// The projection matrix is built from the camera's zoom (0x538D1C, 2.4 in
+// normal play) and four constants:
+//
+//     xscale = 1 / (zoom * A)                 A = 0.5
+//     yscale = 1 / (zoom * B * C * D)         B = 360.0, C = 1/600, D = 0.5
+//
+// so yscale/xscale is A/(B*C*D) = 600/360, the viewport aspect, exactly as a
+// textbook m11/m00.  Rewriting A to `0.5 * (W*360) / (H*600)` -- that is,
+// 0.3 * W/H -- makes it W/H instead, and does so without touching yscale: the
+// vertical field of view is unchanged and the wider screen simply shows more to
+// the sides.  Hor+, by construction rather than by tuning.  Written in that
+// form rather than as 0.3*W/H so that it returns exactly 0.5 at the stock
+// 600x360 and the patch is a genuine no-op there.
+//
+// xscale also feeds the frustum planes the game culls against (0x42DDCA and
+// its siblings read 0x538DB4 four times over), so fixing the aspect at its
+// source keeps matrix and culling consistent -- the alternative, widening only
+// the renderer's side, is what makes geometry pop in and out at the screen
+// edges (GAME-PATCHING.md section 23).
+//
+// There are four of these setups, one per camera mode, each with its own copy
+// of the four constants in the pool.  All four were checked to carry the
+// 600x360 group (B=360.0, C=1/600) rather than the 384x280 one, which is what
+// identifies them as main-view cameras.  The signature is the same twenty-two
+// bytes each time apart from the disp32 naming A, so it is built from a
+// template and that one address.
+//
+static const unsigned char mdk_aspect_sig[] =  /* disp32 of A patched in @8 */
+    "\xd9\x05\x1c\x8d\x53\x00\xd8\x0d\x00\x00"
+    "\x00\x00\xd9\xe8\xde\xf1\xd9\x1d\xb4\x8d"
+    "\x53\x00";
+#define MDK_ASPECT_DISP_AT  8
+
+static const unsigned int mdk_aspect_konst[] = {
+    0x0048bf3cu, 0x0048dc54u, 0x0048dfe0u, 0x0048e098u
+};
+#define MDK_ASPECT_A  0.5f          /* the shipped value, at 600x360 */
+
+
+//
+// K1: rewrite the window.
+//
+// All fifteen spans are located before any of them is written.  A partial
+// application would leave some clip windows full-screen and others still
+// 600x360, which is a far more confusing thing to look at than no patch at
+// all -- and, unlike a missing patch, not obviously wrong from a screenshot.
+//
+static BOOL InstallMdkWindow(unsigned char *code, unsigned int codeSize)
+{
+    unsigned char *at[MDK_WINDOW_SPANS];
+    unsigned char  repl[MDK_SPAN_MAX];
+    unsigned int   i, j, found = 0;
+
+    for (i = 0; i < MDK_WINDOW_SPANS; i++) {
+        at[i] = FindUnique(code, codeSize, mdk_window[i].sig, mdk_window[i].len);
+        if (at[i]) found++;
+    }
+
+    // Nothing found means already applied (or not this build); either way
+    // there is nothing to do and nothing is wrong.
+    if (found == 0) return TRUE;
+    if (found != MDK_WINDOW_SPANS) return FALSE;
+
+    // K9's entry point.  mdk_window[10] starts three bytes into 0x46E6E8, past
+    // its `push %ebp; mov %esp,%ebp` -- so the span matching is also what
+    // proves this is the routine.
+    g_mdkClear = (void (*)(void))(at[10] - 3);
+
+    for (i = 0; i < MDK_WINDOW_SPANS; i++) {
+        const MdkSpan *s = &mdk_window[i];
+
+        memcpy(repl, s->sig, s->len);
+        for (j = 0; j < s->fieldCount; j++) {
+            unsigned int v = 0;
+            switch (s->fields[j].kind) {
+            case MDK_W:  v = g_targetW;      break;
+            case MDK_H:  v = g_targetH;      break;
+            case MDK_W1: v = g_targetW + 1;  break;
+            case MDK_H1: v = g_targetH + 1;  break;
+            case MDK_ZERO: v = 0;            break;
+            }
+            PutU32(repl + s->fields[j].at, v);
+        }
+        WriteCode(at[i], repl, s->len);
+    }
+    return TRUE;
+}
+
+//
+// Resolve a DGROUP constant through the disp32 of the instruction that reads
+// it, and bounds-check the result against the image.  Same shape as Turok's
+// equivalent; kept local so each game's block stays self-contained.
+//
+static unsigned char *MdkConstAt(unsigned char *code, unsigned int codeSize,
+                                 const unsigned char *sig, unsigned int sigLen,
+                                 unsigned int dispAt, unsigned int size)
+{
+    const IMAGE_DOS_HEADER *dos;
+    const IMAGE_NT_HEADERS *nt;
+    unsigned char          *at;
+    unsigned int            addr, imgBase, imgSize;
+    HMODULE                 mod;
+
+    at = FindUnique(code, codeSize, sig, sigLen);
+    if (!at) return NULL;
+
+    mod     = GetModuleHandleA(NULL);
+    dos     = (const IMAGE_DOS_HEADER *)mod;
+    nt      = (const IMAGE_NT_HEADERS *)((const unsigned char *)mod + dos->e_lfanew);
+    imgBase = (unsigned int)mod;
+    imgSize = (unsigned int)nt->OptionalHeader.SizeOfImage;
+
+    addr = ReadU32(at + dispAt);
+    if (addr < imgBase || addr + size > imgBase + imgSize) return NULL;
+    return (unsigned char *)addr;
+}
+
+//
+// Compared bit for bit rather than by value: these are x87 doubles read out of
+// a game's data section, and a `==` against a literal invites the compiler to
+// do the comparison at 80-bit precision.  memcmp says exactly what is meant.
+//
+static void MdkPatchDouble(unsigned char *konst, double from, double to)
+{
+    union { double d; unsigned char b[8]; } cur, want, expect;
+
+    memcpy(cur.b, konst, 8);
+    want.d   = to;
+    expect.d = from;
+
+    if (memcmp(cur.b, want.b,   8) == 0) return;    // already applied
+    if (memcmp(cur.b, expect.b, 8) != 0) return;    // not the constant we expect
+
+    WriteCode(konst, want.b, 8);
+}
+
+//
+// K2: scale the mode-0 projection's half extents to the real screen.
+//
+static void InstallMdkProjection(unsigned char *code, unsigned int codeSize)
+{
+    unsigned char *at, *kx, *ky;
+
+    at = FindUnique(code, codeSize, mdk_proj_sig, sizeof(mdk_proj_sig) - 1);
+    if (!at) return;
+
+    kx = MdkConstAt(code, codeSize, mdk_proj_sig, sizeof(mdk_proj_sig) - 1,
+                    MDK_PROJ_KX_AT, 8);
+    ky = MdkConstAt(code, codeSize, mdk_proj_sig, sizeof(mdk_proj_sig) - 1,
+                    MDK_PROJ_KY_AT, 8);
+    if (!kx || !ky) return;
+
+    MdkPatchDouble(kx, MDK_PROJ_KX,
+                   MDK_PROJ_KX * (double)g_targetW / (double)MDK_VIEW_W);
+    MdkPatchDouble(ky, MDK_PROJ_KY,
+                   MDK_PROJ_KY * (double)g_targetH / (double)MDK_VIEW_H);
+}
+
+//
+// K3: widen the frustum, for all four main-view camera setups.
+//
+static void InstallMdkAspect(unsigned char *code, unsigned int codeSize)
+{
+    unsigned char sig[sizeof(mdk_aspect_sig) - 1];
+    unsigned int  i, want, cur;
+    float         a;
+
+    a = MDK_ASPECT_A * ((float)g_targetW * (float)MDK_VIEW_H)
+                     / ((float)g_targetH * (float)MDK_VIEW_W);
+    want = FloatBits(a);
+
+    for (i = 0; i < sizeof(mdk_aspect_konst) / sizeof(mdk_aspect_konst[0]); i++) {
+        unsigned char *konst;
+
+        memcpy(sig, mdk_aspect_sig, sizeof(sig));
+        PutU32(sig + MDK_ASPECT_DISP_AT, mdk_aspect_konst[i]);
+
+        konst = MdkConstAt(code, codeSize, sig, sizeof(sig),
+                           MDK_ASPECT_DISP_AT, 4);
+        if (!konst) continue;
+
+        cur = ReadU32(konst);
+        if (cur == want) continue;                      // already applied
+        if (cur != FloatBits(MDK_ASPECT_A)) continue;   // not what we expect
+
+        WriteCode(konst, (const unsigned char *)&want, 4);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// K4.  The screen shake, which moved the 3D window
+// ---------------------------------------------------------------------------
+//
+// K1 forces the window origin to (0,0) everywhere it is *reset*, but MDK also
+// SLIDES it: `0x46E340(newX, newY, otherX, otherY)` sets the origin globals
+// outright, and its four call sites -- two twin routines, two branches each --
+// feed it an animated origin from `0x538EAC`/`0x538EB4`, initialised to (20,60)
+// at `0x435524`/`0x435546`.  That is the screen shake: the 600x360 window
+// jiggles inside the 640x480 frame, and the black border absorbs the movement.
+// `0x43820C` reads the displacement back out as `origin - (20,60)`.
+//
+// Without this the window would jump back to (20,60) the first time anything
+// exploded, taking the clip window with it -- to (20, 60, 20+W, 60+H), which is
+// off the end of the framebuffer.
+//
+// **The effect is deleted rather than corrected**, per GAME-PATCHING.md
+// section 13.  It cannot be corrected: sliding a window that is already the
+// whole screen has nowhere to slide to, so every version of "keep the shake"
+// either pushes the picture off the screen or hands Glide a clip rectangle
+// outside the framebuffer.  The border it used to move within no longer exists.
+//
+// Deleted at the four CALL SITES rather than inside 0x46E340 (section 5b), by
+// zeroing the four argument registers.  That is 8 bytes of `xor` in an 18-byte
+// span, needs no stub, and -- the point -- leaves the game's own shake
+// bookkeeping completely untouched.  That matters more than it looks: the
+// routine at `0x438260` stops the shake only when it observes the viewport back
+// at exactly (20,60), so rewriting `0x538EAC`/`0x538EB4` instead would have left
+// a shake that decays and then never terminates.
+//
+// The shake amplitude `0x538EA8` still drives its other consumers (`0x438050`,
+// `0x43808D`, `0x4380B7`), so this removes the window movement, not the effect.
+//
+static const unsigned char mdk_shake0[] =   /* 0x0043859b */
+    "\x8b\x55\xe4\x8b\x45\xe0\x8b\x0d\xb8\x8e"
+    "\x53\x00\x8b\x1d\xb0\x8e\x53\x00\xe8\x8e"
+    "\x5d\x03\x00";
+static const unsigned char mdk_shake1[] =   /* 0x004385b7 */
+    "\x8b\x55\xe4\x8b\x45\xe0\x8b\x0d\xb4\x8e"
+    "\x53\x00\x8b\x1d\xac\x8e\x53\x00\xe8\x72"
+    "\x5d\x03\x00";
+static const unsigned char mdk_shake2[] =   /* 0x00473f52 */
+    "\x8b\x55\xe4\x8b\x45\xe0\x8b\x0d\xb8\x8e"
+    "\x53\x00\x8b\x1d\xb0\x8e\x53\x00\xe8\xd7"
+    "\xa3\xff\xff";
+static const unsigned char mdk_shake3[] =   /* 0x00473f6e */
+    "\x8b\x55\xe4\x8b\x45\xe0\x8b\x0d\xb4\x8e"
+    "\x53\x00\x8b\x1d\xac\x8e\x53\x00\xe8\xbb"
+    "\xa3\xff\xff";
+
+static const unsigned char *const mdk_shake[] = {
+    mdk_shake0, mdk_shake1, mdk_shake2, mdk_shake3
+};
+#define MDK_SHAKE_SITES  (sizeof(mdk_shake) / sizeof(mdk_shake[0]))
+#define MDK_SHAKE_SIG    23     /* through the call, which is what makes each
+                                   site unique -- the 18 bytes before it are
+                                   identical between the twins */
+#define MDK_SHAKE_ZERO   18     /* the four argument loads */
+
+// ---------------------------------------------------------------------------
+// K6.  The sprite pipeline's reference size
+// ---------------------------------------------------------------------------
+//
+// MDK draws entities as screen-space sprites: `0x46D1C8` transforms a world
+// point by the projection matrix AND calls the mode-0 projection routine to
+// get screen x/y, and then a caller such as `0x4110B7` computes the sprite's
+// on-screen SIZE as
+//
+//     pixels = camW * s / (z * zoom)
+//
+// where `camW` is `0x538D2C`, the camera viewport's width.  That formula is
+// only correct while `camW == Kx / A` -- 299.95/0.5 = 599.9 in the shipped
+// game, which is why the constant is 600.  K2 and K3 changed both terms, so
+// camW has to follow or every sprite in the game comes out at a third of its
+// proper size.
+//
+//     camW' = Kx'/A' = (299.95 * W/600) / (0.5 * W*360 / (H*600)) = 600 * H/360
+//
+// -- the W cancels, which is the whole point: the world scale is UNIFORM H/360
+// (that is what Hor+ means; the extra width buys more world, not bigger world),
+// so the sprite reference scales by H/360 too and never by W/600.
+//
+// The same block carries `camH` (`0x538D30`) and a centre pair
+// (`0x538D34`/`0x538D38`), and scaling all four by H/360 is exactly right for
+// each: camH is read only as a clip bound and 360*H/360 == H, the real screen
+// height.  The centre pair has ELEVEN writers and, verified by byte search,
+// ZERO readers -- it is scaled only so the block cannot be read as
+// half-converted later.
+//
+// Seven camera-setup routines write the main 600x360 view; four more write the
+// inset viewports (384x280, and three 140x70 panels) used by projection modes
+// 1-4 during cutscenes.  Those are deliberately NOT scaled, exactly as their
+// projection routines were not: each inset is internally consistent as it
+// stands, and scaling one half of it would be worse than leaving both.
+//
+// Because every value here is the original times H/360, the table does not name
+// the values at all -- MDK_SCALE_H reads the immediate out of the signature and
+// scales it.  That also means the signature failing to match cannot silently
+// write the wrong constant into the right place.
+//
+static const unsigned char mdk_cam00[] =    /* 0x0040f9e0 */
+    "\xbf\x58\x02\x00\x00\x88\x35\x56\x96\x53"
+    "\x00\xe8\xa0\x18\x02\x00\xb8\x00\x35\x00"
+    "\x00\xbe\xb4\x00\x00\x00\xe8\x35\xd0\x00"
+    "\x00\xa3\xe4\x8c\x53\x00\xa1\xf0\x5c\x4e"
+    "\x00\x31\xd2\xe8\x34\x02\x00\x00\xb8\x68"
+    "\x01\x00\x00";
+static const MdkField mdk_cam00_f[] = { {1,MDK_SCALE_H}, {22,MDK_SCALE_H}, {49,MDK_SCALE_H} };
+
+static const unsigned char mdk_cam01[] =    /* 0x0040fa3f */
+    "\xbb\x2c\x01\x00\x00\xa3\x30\x8d\x53\x00";
+static const MdkField mdk_cam01_f[] = { {1,MDK_SCALE_H} };
+
+static const unsigned char mdk_cam02[] =    /* 0x00429f77 */
+    "\xbe\x58\x02\x00\x00\xbf\x68\x01\x00\x00"
+    "\xbb\xb4\x00\x00\x00";
+static const MdkField mdk_cam02_f[] = { {1,MDK_SCALE_H}, {6,MDK_SCALE_H}, {11,MDK_SCALE_H} };
+
+static const unsigned char mdk_cam03[] =    /* 0x00429ff3 */
+    "\xb9\x2c\x01\x00\x00\xa3\xf4\x8c\x53\x00";
+static const MdkField mdk_cam03_f[] = { {1,MDK_SCALE_H} };
+
+static const unsigned char mdk_cam04[] =    /* 0x0042dbc5 */
+    "\xbe\x58\x02\x00\x00\xbf\x68\x01\x00\x00"
+    "\xbb\x2c\x01\x00\x00";
+static const MdkField mdk_cam04_f[] = { {1,MDK_SCALE_H}, {6,MDK_SCALE_H}, {11,MDK_SCALE_H} };
+
+static const unsigned char mdk_cam05[] =    /* 0x0042dbfe */
+    "\xbe\xb4\x00\x00\x00\x8d\x45\xb8";
+static const MdkField mdk_cam05_f[] = { {1,MDK_SCALE_H} };
+
+static const unsigned char mdk_cam06[] =    /* 0x00430efc */
+    "\xbf\x58\x02\x00\x00\xb8\x68\x01\x00\x00"
+    "\x89\x1d\x28\x8d\x53\x00\x89\x35\x1c\x8d"
+    "\x53\x00\x89\x3d\x2c\x8d\x53\x00\xd8\x21"
+    "\xa3\x30\x8d\x53\x00\xd9\x5d\xb4\xbf\x2c"
+    "\x01\x00\x00\xb8\xb4\x00\x00\x00";
+static const MdkField mdk_cam06_f[] = { {1,MDK_SCALE_H}, {6,MDK_SCALE_H}, {39,MDK_SCALE_H}, {44,MDK_SCALE_H} };
+
+static const unsigned char mdk_cam07[] =    /* 0x00432390 */
+    "\xbe\x58\x02\x00\x00\xbf\x68\x01\x00\x00"
+    "\xb9\x2c\x01\x00\x00\x31\xc0\x89\x1d\x28"
+    "\x8d\x53\x00\x89\x35\x2c\x8d\x53\x00\x89"
+    "\x3d\x30\x8d\x53\x00\xa3\x40\x8d\x53\x00"
+    "\xa3\x3c\x8d\x53\x00\xbb\xb4\x00\x00\x00";
+static const MdkField mdk_cam07_f[] = { {1,MDK_SCALE_H}, {6,MDK_SCALE_H}, {11,MDK_SCALE_H}, {46,MDK_SCALE_H} };
+
+static const unsigned char mdk_cam08[] =    /* 0x004390b8 */
+    "\xbb\xb4\x00\x00\x00\xba\x00\x00\x80\xbf"
+    "\x57\x89\xc8\xc1\xe9\x02\xf2\xa5\x8a\xc8"
+    "\x80\xe1\x03\xf2\xa4\x5f\xb9\x9a\x99\x19"
+    "\x40\xbe\x58\x02\x00\x00\x31\xc0\xbf\x68"
+    "\x01\x00\x00";
+static const MdkField mdk_cam08_f[] = { {1,MDK_SCALE_H}, {32,MDK_SCALE_H}, {39,MDK_SCALE_H} };
+
+static const unsigned char mdk_cam09[] =    /* 0x0043910e */
+    "\xb9\x2c\x01\x00\x00\xbe\x55\x55\x55\x3f";
+static const MdkField mdk_cam09_f[] = { {1,MDK_SCALE_H} };
+
+static const unsigned char mdk_cam10[] =    /* 0x004737a8 */
+    "\xbf\x58\x02\x00\x00\xb8\x68\x01\x00\x00"
+    "\xbb\x2c\x01\x00\x00\x31\xd2\x89\x35\x28"
+    "\x8d\x53\x00\x89\x3d\x2c\x8d\x53\x00\xa3"
+    "\x30\x8d\x53\x00\x89\x15\x40\x8d\x53\x00"
+    "\x89\x15\x3c\x8d\x53\x00\xbe\xb4\x00\x00"
+    "\x00";
+static const MdkField mdk_cam10_f[] = { {1,MDK_SCALE_H}, {6,MDK_SCALE_H}, {11,MDK_SCALE_H}, {47,MDK_SCALE_H} };
+
+static const MdkSpan mdk_camera[] = {
+    { mdk_cam00, 53, mdk_cam00_f, 3 },   /* 0x0040f9e0 */
+    { mdk_cam01, 10, mdk_cam01_f, 1 },   /* 0x0040fa3f */
+    { mdk_cam02, 15, mdk_cam02_f, 3 },   /* 0x00429f77 */
+    { mdk_cam03, 10, mdk_cam03_f, 1 },   /* 0x00429ff3 */
+    { mdk_cam04, 15, mdk_cam04_f, 3 },   /* 0x0042dbc5 */
+    { mdk_cam05,  8, mdk_cam05_f, 1 },   /* 0x0042dbfe */
+    { mdk_cam06, 48, mdk_cam06_f, 4 },   /* 0x00430efc */
+    { mdk_cam07, 50, mdk_cam07_f, 4 },   /* 0x00432390 */
+    { mdk_cam08, 43, mdk_cam08_f, 3 },   /* 0x004390b8 */
+    { mdk_cam09, 10, mdk_cam09_f, 1 },   /* 0x0043910e */
+    { mdk_cam10, 51, mdk_cam10_f, 4 },   /* 0x004737a8 */
+};
+#define MDK_CAMERA_SPANS (sizeof(mdk_camera) / sizeof(mdk_camera[0]))
+
+// ---------------------------------------------------------------------------
+// K7.  The sprite clip bound
+// ---------------------------------------------------------------------------
+//
+// `0x4045F0` is the sprite blitter.  It reduces the sprite's left edge to
+// viewport-relative (`x - camOX`), rejects it if negative, and then takes the
+// available width as `camW - left`, rejecting again if that is <= 0.  So camW
+// is simultaneously the sprite pipeline's reference size (K6) and its right
+// clip boundary -- and after K6 those want DIFFERENT values: 1800 and 2560 at
+// 2560x1080.  They were equal in the shipped game only because the viewport
+// was 4:3-ish; widening the aspect separated them for good.
+//
+// K6 gives the global the reference-size value, because that is the one used
+// five times and the one whose failure is catastrophic (a sprite at a third or
+// thirteen times its size).  This patch gives the single clip read the real
+// screen width instead.
+//
+// Consequence for the inset viewports, stated plainly: their clip bound becomes
+// the whole screen rather than their own 384 or 140.  That is benign, because
+// this bound has never been what positions anything -- the projection already
+// confines each mode's output to its own rectangle, and the clip only decides
+// whether a sprite already at the edge gets cut.  The reverse trade (correct
+// clip, wrong reference size) would have made inset sprites thirteen times too
+// big.
+//
+static const unsigned char mdk_clipw_sig[] =    /* 0x004046a0 */
+    "\x8b\x15\x2c\x8d\x53\x00"      /* mov  0x538d2c,%edx  <- camW  */
+    "\x29\xf2";                     /* sub  %esi,%edx               */
+
+// ---------------------------------------------------------------------------
+// K5/K8.  The 2D layer -- HUD and menus centred, world sprites left alone
+// ---------------------------------------------------------------------------
+//
+// Everything MDK draws in 2D goes through `0x470F78`, which locks the LFB and
+// returns `lfbPtr + strideInBytes*originY + 2*originX`.  With K1 the origin is
+// (0,0), so the 2D layer -- which clips itself to 600x360 in software
+// (`0x40A940`) and whose background blitter walks 600-pixel rows (`0x46F52A`)
+// -- lands as a 600x360 island in the top-left corner.  Centring that island is
+// K5.
+//
+// But not everything on that path wants the same treatment.  Enumerating all
+// eighteen callers and asking which touch the camera viewport globals splits
+// them cleanly: exactly ONE does, `0x404755`, the sprite blitter.  The other
+// seventeen use hardcoded 600/360 layout constants and are centred.
+//
+// So the offset is applied by CALLER (GAME-PATCHING.md section 6, "the caller's
+// return address identifies the element exactly"), and the table has one entry:
+// the sprite blitter gets no offset, i.e. its base is the raw framebuffer
+// origin.
+//
+// **The original reason given for that exclusion was wrong** and is corrected
+// here rather than quietly rewritten: the claim was that the blitter's
+// coordinates "come from the 3D projection and are already real screen pixels".
+// They are not -- the hardware logs show every sprite drawn in MDK's old
+// 600x360 space, unchanged at every patch level.  The exclusion is still
+// correct, but for a different reason: K10 converts the player's descriptor to
+// real screen pixels at its call site, so the blitter must be working from the
+// real origin, and K7's clip bound of W then agrees with that base instead of
+// being cx too generous.
+//
+// The cost is that the other blitter callers -- 600-wide loading and cutscene
+// art -- stay in the top-left rather than centred.  They do not run in
+// gameplay (zero blitter calls until K10's site was identified), so this buys
+// the thing that matters and defers the thing that does not.
+//
+// Everything else is centred, not spread.  MDK's 2D arrives at one blitter from
+// an ordinary draw list; there is no further call site to classify against,
+// which is exactly the situation section 24 describes.  Centring reproduces the
+// 600x360 layout exactly, so nothing can split and nothing can move relative to
+// anything else -- correct by construction, at the cost of the corners.  Two
+// attempts at recovering the corners in Turok failed on hardware for structural
+// reasons that apply here word for word; do not try a third.
+//
+// Implemented as an inline hook rather than an in-place rewrite because the
+// arithmetic does not fit: the site is 32 bytes and the offset form needs 41.
+// The stub's body is C (section 25) and the four globals it needs are read out
+// of the SIGNATURE's own displacements rather than written down here, so a
+// matched signature is also proof they are the right addresses.
+//
+// pushad/popad around the call is what makes this safe to drop in: the original
+// left the computed base in eax, and the code after the site reloads eax from
+// the stride global before using it again, so nothing depends on our not
+// clobbering it.  Nothing downstream reads flags either.  `ebp` still addresses
+// 0x470F78's own frame at the hook point, so `[ebp+4]` is the caller's return
+// address.
+//
+// The sprite blitter's own lock call is located by signature rather than
+// written down, and its return address is the byte after it.  If that signature
+// is ever not found the whole hook is skipped: centring WITHOUT the exception
+// is a known-broken state, not a degraded one.
+//
+static const unsigned char mdk_spritelock_sig[] = {   /* ends at 0x0040475a */
+    0x89, 0x85, 0xac, 0xfd, 0xff, 0xff,   // mov  %eax,-0x254(%ebp)
+    0x8d, 0x45, 0xd8,                     // lea  -0x28(%ebp),%eax
+    0xe8, 0x1e, 0xc8, 0x06, 0x00          // call 0x470f78
+};
+
+static const unsigned char mdk_lfb_view_sig[] = {  /* 0x00470f9d */
+    0xa1, 0x58, 0x6a, 0x54, 0x00,               // mov  0x546a58,%eax  stride @1
+    0x0f, 0xaf, 0x05, 0xe4, 0x2b, 0x49, 0x00,   // imul 0x492be4       orgY   @8
+    0x8b, 0x15, 0x54, 0x6a, 0x54, 0x00,         // mov  0x546a54,%edx  lfb    @14
+    0x01, 0xd0,                                 // add  %edx,%eax
+    0x8b, 0x15, 0xe0, 0x2b, 0x49, 0x00,         // mov  0x492be0,%edx  orgX   @22
+    0x01, 0xd2,                                 // add  %edx,%edx
+    0x01, 0xd0,                                 // add  %edx,%eax
+    0x89, 0x03                                  // mov  %eax,(%ebx)
+};
+#define MDK_LFB_STRIDE_AT   1
+#define MDK_LFB_ORGY_AT     8
+#define MDK_LFB_PTR_AT     14
+#define MDK_LFB_ORGX_AT    22
+
+/* Live pointers into the game, so the hook follows whatever it does later. */
+static const unsigned int *g_mdkLfbPtr    = NULL;
+static const unsigned int *g_mdkStride    = NULL;
+static const int          *g_mdkOrgX      = NULL;
+static const int          *g_mdkOrgY      = NULL;
+static int                 g_mdkHudCx     = 0;
+static int                 g_mdkHudCy     = 0;
+
+//
+// The callers whose coordinates are already real screen pixels and must NOT be
+// centred: the sprite blitter (K10) and the entity drawer (K11).
+//
+static unsigned int        g_mdkSpriteRet = 0;
+static unsigned int        g_mdkEntityRet = 0;
+
+//
+// Not static, and marked used/noinline: its only reference is the rel32 written
+// into the stub below, so nothing in this translation unit calls it and it must
+// keep a plain cdecl frame.
+//
+extern "C" void __attribute__((cdecl, used, noinline))
+MdkLfbBaseView(unsigned int *out, unsigned int caller)
+{
+    int cx = g_mdkHudCx;
+    int cy = g_mdkHudCy;
+
+    if (!out || !g_mdkLfbPtr) return;
+
+    // TEMPORARY: which of the eighteen callers actually run, and when.
+    if (MdkDiagFresh(0x2d000000u ^ (caller << 4)))
+        MdkDiag("viewlock caller=%08lx", (long)caller);
+
+    // Two callers work in real screen pixels rather than the 600x360 layout,
+    // and must not be offset again: the sprite blitter and the entity drawer.
+    if (caller == g_mdkSpriteRet || (g_mdkEntityRet && caller == g_mdkEntityRet)) {
+        cx = 0;
+        cy = 0;
+    }
+
+    *out = *g_mdkLfbPtr
+         + (unsigned int)((*g_mdkOrgY + cy) * (int)*g_mdkStride)
+         + (unsigned int)(2 * (*g_mdkOrgX + cx));
+}
+
+static const unsigned char mdk_lfb_stub[] = {
+    0x60,                       // pushad
+    0xff, 0x75, 0x04,           // push  0x4(%ebp)     -> caller's return addr
+    0x53,                       // push  %ebx          -> the out pointer
+    0xe8, 0, 0, 0, 0,           // call  MdkLfbBaseView            <- @6
+    0x83, 0xc4, 0x08,           // add   $0x8,%esp
+    0x61,                       // popad
+    0xc3                        // ret
+};
+#define MDK_LFB_STUB_CALL_AT  6
+
+
+//
+// K4: stop the shake moving the window.
+//
+static void InstallMdkShake(unsigned char *code, unsigned int codeSize)
+{
+    static const unsigned char zero[MDK_SHAKE_ZERO] = {
+        0x31, 0xc0,             // xor %eax,%eax   new X
+        0x31, 0xd2,             // xor %edx,%edx   new Y
+        0x31, 0xdb,             // xor %ebx,%ebx   other X
+        0x31, 0xc9,             // xor %ecx,%ecx   other Y
+        0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90
+    };
+    unsigned char *at[MDK_SHAKE_SITES];
+    unsigned int   i, found = 0;
+
+    for (i = 0; i < MDK_SHAKE_SITES; i++) {
+        at[i] = FindUnique(code, codeSize, mdk_shake[i], MDK_SHAKE_SIG);
+        if (at[i]) found++;
+    }
+
+    // All or nothing: half the branches sliding the window and half not is a
+    // worse state than either, and one that only shows up when something
+    // explodes.
+    if (found != MDK_SHAKE_SITES) return;
+
+    for (i = 0; i < MDK_SHAKE_SITES; i++)
+        WriteCode(at[i], zero, MDK_SHAKE_ZERO);
+}
+
+// ---------------------------------------------------------------------------
+// K11.  The player character -- the real one this time
+// ---------------------------------------------------------------------------
+//
+// Found by instrumenting every 2D drawer that runs in gameplay and reading the
+// accumulated log as a sequence.  In the in-level epochs there are no sprite
+// records at all; what fires instead, every time, is `0x415a38` from caller
+// `0x40ab11`, with arguments like
+//
+//     eax=0x4f2 edx=0x333   (1266, 819)
+//     eax=0x457 edx=0x28a   (1111, 650)
+//     eax=0x502 edx=0x33e   (1282, 830)
+//
+// -- and the routine's first two instructions are
+//
+//     415a45  cmp %eax,$600 ; jge return
+//     415a4c  cmp %edx,$360 ; jge return
+//
+// So the character is passed correct, fully-scaled screen coordinates and then
+// thrown away by a destination surface still described as 600x360.  That is
+// also why the bisect blamed K2: before the projection patch these coordinates
+// were ~(370,206) and passed the test; after it they are three times larger and
+// never do.  Nothing was ever culling it in the 3D sense -- this is a 2D clip.
+//
+// The arithmetic confirms which space they are in.  The scaled projection puts
+// an old-space point at `old*3 + 380` horizontally and `old*3` vertically (the
+// vertical offset vanishes because 180*3 == H/2 exactly).  Inverting the logged
+// values gives old x 244..301 and old y 206..282 -- clustered around the old
+// centre of (300,180), which is where a third-person character belongs.  Read
+// as an unscaled `old*3` they would sit 70..127 units right of centre for no
+// reason.  So these are real screen pixels.
+//
+// Seven bounds inside the routine: two entry rejects, a right-edge clamp pair,
+// and three bottom-edge clamps.  All become the real screen.
+//
+// The drawer takes its framebuffer base from `0x470F78`, which K5 centres.
+// Real screen coordinates must not then be offset again by (cx,cy), so its lock
+// is excluded exactly as the sprite blitter's is -- the caller table now has
+// two entries.  Its return address is located by signature rather than written
+// down.
+//
+static const unsigned char mdk_ent00[] =   /* 0x00415a45 */
+    "\x3d\x58\x02\x00\x00\x7d\x1c\x81\xfa\x68"
+    "\x01\x00\x00";
+static const MdkField mdk_ent00_f[] = { {1,MDK_W}, {9,MDK_H} };
+
+static const unsigned char mdk_ent01[] =   /* 0x00415aa8 */
+    "\x81\xfa\x58\x02\x00\x00\x0f\x8c\x9f\x02"
+    "\x00\x00\xba\x58\x02\x00\x00";
+static const MdkField mdk_ent01_f[] = { {2,MDK_W}, {13,MDK_W} };
+
+static const unsigned char mdk_ent02[] =   /* 0x00415af1 */
+    "\x81\xfe\x68\x01\x00\x00\x7c\xc8";
+static const MdkField mdk_ent02_f[] = { {2,MDK_H} };
+
+static const unsigned char mdk_ent03[] =   /* 0x00415b6d */
+    "\x81\xfe\x68\x01\x00\x00\x7c\xcd";
+static const MdkField mdk_ent03_f[] = { {2,MDK_H} };
+
+static const unsigned char mdk_ent04[] =   /* 0x00415d78 */
+    "\x81\xfe\x68\x01\x00\x00\x7c\xd3";
+static const MdkField mdk_ent04_f[] = { {2,MDK_H} };
+
+static const MdkSpan mdk_entity[] = {
+    { mdk_ent00, 13, mdk_ent00_f, 2 },   /* 0x00415a45 */
+    { mdk_ent01, 17, mdk_ent01_f, 2 },   /* 0x00415aa8 */
+    { mdk_ent02,  8, mdk_ent02_f, 1 },   /* 0x00415af1 */
+    { mdk_ent03,  8, mdk_ent03_f, 1 },   /* 0x00415b6d */
+    { mdk_ent04,  8, mdk_ent04_f, 1 }    /* 0x00415d78 */
+};
+#define MDK_ENTITY_SPANS (sizeof(mdk_entity) / sizeof(mdk_entity[0]))
+
+static const unsigned char mdk_entlock_sig[] =   /* ends at 0x00415a7a */
+    "\x8d\x55\xcc\x8d\x45\xd0\xe8\xfe\xb4\x05"
+    "\x00";
+
+// ---------------------------------------------------------------------------
+// K10.  A menu/intro sprite (NOT the character -- see K11)
+// ---------------------------------------------------------------------------
+//
+// The player IS a 2D sprite, as first reported -- three builds went past that
+// because the sprite blitter looked idle in gameplay, which it was not: the
+// first capture simply missed the moment.  The hardware bisect and the logs
+// named it exactly:
+//
+//   patches=1  (no projection patch)  pos x 277..323  y 171..195  dest ~65x110
+//   patches=3  (projection patched)   pos x 277..323  y 165..194  dest ~63x107
+//   patches=23 (+ camera viewport)    pos x 275..323  y 165..193  dest ~62x105
+//
+// Drawn once per frame (450 calls in 450 frames), roughly humanoid, wandering
+// around (300,180) -- and **identical at every patch level**.  So it is
+// projected entirely inside MDK's old 600x360 space by the inlined `+300`/`+180`
+// transform at `0x412afb`/`0x412b0a`, which build 3 deliberately left alone as
+// "dual-purpose constants in an unidentified routine".  The routine was
+// `0x412978`, the caller is `0x410e0c`, and the element was the player.
+//
+// Once the world was rescaled and the character was not, it stayed a 65x110
+// sprite in the top-left corner of a 2560x1080 screen: not invisible, just
+// nowhere near where anyone would look.
+//
+// The transform is exact rather than fitted.  In the old space the world put a
+// view-space point at `X/z · Kx/(zoom·A) + Kx`; after K2/K3 it puts it at
+// `X/z · Kx'/(zoom·A') + Kx'`, and the ratio of those two scales is
+//
+//     (Kx'/Kx)·(A/A') = (W/600)·(H·600)/(W·360) = H/360
+//
+// -- the W cancels, exactly as it did for the sprite size in K6, and for the
+// same reason.  So the whole mapping is a uniform scale about the old centre:
+//
+//     screen = (old - 300) · H/360 + W/2        (and 180, H/2 vertically)
+//
+// which is checked by construction: old = 300 lands on W/2, and old = 0 lands
+// on (W - 600·H/360)/2, the left edge of the old view centred in the new one.
+// The sprite's own scale factors get the same H/360, because the world scale is
+// uniform.
+//
+// Hooked at the CALL rather than in the routine (section 5b): the game's return
+// address is already correct, the blitter takes its descriptor in eax under
+// Watcom's register convention, and pushad/popad keeps it there across the
+// body.  Scoped to this one call site, so nothing else that reaches the blitter
+// is touched.
+//
+// This deliberately produces REAL SCREEN pixels, which is why K8 must stay: the
+// blitter's base is the raw framebuffer origin, so K7's clip bound of W is
+// exactly right and cannot walk off the end of a row.  Centring the blitter
+// instead and emitting `(old-300)·k + 300` is arithmetically equivalent but
+// leaves the clip bound disagreeing with the base by cx, which is a buffer
+// overrun waiting to happen.
+//
+static const unsigned char mdk_player_sig[] =    /* 0x00412dd1 */
+    "\x8b\x45\xe8\x8b\x04\x85\x00\x5d\x4e\x00"
+    "\xb9\x60\xf4\x46\x00\x89\x45\xa4\x8d\x45"
+    "\x8c\x89\x4d\xa8\xe8\x02\x18\xff\xff";
+#define MDK_PLAYER_CALL_AT  24      /* the `call 0x4045f0`, five bytes */
+
+/* The old virtual view's centre: what the inlined projection adds. */
+#define MDK_VCENTRE_X  300
+#define MDK_VCENTRE_Y  180
+
+static unsigned char *g_mdkBlitter = NULL;
+
+extern "C" void __attribute__((cdecl, used, noinline))
+MdkFixPlayer(int *d)
+{
+    int k, n;
+
+    if (!d || !g_targetH) return;
+
+    k = (int)g_targetH;
+    n = MDK_VIEW_H;
+
+    d[0] = (d[0] - MDK_VCENTRE_X) * k / n + (int)g_targetW / 2;
+    d[1] = (d[1] - MDK_VCENTRE_Y) * k / n + (int)g_targetH / 2;
+    d[4] = d[4] * k / n;
+    d[5] = d[5] * k / n;
+}
+
+static const unsigned char mdk_player_stub[] = {
+    0x60,                       // pushad
+    0x50,                       // push  %eax        -> the descriptor
+    0xe8, 0, 0, 0, 0,           // call  MdkFixPlayer         rel32 <- @3
+    0x83, 0xc4, 0x04,           // add   $0x4,%esp
+    0x61,                       // popad
+    0xe9, 0, 0, 0, 0            // jmp   the blitter          rel32 <- @12
+};
+/* Displacement offsets, not opcode offsets.  Verified by disassembling the
+   template -- the jmp was written as 13 first (GAME-PATCHING.md section 5). */
+#define MDK_PLAYER_STUB_CALL_AT   3
+#define MDK_PLAYER_STUB_JMP_AT   12
+
+// ---------------------------------------------------------------------------
+// K9.  Clear the frame
+// ---------------------------------------------------------------------------
+//
+// MDK never clears the framebuffer.  It does not need to at 640x480, because
+// its backdrop covers the whole 600x360 3D window -- so the clear routine it
+// does have (`0x46E6E8`: clip, grBufferClear, clip) is called at transitions
+// rather than per frame.
+//
+// Once the window is the whole screen that assumption fails: the backdrop is
+// drawn by `0x471E80` from a 1800x360 source and covers only part of the
+// screen, so everything else keeps whatever the previous frame left there.
+// That is the smearing.
+//
+// The backdrop cannot be made to cover 2560x1080 -- there is no more image --
+// so the honest fix is to clear what it does not reach.  `0x46E6E8` takes no
+// arguments, returns normally, and after K1 its clip window is already the full
+// screen, so it is called as-is from the frame boundary rather than
+// reimplemented.  Its address is taken from the K1 span that overlaps it, which
+// means it is only ever called if that span matched.
+//
+// (`g_mdkClear` is declared with the other MDK data, above.)
+
+//
+// K6: scale the main-view camera viewport by H/360.
+//
+// Every field is the shipped value times H/360, so the value is taken from the
+// signature rather than from a table -- see the note above on why that is both
+// shorter and safer.
+//
+static void InstallMdkCamera(unsigned char *code, unsigned int codeSize)
+{
+    unsigned char *at[MDK_CAMERA_SPANS];
+    unsigned char  repl[MDK_SPAN_MAX];
+    unsigned int   i, j, found = 0;
+
+    for (i = 0; i < MDK_CAMERA_SPANS; i++) {
+        at[i] = FindUnique(code, codeSize, mdk_camera[i].sig, mdk_camera[i].len);
+        if (at[i]) found++;
+    }
+
+    if (found == 0) return;                     // already applied
+    if (found != MDK_CAMERA_SPANS) return;      // partial: refuse
+
+    for (i = 0; i < MDK_CAMERA_SPANS; i++) {
+        const MdkSpan *s = &mdk_camera[i];
+
+        memcpy(repl, s->sig, s->len);
+        for (j = 0; j < s->fieldCount; j++) {
+            unsigned int at_ = s->fields[j].at;
+            unsigned int v   = ReadU32(s->sig + at_);
+
+            PutU32(repl + at_, v * g_targetH / MDK_VIEW_H);
+        }
+        WriteCode(at[i], repl, s->len);
+    }
+}
+
+//
+// K7: give the sprite clip the real screen width.
+//
+static void InstallMdkSpriteClip(unsigned char *code, unsigned int codeSize)
+{
+    unsigned char  repl[sizeof(mdk_clipw_sig) - 1];
+    unsigned char *at;
+
+    at = FindUnique(code, codeSize, mdk_clipw_sig, sizeof(mdk_clipw_sig) - 1);
+    if (!at) return;
+
+    repl[0] = 0xba;                     // mov $W,%edx  -- same length as the
+    PutU32(repl + 1, g_targetW);        // 6-byte load it replaces, less one
+    repl[5] = 0x90;                     // nop
+    repl[6] = 0x29;                     // sub %esi,%edx  (kept)
+    repl[7] = 0xf2;
+
+    WriteCode(at, repl, sizeof(repl));
+}
+
+//
+// K11: give the entity drawer the real screen as its destination surface.
+//
+static void InstallMdkEntity(unsigned char *code, unsigned int codeSize)
+{
+    unsigned char *at[MDK_ENTITY_SPANS];
+    unsigned char  repl[MDK_SPAN_MAX];
+    unsigned int   i, j, found = 0;
+
+    for (i = 0; i < MDK_ENTITY_SPANS; i++) {
+        at[i] = FindUnique(code, codeSize, mdk_entity[i].sig, mdk_entity[i].len);
+        if (at[i]) found++;
+    }
+
+    if (found == 0) return;                     // already applied
+    if (found != MDK_ENTITY_SPANS) return;      // partial: refuse
+
+    for (i = 0; i < MDK_ENTITY_SPANS; i++) {
+        const MdkSpan *s = &mdk_entity[i];
+
+        memcpy(repl, s->sig, s->len);
+        for (j = 0; j < s->fieldCount; j++)
+            PutU32(repl + s->fields[j].at,
+                   s->fields[j].kind == MDK_W ? g_targetW : g_targetH);
+        WriteCode(at[i], repl, s->len);
+    }
+}
+
+//
+// K10: put the menu/intro sprite where the world is.
+//
+static void InstallMdkPlayer(unsigned char *code, unsigned int codeSize)
+{
+    unsigned char *at, *stub, *blitter;
+    unsigned char  call[5];
+    int            rel;
+
+    at = FindUnique(code, codeSize, mdk_player_sig, sizeof(mdk_player_sig) - 1);
+    if (!at) return;
+
+    // Resolve the blitter from the call we are displacing, rather than from a
+    // second signature: it is the same instruction either way, and this cannot
+    // disagree with itself.
+    at     += MDK_PLAYER_CALL_AT;
+    rel     = (int)ReadU32(at + 1);
+    blitter = at + 5 + rel;
+
+    stub = (unsigned char *)VirtualAlloc(NULL, sizeof(mdk_player_stub),
+                                         MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+    if (!stub) return;
+
+    memcpy(stub, mdk_player_stub, sizeof(mdk_player_stub));
+    rel = (int)((unsigned char *)&MdkFixPlayer
+                - (stub + MDK_PLAYER_STUB_CALL_AT + 4));
+    PutU32(stub + MDK_PLAYER_STUB_CALL_AT, (unsigned int)rel);
+    rel = (int)(blitter - (stub + MDK_PLAYER_STUB_JMP_AT + 4));
+    PutU32(stub + MDK_PLAYER_STUB_JMP_AT, (unsigned int)rel);
+
+    call[0] = 0xe8;
+    rel = (int)(stub - (at + 5));
+    PutU32(call + 1, (unsigned int)rel);
+
+    if (!WriteCode(at, call, 5)) {
+        VirtualFree(stub, 0, MEM_RELEASE);
+        return;
+    }
+    g_mdkBlitter = blitter;
+}
+
+//
+// K5/K8: centre the 2D island, except for the sprite blitter.
+//
+static void InstallMdkHud(unsigned char *code, unsigned int codeSize)
+{
+    unsigned char *at, *stub, *spriteLock;
+    unsigned char  repl[sizeof(mdk_lfb_view_sig)];
+    unsigned int   i;
+    int            rel;
+
+    at = FindUnique(code, codeSize, mdk_lfb_view_sig, sizeof(mdk_lfb_view_sig));
+    if (!at) return;
+
+    // Fail closed.  Centring every caller -- including the one whose
+    // coordinates are already real screen pixels -- is not a partial fix, it is
+    // the bug this replaces.
+    spriteLock = FindUnique(code, codeSize, mdk_spritelock_sig,
+                            sizeof(mdk_spritelock_sig));
+    if (!spriteLock) return;
+    g_mdkSpriteRet = (unsigned int)(spriteLock + sizeof(mdk_spritelock_sig));
+
+    // The entity drawer's lock, for the same reason.  Located here rather than
+    // in K11 because this is where the exclusion table lives.
+    spriteLock = FindUnique(code, codeSize, mdk_entlock_sig,
+                            sizeof(mdk_entlock_sig) - 1);
+    if (!spriteLock) return;
+    g_mdkEntityRet = (unsigned int)(spriteLock + sizeof(mdk_entlock_sig) - 1);
+
+    g_mdkHudCx = ((int)g_targetW - MDK_VIEW_W) / 2;
+    g_mdkHudCy = ((int)g_targetH - MDK_VIEW_H) / 2;
+    if (g_mdkHudCx < 0) g_mdkHudCx = 0;
+    if (g_mdkHudCy < 0) g_mdkHudCy = 0;
+    if (!g_mdkHudCx && !g_mdkHudCy) return;     // nothing to move
+
+    g_mdkStride = (const unsigned int *)ReadU32(at + MDK_LFB_STRIDE_AT);
+    g_mdkOrgY   = (const int          *)ReadU32(at + MDK_LFB_ORGY_AT);
+    g_mdkLfbPtr = (const unsigned int *)ReadU32(at + MDK_LFB_PTR_AT);
+    g_mdkOrgX   = (const int          *)ReadU32(at + MDK_LFB_ORGX_AT);
+
+    stub = (unsigned char *)VirtualAlloc(NULL, sizeof(mdk_lfb_stub),
+                                         MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+    if (!stub) return;
+
+    memcpy(stub, mdk_lfb_stub, sizeof(mdk_lfb_stub));
+    rel = (int)((unsigned char *)&MdkLfbBaseView
+                - (stub + MDK_LFB_STUB_CALL_AT + 4));
+    PutU32(stub + MDK_LFB_STUB_CALL_AT, (unsigned int)rel);
+
+    repl[0] = 0xe8;                             // call rel32 -> stub
+    rel = (int)(stub - (at + 5));
+    PutU32(repl + 1, (unsigned int)rel);
+    for (i = 5; i < sizeof(repl); i++)
+        repl[i] = 0x90;
+
+    if (!WriteCode(at, repl, sizeof(repl)))
+        VirtualFree(stub, 0, MEM_RELEASE);
+}
+
+// ==========================================================================
+// TEMPORARY DIAGNOSTIC -- MDK's 2D layer.  Remove once it is understood.
+// ==========================================================================
+//
+// Two questions a screenshot cannot answer, and which cost a round trip each
+// when guessed at (GAME-PATCHING.md section 6):
+//
+//   1. Did every patch actually land?  A `sigs` line sampled BEFORE the patches
+//      consume their own find patterns separates "did nothing" from "did the
+//      wrong thing".
+//   2. What draws the player, and what rejects it?  The sprite blitter is
+//      instrumented at its entry with the descriptor's position and its
+//      computed destination size, so an element that never appears in the log
+//      is not drawn through it -- and that is a real answer, not a null one.
+//
+// Records are deduplicated and capped, and the whole buffer is written once,
+// from grBufferSwap, at a fixed frame count.  A file write per frame would
+// perturb exactly the timing being measured.
+//
+// The first version of this flushed once at a fixed frame count, and the
+// capture missed gameplay entirely -- every sprite in it sat at x=300, the
+// centre of the old 600-wide layout, and the world-entity drawer never ran at
+// all.  That is precisely the trap GAME-PATCHING.md section 6 records ("a frame
+// countdown from launch never covers the right moment").
+//
+// So it is now an EPOCH log: it rewrites the file every few hundred frames and
+// starts a fresh window.  The header is kept, everything after it is discarded.
+// Whenever the file is read it therefore describes the LAST few seconds of play
+// -- there is nothing to time and no key to press, which also avoids the other
+// half of that lesson (a trigger key the game itself consumes).
+//
+#define MDK_DIAG_CAP     (48u * 1024u)
+#define MDK_DIAG_EPOCH   450u          /* ~15 s of frames */
+#define MDK_DIAG_RECS    200u
+#define MDK_DIAG_CALLERS 16u
+
+static char          g_diagBuf[MDK_DIAG_CAP];
+static unsigned int  g_diagLen   = 0;
+static unsigned int  g_diagHdr   = 0;   /* length of the never-discarded header */
+static BOOL          g_diagArmed = FALSE;
+static BOOL          g_diagDone  = FALSE;
+static unsigned int  g_diagFrame = 0;
+static unsigned int  g_diagEpoch = 0;
+
+static unsigned int  g_diagKey[MDK_DIAG_RECS];
+static unsigned int  g_diagKeys = 0;
+
+/* Per-epoch call counts, so "this drawer never ran" is visible as such. */
+static unsigned int  g_sprCaller[MDK_DIAG_CALLERS];
+static unsigned int  g_sprCount[MDK_DIAG_CALLERS];
+static unsigned int  g_sprCallers = 0;
+
+static void MdkDiag(const char *fmt, ...)
+{
+    char    line[256];
+    va_list ap;
+    int     n;
+
+    if (!g_diagArmed || g_diagDone) return;
+
+    va_start(ap, fmt);
+    n = wvsprintfA(line, fmt, ap);
+    va_end(ap);
+
+    if (n < 0) return;
+    if (g_diagLen + (unsigned int)n + 2 >= MDK_DIAG_CAP) return;
+
+    memcpy(g_diagBuf + g_diagLen, line, (unsigned int)n);
+    g_diagLen += (unsigned int)n;
+    g_diagBuf[g_diagLen++] = '\r';
+    g_diagBuf[g_diagLen++] = '\n';
+}
+
+/* Returns TRUE the first time this key is seen. */
+static BOOL MdkDiagFresh(unsigned int key)
+{
+    unsigned int i;
+
+    for (i = 0; i < g_diagKeys; i++)
+        if (g_diagKey[i] == key) return FALSE;
+
+    if (g_diagKeys >= MDK_DIAG_RECS) return FALSE;
+    g_diagKey[g_diagKeys++] = key;
+    return TRUE;
+}
+
+static void MdkDiagFlush(void)
+{
+    char   path[MAX_PATH];
+    HANDLE h;
+    DWORD  wrote = 0;
+
+    if (g_diagDone || !g_diagLen) return;
+
+    if (!PathBesideExe("gxp_mdk.txt", path)) return;
+
+    h = CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                    FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return;
+
+    WriteFile(h, g_diagBuf, g_diagLen, &wrote, NULL);
+    CloseHandle(h);
+}
+
+//
+// Logged at the sprite blitter's entry.  `d` is the descriptor:
+//
+//     +0x00 posX   +0x04 posY   +0x08 srcW  +0x0c srcH
+//     +0x10 scaleX +0x14 scaleY (both 8.8), +0x18 pixels
+//
+// destW/destH are what the blitter itself computes and then tests for <= 0,
+// which is the first of the three ways it can decline to draw.
+//
+extern "C" void __attribute__((cdecl, used, noinline))
+MdkDiagSprite(const int *d, unsigned int caller)
+{
+    unsigned int i;
+    int          dw, dh;
+
+    if (!g_diagArmed || g_diagDone || !d) return;
+
+    for (i = 0; i < g_sprCallers; i++)
+        if (g_sprCaller[i] == caller) break;
+    if (i == g_sprCallers && g_sprCallers < MDK_DIAG_CALLERS) {
+        g_sprCaller[g_sprCallers] = caller;
+        g_sprCount[g_sprCallers]  = 0;
+        g_sprCallers++;
+    }
+    if (i < MDK_DIAG_CALLERS) g_sprCount[i]++;
+
+    dw = (d[4] * d[2]) >> 8;
+    dh = (d[5] * d[3]) >> 8;
+
+    // Key on the caller and a coarse position, so a sprite that moves a little
+    // does not flood the buffer but one drawn somewhere new still appears.
+    if (!MdkDiagFresh((caller * 2654435761u)
+                      ^ (unsigned int)((d[0] >> 5) & 0x3ff)
+                      ^ ((unsigned int)((d[1] >> 5) & 0x3ff) << 10)))
+        return;
+
+    MdkDiag("spr call=%08lx pos=%ld,%ld src=%ldx%ld dest=%ldx%ld",
+            (long)caller, (long)d[0], (long)d[1],
+            (long)d[2], (long)d[3], (long)dw, (long)dh);
+}
+
+//
+// Logged at each raw-LFB lock, so we learn which of them draws the backdrop.
+//
+extern "C" void __attribute__((cdecl, used, noinline))
+MdkDiagLock(unsigned int tag, unsigned int caller)
+{
+    if (!g_diagArmed || g_diagDone) return;
+    if (!MdkDiagFresh(0x10c00000u ^ (caller << 4) ^ tag)) return;
+
+    MdkDiag("rawlock%lu caller=%08lx", (unsigned long)tag, (long)caller);
+}
+
+static const unsigned char mdk_diag_sprite_stub[] = {
+    0x83, 0xc4, 0x04,           // add   $0x4,%esp   (drop our return address)
+    0x60,                       // pushad
+    0xff, 0x74, 0x24, 0x20,     // push  0x20(%esp)  -> caller's return address
+    0x50,                       // push  %eax        -> the descriptor
+    0xe8, 0, 0, 0, 0,           // call  MdkDiagSprite        rel32 <- @10
+    0x83, 0xc4, 0x08,           // add   $0x8,%esp
+    0x61,                       // popad
+    0x55, 0x89, 0xe5, 0x53, 0x51,   // <displaced: push %ebp; mov %esp,%ebp;
+                                    //             push %ebx; push %ecx>
+    0xe9, 0, 0, 0, 0            // jmp   blitter+5            rel32 <- @24
+};
+/* Offsets of the DISPLACEMENTS, not the opcodes -- both were off by one until
+   the generated stub was disassembled (GAME-PATCHING.md section 5). */
+#define MDK_DIAG_SPR_CALL_AT  10
+#define MDK_DIAG_SPR_JMP_AT   24
+
+static const unsigned char mdk_diag_lock_stub[] = {
+    0x83, 0xc4, 0x04,           // add   $0x4,%esp
+    0x60,                       // pushad
+    0xff, 0x74, 0x24, 0x20,     // push  0x20(%esp)  -> caller's return address
+    0x6a, 0x00,                 // push  $tag                 imm8  <- @9
+    0xe8, 0, 0, 0, 0,           // call  MdkDiagLock          rel32 <- @11
+    0x83, 0xc4, 0x08,           // add   $0x8,%esp
+    0x61,                       // popad
+    0x55, 0x89, 0xe5, 0x53, 0x51,   // <displaced>
+    0xe9, 0, 0, 0, 0            // jmp   lock+5               rel32 <- @25
+};   /* verified by disassembling the template, as above */
+#define MDK_DIAG_LOCK_TAG_AT   9
+#define MDK_DIAG_LOCK_CALL_AT 11
+#define MDK_DIAG_LOCK_JMP_AT  25
+
+/* The two raw-LFB locks, and the sprite blitter, by entry signature. */
+static const unsigned char mdk_rawlock1_sig[] = {   /* 0x00470fd8 */
+    0x55, 0x89, 0xe5, 0x53, 0x51, 0x56, 0x89, 0xc6, 0x89, 0xd3,
+    0x6a, 0x00, 0xe8, 0xdf, 0x87, 0x01, 0x00
+};
+static const unsigned char mdk_rawlock2_sig[] = {   /* 0x00471054 */
+    0x55, 0x89, 0xe5, 0x53, 0x51, 0x56, 0x89, 0xc6, 0x89, 0xd3,
+    0x6a, 0x00, 0xe8, 0x63, 0x87, 0x01, 0x00
+};
+static const unsigned char mdk_blitter_sig[] = {    /* 0x004045f0 */
+    0x55, 0x89, 0xe5, 0x53, 0x51, 0x52, 0x56, 0x57,
+    0x81, 0xec, 0x4c, 0x02, 0x00, 0x00, 0x89, 0xc1
+};
+
+//
+// Every 2D drawer seen running during gameplay, hooked at its entry so its
+// arguments are logged rather than guessed at.
+//
+// tag 0 is `0x471E80`, the rotated-sprite drawer that takes the RAW framebuffer
+// base -- its first argument is a pointer to {x, y, ...}, which the game itself
+// dereferences immediately, so it is safe to read.  Tags 1-5 are the drawers
+// whose callers appeared in the `viewlock` lines; their arguments are logged
+// raw, because Watcom passes in eax/edx/ebx/ecx and one of them should be a
+// recognisable screen coordinate.
+//
+// The text renderer (`0x414FA8`) is deliberately not hooked: it was read and
+// identified, and it emits one call per character.
+//
+struct MdkFnHook {
+    const unsigned char *sig;
+    unsigned int         len;
+    unsigned int         tag;
+};
+
+static const unsigned char mdk_fn_rot[] =   /* 0x00471e80, tag 0 */
+    "\x55\x89\xe5\x53\x51\x56\x57\x81\xec\xa8"
+    "\x00\x00\x00\x89\x45\xcc";
+static const unsigned char mdk_fn_d2d1[] =  /* 0x00416e38, tag 1 */
+    "\x55\x89\xe5\x56\x57\x83\xec\x10\x89\xc7"
+    "\x89\x55";
+static const unsigned char mdk_fn_d2d2[] =  /* 0x00416c0c, tag 2 */
+    "\x55\x89\xe5\x53\x51\x56\x57\x81\xec\x00"
+    "\x06\x00";
+static const unsigned char mdk_fn_d2d3[] =  /* 0x004193fc, tag 3 */
+    "\x55\x89\xe5\x56\x57\x83\xec\x10\x89\xc6"
+    "\x89\x55";
+static const unsigned char mdk_fn_d2d4[] =  /* 0x00415a38, tag 4 */
+    "\x55\x89\xe5\x56\x57\x83\xec\x2c\x89\x45"
+    "\xd8\x89";
+static const unsigned char mdk_fn_d2d5[] =  /* 0x00415314, tag 5 */
+    "\x55\x89\xe5\x56\x57\x83\xec\x54\x89\x45"
+    "\xc0\x89";
+
+static const MdkFnHook mdk_fnhooks[] = {
+    { mdk_fn_rot,  16, 0 },   /* 0x00471e80 */
+    { mdk_fn_d2d1, 12, 1 },   /* 0x00416e38 */
+    { mdk_fn_d2d2, 12, 2 },   /* 0x00416c0c */
+    { mdk_fn_d2d3, 12, 3 },   /* 0x004193fc */
+    { mdk_fn_d2d4, 12, 4 },   /* 0x00415a38 */
+    { mdk_fn_d2d5, 12, 5 }    /* 0x00415314 */
+};
+#define MDK_FNHOOKS (sizeof(mdk_fnhooks) / sizeof(mdk_fnhooks[0]))
+
+//
+// Generic entry hook: `add $4,%esp` so the displaced prologue sees the original
+// stack (section 5a), then pushad and hand the frame to C.  The pushad frame is
+// edi, esi, ebp, esp, ebx, edx, ecx, eax ascending, with the hooked function's
+// own return address immediately above it.
+//
+static const unsigned char mdk_fn_stub[] = {
+    0x83, 0xc4, 0x04,           // add   $0x4,%esp
+    0x60,                       // pushad
+    0x54,                       // push  %esp        -> &frame
+    0x6a, 0x00,                 // push  $tag               imm8  <- @6
+    0xe8, 0, 0, 0, 0,           // call  MdkDiagFn          rel32 <- @8
+    0x83, 0xc4, 0x08,           // add   $0x8,%esp
+    0x61,                       // popad
+    0, 0, 0, 0, 0,              // <the function's own first 5 bytes>  @16
+    0xe9, 0, 0, 0, 0            // jmp   fn+5               rel32 <- @22
+};
+#define MDK_FN_TAG_AT    6
+#define MDK_FN_CALL_AT   8
+#define MDK_FN_DISP_AT  16
+#define MDK_FN_JMP_AT   22
+
+extern "C" void __attribute__((cdecl, used, noinline))
+MdkDiagFn(unsigned int tag, const unsigned int *f)
+{
+    unsigned int caller, eax;
+
+    if (!g_diagArmed || g_diagDone || !f) return;
+
+    eax    = f[7];
+    caller = f[8];
+
+    if (tag == 0) {
+        // 0x471E80's first argument is {x, y, ...} in the game's own 2D space.
+        //
+        // It can be NULL: the routine's own second act is `test %edx,%edx; je`
+        // on exactly this pointer.  Dereferencing it unconditionally is what
+        // crashed the previous build the moment a level started -- read the
+        // callee's guards before copying its argument access.
+        const int *p = (const int *)eax;
+
+        if (!eax || IsBadReadPtr(p, 8)) return;
+
+        if (!MdkDiagFresh(0x3a000000u ^ (caller << 4)
+                          ^ (unsigned int)((p[0] >> 5) & 0x3ff)
+                          ^ ((unsigned int)((p[1] >> 5) & 0x3ff) << 10)))
+            return;
+        MdkDiag("rot caller=%08lx pos=%ld,%ld", (long)caller,
+                (long)p[0], (long)p[1]);
+        return;
+    }
+
+    if (!MdkDiagFresh(0x4b000000u ^ (tag << 24) ^ (caller << 4)
+                      ^ ((eax >> 5) & 0x3ff)))
+        return;
+
+    MdkDiag("d2d%lu caller=%08lx eax=%08lx edx=%08lx ebx=%08lx ecx=%08lx",
+            (unsigned long)tag, (long)caller, (long)eax,
+            (long)f[5], (long)f[4], (long)f[6]);
+}
+
+static unsigned char *MdkDiagHook(unsigned char *at, const unsigned char *tmpl,
+                                  unsigned int len, unsigned int callAt,
+                                  unsigned int jmpAt, void *body)
+{
+    unsigned char *stub;
+    unsigned char  call[5];
+    int            rel;
+
+    stub = (unsigned char *)VirtualAlloc(NULL, len, MEM_COMMIT,
+                                         PAGE_EXECUTE_READWRITE);
+    if (!stub) return NULL;
+
+    memcpy(stub, tmpl, len);
+    rel = (int)((unsigned char *)body - (stub + callAt + 4));
+    PutU32(stub + callAt, (unsigned int)rel);
+    rel = (int)((at + 5) - (stub + jmpAt + 4));
+    PutU32(stub + jmpAt, (unsigned int)rel);
+
+    call[0] = 0xe8;
+    rel = (int)(stub - (at + 5));
+    PutU32(call + 1, (unsigned int)rel);
+
+    if (!WriteCode(at, call, 5)) {
+        VirtualFree(stub, 0, MEM_RELEASE);
+        return NULL;
+    }
+    return stub;
+}
+
+//
+// TEMPORARY crash filter.  Chained and returning EXCEPTION_CONTINUE_SEARCH, so
+// Windows still shows its own dialog -- this only writes the log first.
+//
+// Reports the faulting address three ways, because each names a different
+// culprit (GAME-PATCHING.md section 6): raw, as an RVA into MDK's image, and as
+// an offset into whichever hook stub we allocated.  A fault inside one of our
+// own stubs is a bug in the instrument; one inside the game's image with a
+// sensible RVA is a bug in what we told it to do.
+//
+#define MDK_STUBS_MAX 12
+static unsigned char *g_stubAt[MDK_STUBS_MAX];
+static unsigned int   g_stubTag[MDK_STUBS_MAX];
+static unsigned int   g_stubs = 0;
+
+static LPTOP_LEVEL_EXCEPTION_FILTER g_prevFilter = NULL;
+
+static LONG WINAPI MdkCrashFilter(EXCEPTION_POINTERS *ep)
+{
+    unsigned int pc, i;
+
+    if (ep && ep->ExceptionRecord && ep->ContextRecord) {
+        pc = (unsigned int)ep->ExceptionRecord->ExceptionAddress;
+
+        MdkDiag("CRASH code=%08lx at=%08lx exe+%08lx",
+                (long)ep->ExceptionRecord->ExceptionCode, (long)pc,
+                (long)(pc - MDK_IMAGE_BASE));
+        MdkDiag("  eax=%08lx ebx=%08lx ecx=%08lx edx=%08lx",
+                (long)ep->ContextRecord->Eax, (long)ep->ContextRecord->Ebx,
+                (long)ep->ContextRecord->Ecx, (long)ep->ContextRecord->Edx);
+        MdkDiag("  esi=%08lx edi=%08lx ebp=%08lx esp=%08lx",
+                (long)ep->ContextRecord->Esi, (long)ep->ContextRecord->Edi,
+                (long)ep->ContextRecord->Ebp, (long)ep->ContextRecord->Esp);
+
+        for (i = 0; i < g_stubs; i++)
+            if (pc >= (unsigned int)g_stubAt[i] &&
+                pc <  (unsigned int)g_stubAt[i] + 64)
+                MdkDiag("  INSIDE our stub tag=%lu at +%lu",
+                        (unsigned long)g_stubTag[i],
+                        (unsigned long)(pc - (unsigned int)g_stubAt[i]));
+    }
+
+    MdkDiagFlush();
+    if (g_prevFilter) return g_prevFilter(ep);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static void InstallMdkDiag(unsigned char *code, unsigned int codeSize)
+{
+    unsigned char *at, *stub;
+    unsigned int   i;
+
+    at = FindUnique(code, codeSize, mdk_blitter_sig, sizeof(mdk_blitter_sig));
+    MdkDiag("diag blitter=%08lx", (long)(unsigned int)at);
+    if (at)
+        MdkDiagHook(at, mdk_diag_sprite_stub, sizeof(mdk_diag_sprite_stub),
+                    MDK_DIAG_SPR_CALL_AT, MDK_DIAG_SPR_JMP_AT,
+                    (void *)&MdkDiagSprite);
+
+    for (i = 0; i < 2; i++) {
+        const unsigned char *sig = i ? mdk_rawlock2_sig : mdk_rawlock1_sig;
+        unsigned int         len = i ? sizeof(mdk_rawlock2_sig)
+                                     : sizeof(mdk_rawlock1_sig);
+
+        at = FindUnique(code, codeSize, sig, len);
+        MdkDiag("diag rawlock%lu=%08lx", (long)(i + 1), (long)(unsigned int)at);
+        if (!at) continue;
+
+        stub = MdkDiagHook(at, mdk_diag_lock_stub, sizeof(mdk_diag_lock_stub),
+                           MDK_DIAG_LOCK_CALL_AT, MDK_DIAG_LOCK_JMP_AT,
+                           (void *)&MdkDiagLock);
+        if (stub) stub[MDK_DIAG_LOCK_TAG_AT] = (unsigned char)(i + 1);
+    }
+
+    // Every 2D drawer that ran in gameplay, so the character's own path names
+    // itself instead of being narrowed to by elimination.
+    for (i = 0; i < MDK_FNHOOKS; i++) {
+        const MdkFnHook *h = &mdk_fnhooks[i];
+        unsigned char    tmpl[sizeof(mdk_fn_stub)];
+
+        at = FindUnique(code, codeSize, h->sig, h->len);
+        MdkDiag("diag fn%lu=%08lx", (unsigned long)h->tag,
+                (long)(unsigned int)at);
+        if (!at) continue;
+
+        // Customise the template BEFORE it is installed.  The displaced bytes
+        // are taken from the signature rather than re-read from the site --
+        // by the time the hook is written the site holds our own call.
+        memcpy(tmpl, mdk_fn_stub, sizeof(tmpl));
+        tmpl[MDK_FN_TAG_AT] = (unsigned char)h->tag;
+        memcpy(tmpl + MDK_FN_DISP_AT, h->sig, 5);
+
+        stub = MdkDiagHook(at, tmpl, sizeof(tmpl),
+                           MDK_FN_CALL_AT, MDK_FN_JMP_AT, (void *)&MdkDiagFn);
+        if (stub && g_stubs < MDK_STUBS_MAX) {
+            g_stubAt[g_stubs]  = stub;
+            g_stubTag[g_stubs] = h->tag;
+            g_stubs++;
+        }
+    }
+
+    g_prevFilter = SetUnhandledExceptionFilter(MdkCrashFilter);
+}
+
+//
+// Count the signatures BEFORE anything is patched, so "never ran", "ran and
+// matched nothing" and "ran and patched" are three distinguishable outcomes.
+//
+static void MdkDiagSigs(unsigned char *code, unsigned int codeSize)
+{
+    unsigned int i, win = 0, cam = 0, shake = 0;
+
+    for (i = 0; i < MDK_WINDOW_SPANS; i++)
+        if (FindUnique(code, codeSize, mdk_window[i].sig, mdk_window[i].len))
+            win++;
+    for (i = 0; i < MDK_CAMERA_SPANS; i++)
+        if (FindUnique(code, codeSize, mdk_camera[i].sig, mdk_camera[i].len))
+            cam++;
+    for (i = 0; i < MDK_SHAKE_SITES; i++)
+        if (FindUnique(code, codeSize, mdk_shake[i], MDK_SHAKE_SIG))
+            shake++;
+
+    MdkDiag("sigs win=%lu/%lu cam=%lu/%lu shake=%lu/%lu proj=%lu clip=%lu "
+            "lfb=%lu spritelock=%lu",
+            (unsigned long)win,   (unsigned long)MDK_WINDOW_SPANS,
+            (unsigned long)cam,   (unsigned long)MDK_CAMERA_SPANS,
+            (unsigned long)shake, (unsigned long)MDK_SHAKE_SITES,
+            (unsigned long)(FindUnique(code, codeSize, mdk_proj_sig,
+                                       sizeof(mdk_proj_sig) - 1) ? 1 : 0),
+            (unsigned long)(FindUnique(code, codeSize, mdk_clipw_sig,
+                                       sizeof(mdk_clipw_sig) - 1) ? 1 : 0),
+            (unsigned long)(FindUnique(code, codeSize, mdk_lfb_view_sig,
+                                       sizeof(mdk_lfb_view_sig)) ? 1 : 0),
+            (unsigned long)(FindUnique(code, codeSize, mdk_spritelock_sig,
+                                       sizeof(mdk_spritelock_sig)) ? 1 : 0));
+}
+
+//
+// A sample of what the game BELIEVES, taken live rather than inferred.
+//
+// The rotated-sprite drawer at 0x471E80 clips against 0x552D90 / 0x552D94, and
+// those are not constants: 0x4355A8 loads them out of a structure reached
+// through 0x544F08, i.e. from level data.  Nothing static can say what they
+// hold, which is precisely why they are read here instead of guessed at.
+//
+static void MdkDiagLive(void)
+{
+    static const struct { unsigned int va; const char *name; } probe[] = {
+        { 0x00492be0u, "vpOrgX"  }, { 0x00492be4u, "vpOrgY"  },
+        { 0x00538d2cu, "camW"    }, { 0x00538d30u, "camH"    },
+        { 0x00538d3cu, "camOX"   }, { 0x00538d40u, "camOY"   },
+        { 0x00552d90u, "rot90"   }, { 0x00552d94u, "rot94"   },
+        { 0x00552da0u, "rotA0"   }, { 0x00552dacu, "rotAC"   },
+        { 0x00538e60u, "mode60"  }, { 0x00538e64u, "mode64"  }
+    };
+    unsigned int i;
+
+    for (i = 0; i < sizeof(probe) / sizeof(probe[0]); i++)
+        MdkDiag("live %s = %ld", probe[i].name,
+                (long)*(const int *)probe[i].va);
+}
+
+void GameFix_Tick(void)
+{
+    unsigned int i, saved;
+
+    // K9.  Called from the wrapper's grBufferSwap AFTER the swap, so this
+    // clears the buffer the game is about to draw into, not the one being
+    // shown.  Inert unless MDK's window patch matched, and therefore inert
+    // whenever the resolution override is disabled.
+    if (g_mdkClear) g_mdkClear();
+
+    if (!g_diagArmed || g_diagDone) return;
+    if (++g_diagFrame < MDK_DIAG_EPOCH) return;
+
+    // The BODY accumulates for the whole session and is never discarded: an
+    // element that only appears during gameplay must not be lost because the
+    // player later walked into a fade.  That cost a run -- the previous log's
+    // last window happened to cover an intro and a screen fade, and read as
+    // "this drawer never runs".
+    //
+    // Only the tail (counts and live values) is rewritten each time, so the
+    // file stays current without losing history.
+    // A marker in the BODY, so the accumulated history can be read as a
+    // sequence: `rot90` is non-zero only once level data is loaded, which is
+    // what separates menu/intro records from in-level ones.  Without it, seven
+    // earlier logs looked like evidence for the opposite conclusion.
+    MdkDiag("--- epoch %lu  rot90=%ld  camW=%ld ---",
+            (unsigned long)g_diagEpoch,
+            (long)*(const int *)0x00552d90u,
+            (long)*(const int *)0x00538d2cu);
+
+    saved = g_diagLen;
+
+    for (i = 0; i < g_sprCallers; i++)
+        MdkDiag("sprsum call=%08lx n=%lu",
+                (long)g_sprCaller[i], (unsigned long)g_sprCount[i]);
+
+    MdkDiag("epoch=%lu frames=%lu", (unsigned long)g_diagEpoch,
+            (unsigned long)(g_diagEpoch + 1) * MDK_DIAG_EPOCH);
+    MdkDiagLive();
+    MdkDiagFlush();
+
+    g_diagLen   = saved;        /* drop the tail, keep the history */
+    g_diagFrame = 0;
+    g_diagEpoch++;
+}
+
+
+//
+// Everything MDK needs, in one place.
+//
+// K1 fails closed, and takes the rest with it: a projection scaled to the full
+// screen while the clip window is still 600x360 would draw a correctly framed
+// picture and then throw three quarters of it away, which reads as a projection
+// bug rather than as the missing patch it would be.
+//
+// No ini keys.  A game rendering into a corner of the screen, rendering it
+// stretched, or leaving its HUD in a corner is not a preference; and the one
+// thing here that IS a judgement call -- deleting the window shake -- has no
+// second behaviour anyone could choose between, because the alternative hands
+// Glide a clip rectangle off the end of the framebuffer.
+//
+//
+// TEMPORARY.  `patches` is a bitmask so the hardware can bisect which patch
+// hides the player, in one session instead of one build per candidate.
+//
+// The control run already established what matters most: with the override
+// DISABLED the character is visible, and at 1024x768 -- a 4:3 mode -- it is
+// missing exactly as at 2560x1080.  So it is not the aspect, and it is one of
+// the patches below rather than anything about widescreen as such.
+//
+// This goes once the answer is known.  It is a diagnostic, not a preference.
+//
+#define MDK_P_WINDOW  0x01u
+#define MDK_P_PROJ    0x02u
+#define MDK_P_ASPECT  0x04u
+#define MDK_P_SHAKE   0x08u
+#define MDK_P_CAMERA  0x10u
+#define MDK_P_SPRCLIP 0x20u
+#define MDK_P_HUD     0x40u
+#define MDK_P_CLEAR   0x80u
+#define MDK_P_PLAYER  0x100u
+#define MDK_P_ENTITY  0x200u
+#define MDK_P_ALL     0x3ffu
+
+static void MdkApply(const char *exePath, const char *ini, BOOL haveIni)
+{
+    HMODULE        mod;
+    unsigned char *code = NULL;
+    unsigned int   codeSize = 0;
+    unsigned int   mask = MDK_P_ALL;
+
+    if (!PathEndsWith(exePath, MDK_EXE)) return;
+
+    mod = GetModuleHandleA(NULL);
+    if (!mod) return;
+    if ((unsigned int)mod != MDK_IMAGE_BASE) return;
+    if (!GetCodeRange(mod, &code, &codeSize)) return;
+
+    if (haveIni)
+        mask = (unsigned int)GetPrivateProfileIntA("MDK", "patches",
+                                                   (int)MDK_P_ALL, ini);
+
+    /* TEMPORARY diagnostic -- armed before anything is patched. */
+    g_diagArmed = TRUE;
+    MdkDiag("mdk exe=%s res=%lu %lux%lu code=%08lx+%08lx patches=%lu", exePath,
+            (unsigned long)g_targetRes, (unsigned long)g_targetW,
+            (unsigned long)g_targetH, (long)(unsigned int)code,
+            (unsigned long)codeSize, (unsigned long)mask);
+    MdkDiagSigs(code, codeSize);
+
+    if (mask & MDK_P_WINDOW) {
+        if (!InstallMdkWindow(code, codeSize)) return;
+    }
+    if (!(mask & MDK_P_CLEAR)) g_mdkClear = NULL;
+
+    if (mask & MDK_P_PROJ)    InstallMdkProjection(code, codeSize);
+    if (mask & MDK_P_ASPECT)  InstallMdkAspect(code, codeSize);
+    if (mask & MDK_P_SHAKE)   InstallMdkShake(code, codeSize);
+    if (mask & MDK_P_CAMERA)  InstallMdkCamera(code, codeSize);
+    if (mask & MDK_P_SPRCLIP) InstallMdkSpriteClip(code, codeSize);
+    if (mask & MDK_P_HUD)     InstallMdkHud(code, codeSize);
+    if (mask & MDK_P_PLAYER)  InstallMdkPlayer(code, codeSize);
+    if (mask & MDK_P_ENTITY)  InstallMdkEntity(code, codeSize);
+
+    MdkDiag("entity spriteRet=%08lx entityRet=%08lx",
+            (long)g_mdkSpriteRet, (long)g_mdkEntityRet);
+
+    MdkDiag("hud cx=%ld cy=%ld spriteRet=%08lx",
+            (long)g_mdkHudCx, (long)g_mdkHudCy, (long)g_mdkSpriteRet);
+    InstallMdkDiag(code, codeSize);
+
+    /* Everything above survives every epoch reset. */
+    g_diagHdr = g_diagLen;
 }
 
 
@@ -2580,4 +4774,5 @@ void GameFix_Apply(void)
     Gta2Apply(exePath, ini, haveIni);
     IgnitionApply(exePath);
     TurokApply(exePath, ini, haveIni);
+    MdkApply(exePath, ini, haveIni);
 }
