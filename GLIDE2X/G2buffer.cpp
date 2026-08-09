@@ -10,6 +10,7 @@
 //
 
 #include "g2pch.h"
+#include "gamefix.h"        /* TEMPORARY: GameFix_Tick, for the MDK diagnostic */
 
 // The values for the extemes on the depth buffer
 static FxU32 zMinMax[2];
@@ -110,6 +111,10 @@ NAKED_CALL void FX_CALL grBufferSwap( int swap_interval )
 
 	using Glide3::grBufferSwap;
 	VOID_ASM_JMP(grBufferSwap, (swap_interval));
+
+	/* One frame boundary has passed.  Must be AFTER the swap: gamefix uses
+	   this to clear the buffer the game is about to draw into. */
+	GameFix_Tick();
 
 #undef FN_NAME
 }

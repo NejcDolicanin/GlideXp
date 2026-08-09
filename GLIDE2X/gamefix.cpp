@@ -2009,7 +2009,6 @@ static void TurokApply(const char *exePath, const char *ini, BOOL haveIni)
 // game runs unpatched.
 //
 static unsigned char *g_ignFrameBuffer = NULL;
-static unsigned int   g_ignFrameBytes  = 0;     /* TEMPORARY: for the diagnostic */
 
 static BOOL InstallIgnFrameBuffer(unsigned char *code, unsigned int codeSize)
 {
@@ -2040,7 +2039,6 @@ static BOOL InstallIgnFrameBuffer(unsigned char *code, unsigned int codeSize)
     if (!g_ignFrameBuffer) return FALSE;
 
     memset(g_ignFrameBuffer, 0, need);
-    g_ignFrameBytes = need;
     PutU32(repl, (unsigned int)g_ignFrameBuffer);
 
     for (i = 0; i + 4 <= codeSize; ) {
@@ -2327,8 +2325,6 @@ static void InstallIgnWipe(unsigned char *code, unsigned int codeSize)
 #define IGN_RVA_SCREEN_A    0x0F2F40u   /* the two screen surfaces       */
 #define IGN_RVA_SCREEN_B    0x0F2E50u
 #define IGN_RVA_PALETTE     0x21E520u   /* 256 x u16, index -> 16bpp     */
-#define IGN_RVA_CLIP_W      0x08EB38u   /* Glide clip window, 0x48EB38   */
-#define IGN_RVA_CLIP_H      0x08EB3Cu
 #define IGN_RVA_SCREEN_W    0x136EECu   /* screen globals, 0x536EEC      */
 #define IGN_RVA_SCREEN_H    0x147B18u
 
@@ -2350,6 +2346,7 @@ static unsigned int IgnField(void *surf, unsigned int off)
 {
     return ReadU32((const unsigned char *)surf + off);
 }
+
 
 //
 // Not static, and marked used/noinline, for the same reason as TurokFixRect2D:
@@ -2666,117 +2663,6 @@ static void InstallIgnLoadState(unsigned char *code, unsigned int codeSize,
     WriteCode(at, repl, sizeof(ign_load_call) - 1);
 }
 
-// ==========================================================================
-// TEMPORARY DIAGNOSTIC -- remove once the second-race crash is understood.
-// ==========================================================================
-//
-// Symptom: the first race is fine; loading a SECOND one crashes to desktop.
-// Through the menu or straight on in championship mode, same result -- so it
-// is the second execution of the load path, not anything about the menu.  Only
-// with the resolution override active, but that only says "one of F1-F6",
-// since nothing is patched at all without a target resolution.
-//
-// The reason this is a filter rather than a guess: the standing model of the
-// load path says the 640x400 transient is "confined to start-up", and the
-// repro proves that wrong -- the loader runs for every race, and on the second
-// one it is entered with the screen globals already at W x H rather than
-// 640x400.  That makes a whole class of routines suspect and names none of
-// them.  One faulting address ends the argument.
-//
-// Reported three ways, because each names a different cause:
-//   * as an RVA into Ign_3dfx.exe          -- which routine died
-//   * as an offset into our relocated overlay buffer, with its size beside it
-//     -- a small positive value means an F1 overrun, anything else means F1 is
-//     not involved
-//   * the register set, for an obviously wrong index
-//
-// Plus the live screen globals, which say whether the loader had already reset
-// them to 640x400 when it died.
-//
-static char  g_ignLog[4096];
-static int   g_ignLogLen = 0;
-static LPTOP_LEVEL_EXCEPTION_FILTER g_ignPrevFilter = NULL;
-
-static void IgnDiag(const char *fmt, ...)
-{
-    char    line[256];
-    int     n;
-    va_list ap;
-
-    va_start(ap, fmt);
-    n = wvsprintfA(line, fmt, ap);
-    va_end(ap);
-
-    if (n < 0 || g_ignLogLen + n + 2 >= (int)sizeof(g_ignLog)) return;
-
-    memcpy(g_ignLog + g_ignLogLen, line, n);
-    g_ignLogLen += n;
-    g_ignLog[g_ignLogLen++] = '\r';
-    g_ignLog[g_ignLogLen++] = '\n';
-}
-
-static void IgnDiagFlush(void)
-{
-    char   path[MAX_PATH];
-    HANDLE h;
-    DWORD  wrote = 0;
-
-    if (!g_ignLogLen) return;
-    if (!PathBesideExe("gxp_ign.txt", path)) return;
-
-    h = CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
-                    FILE_ATTRIBUTE_NORMAL, NULL);
-    if (h == INVALID_HANDLE_VALUE) return;
-
-    WriteFile(h, g_ignLog, (DWORD)g_ignLogLen, &wrote, NULL);
-    CloseHandle(h);
-}
-
-static LONG WINAPI IgnCrashFilter(EXCEPTION_POINTERS *ep)
-{
-    unsigned int pc, addr;
-
-    if (ep && ep->ExceptionRecord && ep->ContextRecord) {
-        pc = (unsigned int)ep->ExceptionRecord->ExceptionAddress;
-
-        IgnDiag("CRASH code=%08lx at=%08lx  exe+%08lx",
-                (long)ep->ExceptionRecord->ExceptionCode, (long)pc,
-                (long)(pc - g_ignImage));
-
-        if (ep->ExceptionRecord->NumberParameters >= 2) {
-            addr = (unsigned int)ep->ExceptionRecord->ExceptionInformation[1];
-            IgnDiag("  %s at %08lx",
-                    ep->ExceptionRecord->ExceptionInformation[0] ? "wrote"
-                                                                 : "read",
-                    (long)addr);
-            if (g_ignFrameBuffer)
-                IgnDiag("  fb+%08lx  (fb=%08lx size=%08lx)",
-                        (long)(addr - (unsigned int)g_ignFrameBuffer),
-                        (long)(unsigned int)g_ignFrameBuffer,
-                        (long)g_ignFrameBytes);
-        }
-
-        IgnDiag("  eax=%08lx ebx=%08lx ecx=%08lx edx=%08lx",
-                (long)ep->ContextRecord->Eax, (long)ep->ContextRecord->Ebx,
-                (long)ep->ContextRecord->Ecx, (long)ep->ContextRecord->Edx);
-        IgnDiag("  esi=%08lx edi=%08lx ebp=%08lx esp=%08lx",
-                (long)ep->ContextRecord->Esi, (long)ep->ContextRecord->Edi,
-                (long)ep->ContextRecord->Ebp, (long)ep->ContextRecord->Esp);
-
-        if (g_ignImage) {
-            IgnDiag("  live W=%ld H=%ld  clip=%ldx%ld",
-                    (long)*(int *)(g_ignImage + IGN_RVA_SCREEN_W),
-                    (long)*(int *)(g_ignImage + IGN_RVA_SCREEN_H),
-                    (long)*(int *)(g_ignImage + IGN_RVA_CLIP_W),
-                    (long)*(int *)(g_ignImage + IGN_RVA_CLIP_H));
-        }
-    }
-
-    IgnDiagFlush();
-    if (g_ignPrevFilter) return g_ignPrevFilter(ep);
-    return EXCEPTION_CONTINUE_SEARCH;
-}
-
 //
 // Everything Ignition needs.
 //
@@ -2802,13 +2688,7 @@ static void IgnitionApply(const char *exePath)
     if (!mod) return;
     if (!GetCodeRange(mod, &code, &codeSize)) return;
 
-    g_ignImage = (unsigned int)mod;             /* TEMPORARY: for the filter */
-
-    if (!InstallIgnFrameBuffer(code, codeSize)) {
-        IgnDiag("ign F1 FAILED -- nothing else applied");
-        IgnDiagFlush();
-        return;
-    }
+    if (!InstallIgnFrameBuffer(code, codeSize)) return;
 
     InstallIgnLoadLoops(code, codeSize);
     InstallIgnScreenSize(code, codeSize);
@@ -2817,16 +2697,6 @@ static void IgnitionApply(const char *exePath)
     InstallIgnWipe(code, codeSize);
     InstallIgnLoadState(code, codeSize, (unsigned int)mod);
     InstallIgnPresent(code, codeSize, (unsigned int)mod);
-
-    /* TEMPORARY diagnostic -- goes with the block above it. */
-    IgnDiag("ign mod=%08lx res=%ld %ldx%ld",
-            (long)(unsigned int)mod, (long)g_targetRes,
-            (long)g_targetW, (long)g_targetH);
-    IgnDiag("ign fb=%08lx size=%08lx",
-            (long)(unsigned int)g_ignFrameBuffer, (long)g_ignFrameBytes);
-    IgnDiagFlush();
-
-    g_ignPrevFilter = SetUnhandledExceptionFilter(IgnCrashFilter);
 }
 
 
@@ -4775,4 +4645,4 @@ void GameFix_Apply(void)
     IgnitionApply(exePath);
     TurokApply(exePath, ini, haveIni);
     MdkApply(exePath, ini, haveIni);
-}
+}
