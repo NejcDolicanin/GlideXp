@@ -2365,6 +2365,7 @@ IgnPresentScaled(const unsigned char *src, int pitch, int sx, int sy,
     unsigned char        *base;
     unsigned int          stride, prevLock;
     int                   scale, outW, outH, ox, oy, stepX, stepY, x, y;
+    int                   composite;
     int                   screenW = (int)g_targetW;
     int                   screenH = (int)g_targetH;
 
@@ -2384,10 +2385,40 @@ IgnPresentScaled(const unsigned char *src, int pitch, int sx, int sy,
     // the vtable is not populated yet, since `orig` is then NULL and the game
     // would have crashed on the original instruction too.
     //
+    //
+    // F10.  Widths that are not a multiple of 160.
+    //
+    // The game's own blit has two paths.  The good one converts 8bpp indices
+    // through the palette and skips index 0, so the overlay composites over
+    // the 3D; it is chosen only when the width divides by 160 AND the pointers
+    // are 4-aligned.  Otherwise it falls through to a plain rep movsb/movsd
+    // memory copy -- no palette, no colour key, no 8-to-16bpp conversion.
+    //
+    // That raw path copies `width` BYTES into a row that is `2*width` bytes
+    // wide, and advances the destination by twice the stride per row, so it
+    // covers the left half of every other line; and since the overlay is
+    // mostly index 0, what lands there is zeros.  Measured on a 2096x900
+    // screenshot: left of x=1048 the even rows are pure black (mean 0) and the
+    // odd rows normal, with the HUD sitting on top undamaged.
+    //
+    // It is a latent bug in the game, not a regression: 640 and 800 are both
+    // multiples of 160, so the raw path could never run for a screen blit at
+    // any resolution Ignition shipped with.  Only an override picks a width
+    // that is not -- 1920 and 2560 divide by 160 and are fine, 2096 and 2304
+    // do not and are broken.
+    //
+    // So when the game would take the raw path, do the blit here instead: the
+    // scaler below degenerates to 1:1 when the source already fills the
+    // screen, and `composite` makes it skip transparent pixels rather than
+    // writing black, which is what the overlay needs over live 3D.  At widths
+    // the game handles correctly it still runs its own hand-tuned loop.
+    //
+    composite = (w >= screenW && h >= screenH);
+
     if (!dst || !orig || w <= 0 || h <= 0 ||
         ((unsigned int)dst != g_ignImage + IGN_RVA_SCREEN_A &&
          (unsigned int)dst != g_ignImage + IGN_RVA_SCREEN_B) ||
-        (w >= screenW && h >= screenH))
+        (composite && (w % 160) == 0))
         return orig ? orig(src, pitch, sx, sy, w, h, dst, dx, dy) : 0;
 
     /* Largest scale that fits, 16.16. */
@@ -2430,23 +2461,50 @@ IgnPresentScaled(const unsigned char *src, int pitch, int sx, int sy,
             int                  acc;
 
             if (y < oy || y >= oy + outH) {          /* top / bottom bar */
-                for (x = 0; x < screenW; x++) row[x] = 0;
+                if (!composite)
+                    for (x = 0; x < screenW; x++) row[x] = 0;
                 continue;
             }
 
             srow = srcTop + (unsigned int)pitch
                           * (unsigned int)((((y - oy) * stepY) >> 16));
 
-            for (x = 0; x < ox; x++) row[x] = 0;     /* left bar */
+            if (!composite)
+                for (x = 0; x < ox; x++) row[x] = 0;            /* left bar */
 
             acc = 0;
-            for (x = 0; x < outW; x++) {
-                unsigned char b = srow[acc >> 16];
-                row[ox + x] = b ? pal[b] : 0;
-                acc += stepX;
+            if (composite) {
+                //
+                // Over live 3D: transparent means leave the pixel alone.  This
+                // is the game's own rule -- its good path is `or al,al ; je` --
+                // and writing 0 here instead would black out the world.
+                //
+                // This one runs every frame of a race, so the 1:1 case (which
+                // is every case here, the source already filling the screen)
+                // drops the 16.16 stepping and indexes directly.
+                //
+                if (stepX == 0x10000) {
+                    for (x = 0; x < outW; x++) {
+                        unsigned char b = srow[x];
+                        if (b) row[ox + x] = pal[b];
+                    }
+                } else {
+                    for (x = 0; x < outW; x++) {
+                        unsigned char b = srow[acc >> 16];
+                        if (b) row[ox + x] = pal[b];
+                        acc += stepX;
+                    }
+                }
+            } else {
+                for (x = 0; x < outW; x++) {
+                    unsigned char b = srow[acc >> 16];
+                    row[ox + x] = b ? pal[b] : 0;
+                    acc += stepX;
+                }
             }
 
-            for (x = ox + outW; x < screenW; x++) row[x] = 0;   /* right bar */
+            if (!composite)
+                for (x = ox + outW; x < screenW; x++) row[x] = 0;  /* right bar */
         }
     }
 
