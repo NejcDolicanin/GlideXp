@@ -446,8 +446,12 @@ void FX_CALL grTexDownloadTablePartial( GrChipID_t tmu, GrTexTable_t type,
 		// Otherwise do all the hacky stuff
 
 		// Just use memcpy. It's replaced by an intrinsic in msvc anyway
-		memcpy (start + theState.tmuTables[tmu].texPalette.data, 
-					start + (FxU32 *) data, (end-start)*sizeof(FxU32));
+		// Nejc: start and end are both INCLUSIVE, so the run is end-start+1
+		// entries.  Copying end-start dropped the last entry of every range,
+		// which then stayed at whatever the shadow was initialised to (zero,
+		// i.e. black) and got pushed to the hardware by the upload below.
+		memcpy (start + theState.tmuTables[tmu].texPalette.data,
+					start + (FxU32 *) data, (end-start+1)*sizeof(FxU32));
 
 		// If we aren't the active palette, we will need to upload the entire thing
 		if (theState.texPaletteActive != tmu) {
@@ -653,7 +657,12 @@ void FX_CALL grTexSource( GrChipID_t tmu,
 		if (info->format == GR_TEXFMT_P_8 || info->format == GR_TEXFMT_AP_88) {
 
 			// It's not the active palette, so download it.
-			if (!theState.texPaletteActive != tmu) {
+			// Nejc: the test is on texPaletteActive itself.  A stray ! made this
+			// (texPaletteActive == 0) != tmu, which is true for every TMU0
+			// bind once texPaletteActive has settled at 0 -- so the shadow
+			// palette was re-uploaded over the real one on every single
+			// palettised grTexSource, undoing the game's partial downloads.
+			if (theState.texPaletteActive != tmu) {
 				Glide3::grTexDownloadTable(GR_TEXTABLE_PALETTE, &theState.tmuTables[tmu].texPalette);
 				theState.texPaletteActive = tmu;
 			}
