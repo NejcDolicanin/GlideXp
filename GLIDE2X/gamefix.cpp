@@ -1959,10 +1959,6 @@ static void TurokApply(const char *exePath, const char *ini, BOOL haveIni)
 
 #define IGN_EXE          "ign_3dfx.exe"
 
-/* The static 8bpp overlay buffer, and how many times .text names it. */
-#define IGN_FB_ADDR      0x547CA0u
-#define IGN_FB_SITES     64
-
 /* The mode the engine was written for, and the display it assumed. */
 #define IGN_NATIVE_W     640.0
 #define IGN_NATIVE_H     400.0
@@ -1975,12 +1971,90 @@ static void TurokApply(const char *exePath, const char *ini, BOOL haveIni)
  */
 #define IGN_PAR          (IGN_NATIVE_ASPECT / (IGN_NATIVE_W / IGN_NATIVE_H))
 
-/* The per-view focal lengths 0x43C8A0 hardcodes, in 640x400 pixels. */
+/* The per-view focal lengths the screen init hardcodes, in 640x400 pixels. */
 #define IGN_FOCAL_X      425.0
 #define IGN_FOCAL_Y      348.0
 
-/* The double 240.0 already sitting in .rdata -- 320.0 * IGN_PAR. */
-#define IGN_K240         0x46A568u
+//
+// ==========================================================================
+// TWO BUILDS
+// ==========================================================================
+//
+// Both the "3dfx patch ver3" and "ver2" executables are supported.  They are
+// the same program a year apart -- every routine below was located in ver2
+// structurally, never by searching for ver3's bytes, because the compiler
+// scheduled them differently and almost nothing matches literally.
+//
+//   ver3   626,688 bytes  1998-12-29  .text 0x68EEC   "Ignition version 6.53"
+//   ver2   643,072 bytes  1997-11-25  .text 0x6BB7C
+//
+// The build is identified by asking the image itself: each build's signatures
+// occur exactly once in its own .text and NOT AT ALL in the other's, verified
+// for all 21 of them, so finding one names the build outright.
+//
+// It was originally selected on the code size instead, and that was a mistake
+// worth recording: GetCodeRange returns OptionalHeader.SizeOfCode, which is the
+// alignment-rounded RAW size (0x69000 / 0x6BC00), not the section's virtual
+// size (0x68EEC / 0x6BB7C) that a disassembler prints.  The table held the
+// latter, nothing matched, and the game ran completely unpatched.  A byte
+// pattern cannot be the wrong quantity in the way a header field can.
+//
+// Two differences worth knowing, because they are not cosmetic:
+//
+//  * ver2 needs one fewer screen-size site.  Where ver3 stores 400 as an
+//    immediate in two separate instructions, ver2 holds 640 and 400 in edi and
+//    esi across the whole routine and stores from the registers -- to the clip
+//    window first, then to the screen globals after the set-mode call.  Both
+//    registers are callee-saved and nothing between touches them, so two
+//    immediates cover all four stores and `sizeGlobal` is NULL for ver2.
+//
+//  * ver2's first loading-screen loop counts in ecx where ver3 counts in eax,
+//    so the replacement `mov` opcode differs per build, and `imul ecx` is
+//    common enough that ver2's signature needs one extra byte to be unique.
+//
+typedef struct {
+    const char   *name;
+
+    unsigned int  fbAddr;           /* the static 8bpp overlay buffer   */
+    unsigned int  fbSites;          /* how many times .text names it    */
+    unsigned int  k240;             /* the double 240.0 in .rdata       */
+
+    /* Read at runtime by the present hook. */
+    unsigned int  rvaVtBlit, rvaVtLock, rvaVtUnlock;
+    unsigned int  rvaScreenA, rvaScreenB, rvaPalette;
+    unsigned int  rvaScreenW, rvaScreenH;
+
+    const unsigned char *sizeMain;    unsigned int sizeMainLen;
+    int           sizeMainW,  sizeMainH;
+    const unsigned char *sizeGlobal;  unsigned int sizeGlobalLen;   /* may be NULL */
+    int           sizeGlobalH;
+    const unsigned char *sizeClip;    unsigned int sizeClipLen;
+    int           sizeClipW,  sizeClipH;
+
+    const unsigned char *focal;       unsigned int focalLen;
+    int           focalX,     focalY;
+
+    const unsigned char *sprite;      unsigned int spriteLen;
+    int           spriteDisp, spriteDiv;
+    const unsigned char *menu;        unsigned int menuLen;
+    int           menuDisp,   menuDiv;
+
+    const unsigned char *wipe;        unsigned int wipeLen;
+
+    const unsigned char *present;     unsigned int presentLen;
+    int           presentCallAt;
+
+    const unsigned char *loopRead;    unsigned int loopReadLen;
+    unsigned char loopReadMov;
+    const unsigned char *loopWrite;   unsigned int loopWriteLen;
+    unsigned char loopWriteMov;
+
+    const unsigned char *loadCall;    unsigned int loadCallLen;
+    int           loadCallAt;
+} IgnBuild;
+
+/* Selected in IgnitionApply, before anything is patched. */
+static const IgnBuild *g_ign = NULL;
 
 //
 // F1.  The 8bpp overlay buffer is a fixed-size static array.
@@ -1990,24 +2064,24 @@ static void TurokApply(const char *exePath, const char *ini, BOOL haveIni)
 // LFB through a 16-bit palette (the blit is at 0x458780; note its
 // `or %al,%al ; je skip`, which is what makes it an overlay rather than a
 // background).  That buffer is not allocated: it is the static array at
-// 0x547CA0, and the engine memsets W*H bytes of it every time the screen size
-// changes.  640x400 is 256,000 bytes; the next referenced global sits at
-// 0x5BEEE0, so there is room for 487,488 and no more.  2560x1080 wants
-// 2,764,800.
+// 0x547CA0 (ver2: 0x54AFE0), and the engine memsets W*H bytes of it every
+// time the screen size changes.  640x400 is 256,000 bytes; the next
+// referenced global leaves room for 487,488 (ver2: 476,192) and no more.
+// 2560x1080 wants 2,764,800.
 //
 // So the buffer has to move before the screen size may be raised, and if it
 // cannot move then nothing else may be applied either -- a larger W*H over the
 // old array would memset straight through the rest of .data.
 //
 // Moving it is mechanical and, unusually for this kind of edit, provably safe.
-// The four bytes A0 7C 54 00 occur exactly 64 times in .text, and
-// disassembling the whole section shows all 64 are genuine instruction
-// operands: immediates of push/mov/add/sub, and disp32s of forms like
-// `mov 0x547ca0(%esi,%ecx,1),%dl`.  Not one is a mid-instruction coincidence,
-// and the value appears in no other section.  A flat scan-and-replace is
-// therefore exactly equivalent to rewriting the 64 operands one at a time, and
-// the count doubles as the build check -- any other build fails it and the
-// game runs unpatched.
+// The address occurs exactly 64 times in ver3's .text and 63 times in ver2's,
+// and disassembling the whole section shows every one is a genuine
+// instruction operand: immediates of push/mov/add/sub, and disp32s of forms
+// like `mov 0x547ca0(%esi,%ecx,1),%dl`.  Not one is a mid-instruction
+// coincidence, and the value appears in no other section.  A flat
+// scan-and-replace is therefore exactly equivalent to rewriting the operands
+// one at a time, and the count doubles as a second build check on top of the
+// .text size.
 //
 static unsigned char *g_ignFrameBuffer = NULL;
 
@@ -2018,14 +2092,14 @@ static BOOL InstallIgnFrameBuffer(unsigned char *code, unsigned int codeSize)
 
     if (g_ignFrameBuffer) return TRUE;          // already relocated
 
-    PutU32(find, IGN_FB_ADDR);
+    PutU32(find, g_ign->fbAddr);
 
     count = 0;
     for (i = 0; i + 4 <= codeSize; ) {
         if (memcmp(code + i, find, 4) == 0) { count++; i += 4; }
         else                                          i += 1;
     }
-    if (count != IGN_FB_SITES) return FALSE;    // not the build this describes
+    if (count != g_ign->fbSites) return FALSE;  // not the build we think
 
     //
     // One spare page.  The engine's clears round W*H up to a multiple of four
@@ -2071,26 +2145,34 @@ static BOOL InstallIgnFrameBuffer(unsigned char *code, unsigned int codeSize)
 // 0x412510 is patched even so.  All it does is set the clip window and clear,
 // and the full screen is never a worse answer than the top-left 640x400 of it.
 //
-static const unsigned char ign_size_main[] =        /* 0x43C8AB */
+static const unsigned char ign_v3_size_main[] =           /* 0x43C8AB */
     "\xbf\x80\x02\x00\x00\xbd\x01\x00\x00\x00"
     "\x89\x3d\x38\xeb\x48\x00\xc7\x05\x3c\xeb"
     "\x48\x00\x90\x01\x00\x00";
-#define IGN_SIZE_MAIN_W_AT   1
-#define IGN_SIZE_MAIN_H_AT  22
 
-static const unsigned char ign_size_global[] =      /* 0x43C907 */
+static const unsigned char ign_v2_size_main[] =           /* 0x43D356 */
+    "\xbf\x80\x02\x00\x00\xbe\x90\x01\x00\x00"
+    "\xbb\x01\x00\x00\x00\x89\x3d\xc8\xfb\x48"
+    "\x00\x89\x35\xcc\xfb\x48\x00\x89\x1d\xd4"
+    "\xfb\x48\x00";
+
+static const unsigned char ign_v3_size_global[] =         /* 0x43C907 */
     "\x89\x3d\xec\x6e\x53\x00\xc7\x05\x18\x7b"
     "\x54\x00\x90\x01\x00\x00";
-#define IGN_SIZE_GLOBAL_H_AT 12
 
-static const unsigned char ign_size_clip[] =        /* 0x412510 */
+static const unsigned char ign_v3_size_clip[] =           /* 0x412510 */
     "\xc7\x05\x38\xeb\x48\x00\x80\x02\x00\x00"
     "\xc7\x05\x3c\xeb\x48\x00\x90\x01\x00\x00"
     "\xc7\x05\x40\xeb\x48\x00\x08\x00\x00\x00"
     "\xc7\x05\x44\xeb\x48\x00\x01\x00\x00\x00"
     "\xe8\x43\x1e\x04\x00";
-#define IGN_SIZE_CLIP_W_AT   6
-#define IGN_SIZE_CLIP_H_AT  16
+
+static const unsigned char ign_v2_size_clip[] =           /* 0x4128A0 */
+    "\xc7\x05\xc8\xfb\x48\x00\x80\x02\x00\x00"
+    "\xc7\x05\xcc\xfb\x48\x00\x90\x01\x00\x00"
+    "\xc7\x05\xd0\xfb\x48\x00\x08\x00\x00\x00"
+    "\xc7\x05\xd4\xfb\x48\x00\x01\x00\x00\x00"
+    "\xe8\x03\x2c\x04\x00";
 
 static void IgnPatchSize(unsigned char *code, unsigned int codeSize,
                          const unsigned char *sig, unsigned int len,
@@ -2112,12 +2194,16 @@ static void IgnPatchSize(unsigned char *code, unsigned int codeSize,
 static void InstallIgnScreenSize(unsigned char *code, unsigned int codeSize)
 {
     /* sizeof-1 throughout: these are string literals, so drop the NUL. */
-    IgnPatchSize(code, codeSize, ign_size_main,   sizeof(ign_size_main)   - 1,
-                 IGN_SIZE_MAIN_W_AT,   IGN_SIZE_MAIN_H_AT);
-    IgnPatchSize(code, codeSize, ign_size_global, sizeof(ign_size_global) - 1,
-                 -1,                   IGN_SIZE_GLOBAL_H_AT);
-    IgnPatchSize(code, codeSize, ign_size_clip,   sizeof(ign_size_clip)   - 1,
-                 IGN_SIZE_CLIP_W_AT,   IGN_SIZE_CLIP_H_AT);
+    IgnPatchSize(code, codeSize, g_ign->sizeMain, g_ign->sizeMainLen,
+                 g_ign->sizeMainW, g_ign->sizeMainH);
+
+    /* ver2 has no second site: it stores both globals from esi/edi. */
+    if (g_ign->sizeGlobal)
+        IgnPatchSize(code, codeSize, g_ign->sizeGlobal, g_ign->sizeGlobalLen,
+                     -1, g_ign->sizeGlobalH);
+
+    IgnPatchSize(code, codeSize, g_ign->sizeClip, g_ign->sizeClipLen,
+                 g_ign->sizeClipW, g_ign->sizeClipH);
 }
 
 //
@@ -2144,33 +2230,36 @@ static void InstallIgnScreenSize(unsigned char *code, unsigned int codeSize)
 // above fy, which is the engine's own small deviation from a true 1.2 and is
 // preserved rather than rounded away.
 //
-static const unsigned char ign_focal[] =            /* 0x43C91B */
+static const unsigned char ign_v3_focal[] =               /* 0x43C91B */
     "\xbf\xa9\x01\x00\x00\xba\x00\x00\x24\x40"
     "\x8b\x2d\xe4\xee\x5b\x00\x41\x89\x7c\x28"
     "\x58\x8b\x2d\xe4\xee\x5b\x00\xc7\x44\x28"
     "\x5c\x5c\x01\x00\x00";
-#define IGN_FOCAL_X_AT    1
-#define IGN_FOCAL_Y_AT   31
+
+static const unsigned char ign_v2_focal[] =               /* 0x43D3BA */
+    "\xbf\xa9\x01\x00\x00\xbe\x5c\x01\x00\x00"
+    "\xba\x00\x00\x24\x40\x8b\x1d\x24\x22\x5c"
+    "\x00\x41\x89\x7c\x03\x58";
 
 static void InstallIgnFocal(unsigned char *code, unsigned int codeSize)
 {
-    unsigned char  repl[sizeof(ign_focal)];
+    unsigned char  repl[64];
     unsigned char *at;
     double         scale;
     unsigned int   fx, fy;
 
-    at = FindUnique(code, codeSize, ign_focal, sizeof(ign_focal) - 1);
+    at = FindUnique(code, codeSize, g_ign->focal, g_ign->focalLen);
     if (!at) return;
 
     scale = (double)g_targetH / IGN_NATIVE_H;
     fy    = (unsigned int)(IGN_FOCAL_Y * scale + 0.5);
     fx    = (unsigned int)(IGN_FOCAL_X * scale * IGN_PAR + 0.5);
 
-    memcpy(repl, ign_focal, sizeof(ign_focal) - 1);
-    PutU32(repl + IGN_FOCAL_X_AT, fx);
-    PutU32(repl + IGN_FOCAL_Y_AT, fy);
+    memcpy(repl, g_ign->focal, g_ign->focalLen);
+    PutU32(repl + g_ign->focalX, fx);
+    PutU32(repl + g_ign->focalY, fy);
 
-    WriteCode(at, repl, sizeof(ign_focal) - 1);
+    WriteCode(at, repl, g_ign->focalLen);
 }
 
 //
@@ -2195,41 +2284,45 @@ static void InstallIgnFocal(unsigned char *code, unsigned int codeSize)
 // and nothing else.  320.0 at 0x46A850 has exactly two references image-wide
 // and these are both of them, so afterwards it is unreferenced.
 //
-static const unsigned char ign_sprite_scale[] =     /* 0x43CAC3 */
+static const unsigned char ign_v3_sprite[] =              /* 0x43CAC3 */
     "\xdd\x44\x24\x10\xdc\x0d\x58\xa8\x46\x00"
     "\xa3\x30\x6e\x53\x00\xdc\x35\x50\xa8\x46"
     "\x00\xe8\xb7\x1a\x02\x00";
-#define IGN_SPRITE_DISP_AT    3     /* fldl 0x10(%esp) -> 0x18(%esp) */
-#define IGN_SPRITE_DIV_AT    17     /* fdivl 320.0     -> 240.0      */
 
-static const unsigned char ign_menu_focal[] =       /* 0x44AB43 */
+static const unsigned char ign_v2_sprite[] =              /* 0x43D563 */
+    "\xdd\x44\x24\x10\xdc\x0d\x20\xd9\x46\x00"
+    "\xa3\x70\xa1\x53\x00\xdc\x35\x28\xd9\x46"
+    "\x00\xe8\x83\x23\x02\x00";
+
+static const unsigned char ign_v3_menu[] =                /* 0x44AB43 */
     "\xd9\x44\x24\x00\xdc\x35\x50\xa8\x46\x00"
     "\xdd\x5c\x24\x04\xdd\x44\x24\x04\xdc\x0d"
     "\xf8\xa8\x46\x00";
-#define IGN_MENU_DISP_AT      3     /* flds 0x0(%esp)  -> 0x10(%esp) */
-#define IGN_MENU_DIV_AT       6     /* fdivl 320.0     -> 240.0      */
+
+static const unsigned char ign_v2_menu[] =                /* 0x44B610 */
+    "\x83\xec\x08\xdb\x44\x24\x10\xdb\x44\x24"
+    "\x0c\xd9\x5c\x24\x10\xd9\x44\x24\x10\xdc"
+    "\x35\xc0\xdb\x46\x00";
 
 static void InstallIgnAspect(unsigned char *code, unsigned int codeSize)
 {
-    unsigned char  repl[sizeof(ign_sprite_scale)];
+    unsigned char  repl[64];
     unsigned char *at;
 
-    at = FindUnique(code, codeSize, ign_sprite_scale,
-                    sizeof(ign_sprite_scale) - 1);
+    at = FindUnique(code, codeSize, g_ign->sprite, g_ign->spriteLen);
     if (at) {
-        memcpy(repl, ign_sprite_scale, sizeof(ign_sprite_scale) - 1);
-        repl[IGN_SPRITE_DISP_AT] = 0x18;            /* the height slot */
-        PutU32(repl + IGN_SPRITE_DIV_AT, IGN_K240);
-        WriteCode(at, repl, sizeof(ign_sprite_scale) - 1);
+        memcpy(repl, g_ign->sprite, g_ign->spriteLen);
+        repl[g_ign->spriteDisp] = 0x18;             /* the height slot */
+        PutU32(repl + g_ign->spriteDiv, g_ign->k240);
+        WriteCode(at, repl, g_ign->spriteLen);
     }
 
-    at = FindUnique(code, codeSize, ign_menu_focal,
-                    sizeof(ign_menu_focal) - 1);
+    at = FindUnique(code, codeSize, g_ign->menu, g_ign->menuLen);
     if (at) {
-        memcpy(repl, ign_menu_focal, sizeof(ign_menu_focal) - 1);
-        repl[IGN_MENU_DISP_AT] = 0x10;              /* the height slot */
-        PutU32(repl + IGN_MENU_DIV_AT, IGN_K240);
-        WriteCode(at, repl, sizeof(ign_menu_focal) - 1);
+        memcpy(repl, g_ign->menu, g_ign->menuLen);
+        repl[g_ign->menuDisp] = 0x10;               /* the height slot */
+        PutU32(repl + g_ign->menuDiv, g_ign->k240);
+        WriteCode(at, repl, g_ign->menuLen);
     }
 }
 
@@ -2271,22 +2364,26 @@ static void InstallIgnAspect(unsigned char *code, unsigned int codeSize)
 // and neither looks at the return value, and the grLfbLock/grLfbUnlock pair
 // this function owns is skipped as a pair.
 //
-static const unsigned char ign_wipe[] =             /* 0x436C10 */
+static const unsigned char ign_v3_wipe[] =                /* 0x436C10 */
     "\x55\x8b\xec\x83\xe4\xf8\x83\xec\x24\x8b"
     "\x0d\xec\x6e\x53\x00\xb8";
 
+static const unsigned char ign_v2_wipe[] =                /* 0x437600 */
+    "\x55\x8b\xec\x83\xe4\xf8\x83\xec\x24\x8b"
+    "\x0d\x2c\xa2\x53\x00\xb8";
+
 static void InstallIgnWipe(unsigned char *code, unsigned int codeSize)
 {
-    unsigned char  repl[sizeof(ign_wipe)];
+    unsigned char  repl[64];
     unsigned char *at;
 
-    at = FindUnique(code, codeSize, ign_wipe, sizeof(ign_wipe) - 1);
+    at = FindUnique(code, codeSize, g_ign->wipe, g_ign->wipeLen);
     if (!at) return;                    // already applied, or not this build
 
-    memcpy(repl, ign_wipe, sizeof(ign_wipe) - 1);
+    memcpy(repl, g_ign->wipe, g_ign->wipeLen);
     repl[0] = 0xC3;                     // ret
 
-    WriteCode(at, repl, sizeof(ign_wipe) - 1);
+    WriteCode(at, repl, g_ign->wipeLen);
 }
 
 //
@@ -2320,14 +2417,13 @@ static void InstallIgnWipe(unsigned char *code, unsigned int codeSize)
 // (index 0) are still skipped inside the image, exactly as the game's blit
 // does, so anything drawn underneath still shows through.
 //
-#define IGN_RVA_VT_BLIT     0x0F3348u   /* the device blit vtable slot   */
-#define IGN_RVA_VT_LOCK     0x0F3358u   /* Lock(surface, type)           */
-#define IGN_RVA_VT_UNLOCK   0x0F335Cu   /* Unlock(surface)               */
-#define IGN_RVA_SCREEN_A    0x0F2F40u   /* the two screen surfaces       */
-#define IGN_RVA_SCREEN_B    0x0F2E50u
-#define IGN_RVA_PALETTE     0x21E520u   /* 256 x u16, index -> 16bpp     */
-#define IGN_RVA_SCREEN_W    0x136EECu   /* screen globals, 0x536EEC      */
-#define IGN_RVA_SCREEN_H    0x147B18u
+/*
+ * The vtable slots, the two screen surfaces, the palette and the screen-size
+ * globals all move between builds, so they live in the build table.  ver2's
+ * whole device vtable sits exactly +0x30F8 from ver3's, which is how the
+ * lock/unlock slots were found -- and then confirmed independently, by reading
+ * back what each slot is initialised with.
+ */
 
 /* Fields of the surface descriptor, read off 0x458A60 and 0x458780. */
 #define IGN_SURF_LOCKTYPE   0x0C        /* 0 = none, 1 = read, 3 = write */
@@ -2372,11 +2468,11 @@ IgnPresentScaled(const unsigned char *src, int pitch, int sx, int sy,
 
     // Unreachable -- the hook is written only after g_ignImage is set -- but
     // the alternative to checking is a wild read at 0x000F3348.
-    if (!g_ignImage) return 0;
+    if (!g_ignImage || !g_ign) return 0;
 
-    orig   = *(IgnBlitFn *)  (g_ignImage + IGN_RVA_VT_BLIT);
-    lock   = *(IgnLockFn *)  (g_ignImage + IGN_RVA_VT_LOCK);
-    unlock = *(IgnUnlockFn *)(g_ignImage + IGN_RVA_VT_UNLOCK);
+    orig   = *(IgnBlitFn *)  (g_ignImage + g_ign->rvaVtBlit);
+    lock   = *(IgnLockFn *)  (g_ignImage + g_ign->rvaVtLock);
+    unlock = *(IgnUnlockFn *)(g_ignImage + g_ign->rvaVtUnlock);
 
     // (The loading screen arrives here as a plain 640x400 source, because F8
     // puts the screen globals back to 640x400 for the duration of the load.)
@@ -2417,8 +2513,8 @@ IgnPresentScaled(const unsigned char *src, int pitch, int sx, int sy,
     composite = (w >= screenW && h >= screenH);
 
     if (!dst || !orig || w <= 0 || h <= 0 ||
-        ((unsigned int)dst != g_ignImage + IGN_RVA_SCREEN_A &&
-         (unsigned int)dst != g_ignImage + IGN_RVA_SCREEN_B) ||
+        ((unsigned int)dst != g_ignImage + g_ign->rvaScreenA &&
+         (unsigned int)dst != g_ignImage + g_ign->rvaScreenB) ||
         (composite && (w % 160) == 0))
         return orig ? orig(src, pitch, sx, sy, w, h, dst, dx, dy) : 0;
 
@@ -2453,7 +2549,7 @@ IgnPresentScaled(const unsigned char *src, int pitch, int sx, int sy,
     stride = IgnField(dst, IGN_SURF_STRIDE);
 
     if (base && stride) {
-        pal    = (const unsigned short *)(g_ignImage + IGN_RVA_PALETTE);
+        pal    = (const unsigned short *)(g_ignImage + g_ign->rvaPalette);
         srcTop = src + (unsigned int)pitch * (unsigned int)sy + sx;
 
         for (y = 0; y < screenH; y++) {
@@ -2521,33 +2617,36 @@ IgnPresentScaled(const unsigned char *src, int pitch, int sx, int sy,
 // is replaced in place with one nop of padding -- no code cave, and the
 // caller's `add $0x24,%esp` still balances because our function is cdecl too.
 //
-static const unsigned char ign_present[] =          /* 0x454336 */
+static const unsigned char ign_v3_present[] =             /* 0x454336 */
     "\x8b\x54\x24\x1c\x50\x51\x52\xff\x15\x48"
     "\x33\x4f\x00\x83\xc4\x24\xc3";
-#define IGN_PRESENT_CALL_AT   7     /* offset of the `ff 15` within it */
+
+static const unsigned char ign_v2_present[] =             /* 0x455486 */
+    "\x8b\x54\x24\x1c\x50\x51\x52\xff\x15\x40"
+    "\x64\x4f\x00\x83\xc4\x24\xc3";
 
 static void InstallIgnPresent(unsigned char *code, unsigned int codeSize,
                               unsigned int imageBase)
 {
-    unsigned char  repl[sizeof(ign_present)];
+    unsigned char  repl[64];
     unsigned char *at;
-    int            rel;
+    int            rel, callAt;
 
-    at = FindUnique(code, codeSize, ign_present, sizeof(ign_present) - 1);
+    at = FindUnique(code, codeSize, g_ign->present, g_ign->presentLen);
     if (!at) return;                    // already applied, or not this build
 
     g_ignImage = imageBase;
+    callAt     = g_ign->presentCallAt;
 
-    memcpy(repl, ign_present, sizeof(ign_present) - 1);
+    memcpy(repl, g_ign->present, g_ign->presentLen);
 
-    rel = (int)((unsigned char *)&IgnPresentScaled
-                - (at + IGN_PRESENT_CALL_AT + 5));
+    rel = (int)((unsigned char *)&IgnPresentScaled - (at + callAt + 5));
 
-    repl[IGN_PRESENT_CALL_AT] = 0xE8;
-    PutU32(repl + IGN_PRESENT_CALL_AT + 1, (unsigned int)rel);
-    repl[IGN_PRESENT_CALL_AT + 5] = 0x90;       // pad the sixth byte
+    repl[callAt] = 0xE8;
+    PutU32(repl + callAt + 1, (unsigned int)rel);
+    repl[callAt + 5] = 0x90;            // pad the sixth byte
 
-    WriteCode(at, repl, sizeof(ign_present) - 1);
+    WriteCode(at, repl, g_ign->presentLen);
 }
 
 //
@@ -2606,23 +2705,33 @@ static void InstallIgnPresent(unsigned char *code, unsigned int codeSize,
 // other six that touch a buffer all feed `mov edi,0x547CA0` -- overlay memsets
 // -- and the overlay is W*H+4096 by F1, so they are correct as they stand.
 //
-static const unsigned char ign_loop_read[] =        /* 0x412785 */
+static const unsigned char ign_v3_loop_read[] =           /* 0x412785 */
     "\x0f\xaf\x05\xec\x6e\x53\x00";
-static const unsigned char ign_loop_write[] =       /* 0x4127EC */
+
+static const unsigned char ign_v2_loop_read[] =           /* 0x412B31 */
+    "\x0f\xaf\x0d\x2c\xa2\x53\x00\x33";
+static const unsigned char ign_v3_loop_write[] =          /* 0x4127EC */
     "\x0f\xaf\x15\xec\x6e\x53\x00";
 
-/* imul <reg>,ds:W  ->  mov <reg>,imm32 + 2 nops.  Same 7 bytes. */
-#define IGN_LOOP_MOV_EAX   0xB8
-#define IGN_LOOP_MOV_EDX   0xBA
+static const unsigned char ign_v2_loop_write[] =          /* 0x412B8E */
+    "\x0f\xaf\x15\x2c\xa2\x53\x00";
 
+/* imul <reg>,ds:W  ->  mov <reg>,imm32 + 2 nops.  Same 7 bytes. */
+
+//
+// The signature may be longer than the seven bytes being replaced -- ver2's
+// first loop counts in ecx, and `imul ecx,ds:screenW` occurs nine times in
+// that image, so it needs one trailing byte of context to be unique.  Only the
+// leading seven are ever written.
+//
 static void IgnPinLoop(unsigned char *code, unsigned int codeSize,
-                       const unsigned char *sig, unsigned char movOp,
-                       unsigned int count)
+                       const unsigned char *sig, unsigned int sigLen,
+                       unsigned char movOp, unsigned int count)
 {
     unsigned char  repl[7];
     unsigned char *at;
 
-    at = FindUnique(code, codeSize, sig, 7);
+    at = FindUnique(code, codeSize, sig, sigLen);
     if (!at) return;                    // already applied, or not this build
 
     repl[0] = movOp;
@@ -2640,8 +2749,10 @@ static void InstallIgnLoadLoops(unsigned char *code, unsigned int codeSize)
     /* Cannot exceed the overlay, for a target smaller than the stock mode. */
     if (count > g_targetW * g_targetH) count = g_targetW * g_targetH;
 
-    IgnPinLoop(code, codeSize, ign_loop_read,  IGN_LOOP_MOV_EAX, count);
-    IgnPinLoop(code, codeSize, ign_loop_write, IGN_LOOP_MOV_EDX, count);
+    IgnPinLoop(code, codeSize, g_ign->loopRead,  g_ign->loopReadLen,
+               g_ign->loopReadMov,  count);
+    IgnPinLoop(code, codeSize, g_ign->loopWrite, g_ign->loopWriteLen,
+               g_ign->loopWriteMov, count);
 }
 
 //
@@ -2676,27 +2787,31 @@ static void InstallIgnLoadLoops(unsigned char *code, unsigned int codeSize)
 // register and no flag, and the jump keeps the caller's return address, so
 // nothing else has to be preserved.
 //
-static const unsigned char ign_load_call[] =        /* 0x412EEA */
+static const unsigned char ign_v3_load_call[] =           /* 0x412EEA */
     "\x33\xc0\x5f\x5e\x83\xc4\x70\xc3\xe8\x89"
     "\xf6\xff\xff\x68\x20\x6e\x53\x00";
-#define IGN_LOAD_CALL_AT     8
+
+static const unsigned char ign_v2_load_call[] =           /* 0x4132EE */
+    "\x33\xc0\x5f\x5e\x83\xc4\x70\xc3\xe8\x15"
+    "\xf6\xff\xff\x68\x60\xa1\x53\x00";
 
 static unsigned char *g_ignLoadStub = NULL;
 
 static void InstallIgnLoadState(unsigned char *code, unsigned int codeSize,
                                 unsigned int imageBase)
 {
-    unsigned char  repl[sizeof(ign_load_call)];
+    unsigned char  repl[64];
     unsigned char *at, *stub;
     unsigned int   builder;
-    int            rel;
+    int            rel, callAt;
 
-    at = FindUnique(code, codeSize, ign_load_call, sizeof(ign_load_call) - 1);
+    at = FindUnique(code, codeSize, g_ign->loadCall, g_ign->loadCallLen);
     if (!at) return;                    // already applied, or not this build
 
+    callAt = g_ign->loadCallAt;
+
     /* Where the original call was going. */
-    builder = (unsigned int)(at + IGN_LOAD_CALL_AT + 5)
-            + ReadU32(at + IGN_LOAD_CALL_AT + 1);
+    builder = (unsigned int)(at + callAt + 5) + ReadU32(at + callAt + 1);
 
     stub = (unsigned char *)VirtualAlloc(NULL, 64, MEM_COMMIT | MEM_RESERVE,
                                          PAGE_EXECUTE_READWRITE);
@@ -2705,24 +2820,69 @@ static void InstallIgnLoadState(unsigned char *code, unsigned int codeSize,
 
     /* mov dword [screenW], 640 */
     stub[0] = 0xC7; stub[1] = 0x05;
-    PutU32(stub + 2, imageBase + IGN_RVA_SCREEN_W);
+    PutU32(stub + 2, imageBase + g_ign->rvaScreenW);
     PutU32(stub + 6, 640);
     /* mov dword [screenH], 400 */
     stub[10] = 0xC7; stub[11] = 0x05;
-    PutU32(stub + 12, imageBase + IGN_RVA_SCREEN_H);
+    PutU32(stub + 12, imageBase + g_ign->rvaScreenH);
     PutU32(stub + 16, 400);
     /* jmp builder */
     stub[20] = 0xE9;
     PutU32(stub + 21, (unsigned int)(builder - ((unsigned int)stub + 25)));
 
-    memcpy(repl, ign_load_call, sizeof(ign_load_call) - 1);
-    rel = (int)((unsigned int)stub - ((unsigned int)at + IGN_LOAD_CALL_AT + 5));
-    PutU32(repl + IGN_LOAD_CALL_AT + 1, (unsigned int)rel);
+    memcpy(repl, g_ign->loadCall, g_ign->loadCallLen);
+    rel = (int)((unsigned int)stub - ((unsigned int)at + callAt + 5));
+    PutU32(repl + callAt + 1, (unsigned int)rel);
 
-    WriteCode(at, repl, sizeof(ign_load_call) - 1);
+    WriteCode(at, repl, g_ign->loadCallLen);
 }
 
 //
+// The two supported builds.  `S(x)` pairs a signature with its length so the
+// two can never drift apart.
+//
+#define S(x)   (x), (unsigned int)(sizeof(x) - 1)
+
+static const IgnBuild ign_builds[] = {
+  { "ver3 (1998-12-29)",
+    0x547CA0u, 64, 0x46A568u,
+    0x0F3348u, 0x0F3358u, 0x0F335Cu,        /* blit / lock / unlock  */
+    0x0F2F40u, 0x0F2E50u, 0x21E520u,        /* screen A / B / palette */
+    0x136EECu, 0x147B18u,                   /* screen W / H globals   */
+    S(ign_v3_size_main),   1, 22,
+    S(ign_v3_size_global),    12,
+    S(ign_v3_size_clip),   6, 16,
+    S(ign_v3_focal),       1, 31,
+    S(ign_v3_sprite),      3, 17,
+    S(ign_v3_menu),        3,  6,
+    S(ign_v3_wipe),
+    S(ign_v3_present),     7,
+    S(ign_v3_loop_read),  0xB8,             /* mov eax,imm32 */
+    S(ign_v3_loop_write), 0xBA,             /* mov edx,imm32 */
+    S(ign_v3_load_call),   8 },
+
+  { "ver2 (1997-11-25)",
+    0x54AFE0u, 63, 0x46DBE0u,
+    0x0F6440u, 0x0F6450u, 0x0F6454u,
+    0x0F6038u, 0x0F5F48u, 0x221860u,
+    0x13A22Cu, 0x14AE58u,
+    S(ign_v2_size_main),   1,  6,
+    NULL, 0,                  0,            /* no second size site   */
+    S(ign_v2_size_clip),   6, 16,
+    S(ign_v2_focal),       1,  6,
+    S(ign_v2_sprite),      3, 17,
+    S(ign_v2_menu),       10, 21,
+    S(ign_v2_wipe),
+    S(ign_v2_present),     7,
+    S(ign_v2_loop_read),  0xB9,             /* mov ecx,imm32 */
+    S(ign_v2_loop_write), 0xBA,
+    S(ign_v2_load_call),   8 },
+};
+
+#undef S
+
+//
+
 // Everything Ignition needs.
 //
 // The order is load-bearing exactly once: F1 has to come first and, if it
@@ -2739,13 +2899,27 @@ static void IgnitionApply(const char *exePath)
 {
     HMODULE        mod;
     unsigned char *code = NULL;
-    unsigned int   codeSize = 0;
+    unsigned int   codeSize = 0, i;
 
     if (!PathEndsWith(exePath, IGN_EXE)) return;
 
     mod = GetModuleHandleA(NULL);
     if (!mod) return;
     if (!GetCodeRange(mod, &code, &codeSize)) return;
+
+    //
+    // Identify the build from its own bytes.  An unrecognised image -- or one
+    // already patched, since the probe pattern is among the things we rewrite
+    // -- is left completely alone, which is the right answer in both cases.
+    //
+    g_ign = NULL;
+    for (i = 0; i < COUNT(ign_builds); i++)
+        if (FindUnique(code, codeSize,
+                       ign_builds[i].wipe, ign_builds[i].wipeLen)) {
+            g_ign = &ign_builds[i];
+            break;
+        }
+    if (!g_ign) return;
 
     if (!InstallIgnFrameBuffer(code, codeSize)) return;
 
