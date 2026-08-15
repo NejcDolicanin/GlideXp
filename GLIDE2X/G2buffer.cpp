@@ -174,6 +174,11 @@ void FX_CALL grBufferClear( GrColor_t color, GrAlpha_t alpha, FxU16 depth )
 #endif
 		Glide3::grBufferClear (color, alpha, depth);
 
+	// TEMPORARY -- MDK's backdrop has to survive whatever clears the game
+	// issues mid-frame, and there are 30 places it can issue one from.
+	// Catching them here catches all of them, including any I have not found.
+	GameFix_AfterClear();
+
 #undef FN_NAME
 }
 

@@ -48,6 +48,9 @@ int GameFix_SetResolutionEnum(unsigned int glideEnum);
 // to flush from.  Goes when the diagnostic goes -- see gamefix.cpp.
 void GameFix_Tick(void);
 
+/* TEMPORARY -- called from the wrapper's grBufferClear, after it forwards. */
+void GameFix_AfterClear(void);
+
 #ifdef __cplusplus
 }
 #endif
