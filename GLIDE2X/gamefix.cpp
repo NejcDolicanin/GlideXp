@@ -40,6 +40,8 @@
 
 #include "gamefix.h"
 
+/* TEMPORARY -- bumped by the wrapper's triangle entry points; see gamefix.h. */
+
 /* TEMPORARY -- forward declaration for the MDK diagnostic, defined below. */
 static void MdkDiag(const char *fmt, ...);
 static BOOL MdkDiagFresh(unsigned int key);
@@ -247,6 +249,55 @@ static BOOL GetCodeRange(HMODULE mod, unsigned char **base, unsigned int *size)
     *base = (unsigned char *)mod + nt->OptionalHeader.BaseOfCode;
     *size = (unsigned int)nt->OptionalHeader.SizeOfCode;
     return TRUE;
+}
+
+//
+// Locate a named section, clamped to its INITIALISED part.
+//
+// Needed because some patch targets are data, not code -- Driver's video mode
+// list is a table in .data -- and GetCodeRange deliberately cannot see them.
+//
+// The clamp is the point.  A section's VirtualSize covers its BSS tail, and
+// that tail can be enormous: Driver's .data is 0x33000 bytes of raw data
+// followed by 14 MB of zeroes.  Scanning the virtual extent would fault every
+// one of those pages in for nothing.  Only the raw part can contain a pattern
+// that was in the file.
+//
+static BOOL GetSectionRange(HMODULE mod, const char *name,
+                            unsigned char **base, unsigned int *size)
+{
+    const IMAGE_DOS_HEADER  *dos = (const IMAGE_DOS_HEADER *)mod;
+    const IMAGE_NT_HEADERS  *nt;
+    const IMAGE_SECTION_HEADER *sec;
+    unsigned int i, n;
+
+    if (!mod) return FALSE;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return FALSE;
+
+    nt = (const IMAGE_NT_HEADERS *)((const unsigned char *)mod + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return FALSE;
+
+    sec = IMAGE_FIRST_SECTION(nt);
+    n   = nt->FileHeader.NumberOfSections;
+
+    for (i = 0; i < n; i++) {
+        unsigned int len;
+        char         nm[9];
+
+        memcpy(nm, sec[i].Name, 8);
+        nm[8] = '\0';
+        if (lstrcmpiA(nm, name) != 0) continue;
+
+        len = sec[i].SizeOfRawData;
+        if (sec[i].Misc.VirtualSize && sec[i].Misc.VirtualSize < len)
+            len = sec[i].Misc.VirtualSize;
+        if (!len) return FALSE;
+
+        *base = (unsigned char *)mod + sec[i].VirtualAddress;
+        *size = len;
+        return TRUE;
+    }
+    return FALSE;
 }
 
 //
@@ -6901,8 +6952,16 @@ void GameFix_AfterClear(void)
     g_mdkSkyBusy = 0;
 }
 
+/* Defined in the Driver block below; declared here only because GameFix_Tick
+   happens to sit above it.  TEMPORARY, and leaves with that diagnostic. */
+static void DrvTick(void);
+
 void GameFix_Tick(void)
 {
+    /* TEMPORARY -- Driver's per-frame status line.  Inert for every other
+       game, and inert for Driver until DriverApply has run. */
+    DrvTick();
+
     // K9.  Called from the wrapper's grBufferSwap AFTER the swap, so this
     // clears the buffer the game is about to draw into, not the one being
     // shown.  Inert unless MDK's window patch matched, and therefore inert
@@ -7091,6 +7150,1232 @@ static void MdkApply(const char *exePath, const char *ini, BOOL haveIni)
 
 
 // ==========================================================================
+// Driver (Reflections, 1999) -- Game.exe
+// ==========================================================================
+//
+// The smallest job in this file so far: four patches, all in memory, nothing
+// on disk modified.  Three unrelated things make it small.
+//
+//  - The Game.exe in this install is ALREADY DECRYPTED.  Driver retail is
+//    SafeDisc (GAME.ICD, clcd32.dll, secdrv.sys, and the 249 KB loader stub
+//    left behind as "Copy of Game.exe"), but the Game.exe actually in place
+//    has .text entropy 5.89 against GAME.ICD's 7.38.  So everything below was
+//    read off the file and no runtime dump was needed.  GAME.ICD is matched
+//    too, in case the protected image is ever the one that runs -- by
+//    grGlideInit it is decrypted, and every pattern here is verified unique
+//    before it is written, so a build that does not match is left alone.
+//
+//  - The engine is resolution-parametric.  The render size lives in two
+//    globals (0x12eff08 W, 0x12de6d0 H) read ~100 and ~88 times; grClipWindow
+//    is built as (0,0,W,H); the projection centre is W/2, H/2; and the only
+//    two W*H products in the whole image are in the TGA screen grab, which
+//    mallocs.  There is no fixed-size static framebuffer to relocate (part
+//    one, section 4), which is the check that has to come first.
+//
+//  - Requirement 1 is a real mode list, but a tidy one.  0x54d790 holds seven
+//    28-byte records -- { u32 w; u32 h; char name[12]; u32 flags; u32 enum } --
+//    320x240, 512x384, 640x480, 800x600, 1024x768, 1280x1024, 1600x1200, and a
+//    -1 terminator.  CONFIG.DAT's dword at +0x0c is the index into it.
+//
+// Requirement 2 is free in the same sense: the game already asks for whatever
+// that row says, so rewriting a row is the whole of "the game must ask".
+//
+// WHICH row, and why two of them.  GlideSetup (0x4264eb) does not read the
+// enum out of the table -- it re-derives it from the live width through a
+// binary-search if-else chain:
+//
+//      cmp W,800 ; jg upper                     upper: cmp W,1024 -> 0x0c
+//      cmp W,800 -> 0x08                               cmp W,1280 -> 0x0d
+//      cmp W,320 -> 0x01                               cmp W,1600 -> 0x0e
+//      cmp W,512 -> 0x03
+//      cmp W,640 -> 0x07
+//
+// Any widescreen width is > 800, so it lands in the UPPER branch.  Repurposing
+// the 800x600 arm would therefore be wrong twice over: the arm would never be
+// reached, and rewriting the FIRST compare to route it there would send 1024
+// and 1280 down the lower branch, where nothing matches and grSstWinOpen fails.
+// So the arm taken over is 1600x1200's, the one mode this hardware cannot use
+// anyway, and both the 800x600 and 1600x1200 rows are given the new size so it
+// does not matter which of the two the user picks in Config.exe.  Every other
+// mode in the list keeps working exactly as before.
+//
+// Requirement 3 is one instruction, and it is the same disguised constant GTA2
+// had.  The world projection is
+//
+//      recip[z] = S / z                         (table at 0xc24520, 345 readers)
+//      screenX  = camX * focal * recip[z] + W/2
+//      screenY  = camY * focal * recip[z] + H/2
+//
+// with `focal` a plain constant (384.0 normally; 1152.0 and 2112.0 for two
+// other cameras) and the table built once at 0x528277 from
+//
+//      S = (W / 640.0) * uiZoom                 <- 0x4260a8
+//
+// One scale for both axes, so the picture is never distorted -- but deriving
+// it from the WIDTH means the vertical field of view shrinks as the screen
+// gets wider.  At 2560x1080 S is 4.0 where the aspect wants 2.25, and the
+// result is a correctly-shaped image zoomed in by 1.78.  Taking the scale from
+// the HEIGHT instead makes the vertical FOV independent of resolution and the
+// extra width becomes extra world: Hor+, by construction (part one, section 7).
+//
+// The patch is an exact no-op at every 4:3 mode the game ships, because
+// H/480 == W/640 at all of them:
+//
+//      320x240 0.5   512x384 0.8   640x480 1.0
+//      800x600 1.25  1024x768 1.6  1600x1200 2.5
+//
+// Only 1280x1024 (5:4, 2.133 against 2.0) and an override differ.  480.0
+// already sits in .rdata at 0x54805c, one dword below the 640.0 being
+// replaced -- the same happy accident Ignition had with 240.0 next to 320.0.
+//
+// What is NOT fixed yet: the 2D layer.  Roughly two dozen paired sites divide
+// an x by 640.0 and a y by 480.0, then multiply by W and H -- so HUD positions
+// stretch to the full screen (which keeps corner elements in the corners, and
+// is right) while element SIZE comes from W/640 (which at 21:9 is 1.78x too
+// big).  That needs a screenshot before it needs code.
+//
+
+/* The video mode table, .data, seven 28-byte records. */
+#define DRV_ROW_800   0x0054d7e4u      /* 800 x 600,   enum 0x08 */
+
+/* The size the game latched out of that table at start-up, before we ran. */
+#define DRV_CFG_W     0x0054bcc0u
+#define DRV_CFG_H     0x0054bcc4u
+
+/* The live render size, and the UI zoom (1.0 in normal play). */
+#define DRV_LIVE_W    0x012eff08u
+#define DRV_LIVE_H    0x012de6d0u
+#define DRV_UI_ZOOM   0x012de6c0u
+
+/* The game's own 480.0f, used as the projection divisor at virtual_height=480
+   so the default path needs no allocation of ours at all. */
+#define DRV_REF_480   0x0054805cu
+
+/* Viewing distance and mirror viewing distance, both floats, both saved in
+   CONFIG.DAT (+0x80 and +0x84) and both settable from the in-game options. */
+#define DRV_VIEW_DIST 0x012eff04u
+#define DRV_MIRR_DIST 0x012de6d8u
+
+/* Their ceilings, in .rdata: 45000.0f and 42000.0f.  NOT patched in place --
+   45000.0f alone has 29 references and only five of them are this. */
+#define DRV_VIEWMAX_C 0x00548030u
+#define DRV_DISTMAX_C 0x00548028u
+
+/* One bit per installer, in install order, so a hardware session can bisect
+   without a rebuild.  Scaffolding -- it leaves with the diagnostic. */
+#define DRV_P_MODES   0x01u
+#define DRV_P_ENUM    0x02u
+#define DRV_P_CONFIG  0x04u
+#define DRV_P_RES2    0x08u
+#define DRV_P_PROJ    0x10u
+#define DRV_P_TEXT    0x20u
+#define DRV_P_BAR     0x40u
+#define DRV_P_SIZES   0x80u
+#define DRV_P_DIST    0x100u
+#define DRV_P_ALL     0x1ffu
+
+//
+// Signatures are byte arrays rather than string literals on purpose: two
+// signatures elsewhere in this file were silently destroyed by a UTF-8
+// round-trip that turned every byte >= 0x80 into EF BF BD, and an array
+// initialiser cannot suffer that.
+//
+
+/* V1.  The 800x600 mode-table row, matched whole so the check doubles as the
+   idempotency test -- a row already carrying the new size does not match and is
+   skipped.  ONLY this row is taken over; 320x240, 512x384, 640x480, 1024x768,
+   1280x1024 and 1600x1200 all keep meaning exactly what they say. */
+static const unsigned char drv_row800_find[] = {
+    0x20,0x03,0x00,0x00,  0x58,0x02,0x00,0x00,
+    '8','0','0',' ','x',' ','6','0','0',0x00,0x00,0x00,
+    0x00,0x00,0x00,0x00,  0x08,0x00,0x00,0x00
+};
+
+/* V2.  0x4265d2 -- the tail of the width -> Glide enum chain's upper branch:
+   `cmp [ebp-0xc],1600 ; je <1600 arm> ; jmp <fail>`.
+   Only the five-byte `jmp` at offset 13 is rewritten, so the 1600x1200 arm
+   itself is left completely intact. */
+static const unsigned char drv_enumtail_sig[] = {
+    0x81,0x7d,0xf4, 0x40,0x06,0x00,0x00,
+    0x0f,0x84,0xe6,0x00,0x00,0x00,
+    0xe9,0x05,0x01,0x00,0x00
+};
+#define DRV_ENUMTAIL_JMP 13
+
+/* Used only to LOCATE the arm's `call` instruction, which the stub rejoins.
+   Not patched.  The six-byte tail is shared with every other arm; the
+   `push 0xe` at offset 13 is what makes this unique. */
+static const unsigned char drv_arm1600_sig[] = {
+    0x6a,0x01, 0x6a,0x02, 0x8b,0x4d,0xfc, 0x51, 0x6a,0x00, 0x6a,0x00,
+    0x6a,0x0e, 0x8b,0x55,0x08, 0x52, 0xe8
+};
+#define DRV_ARM1600_CALL 18
+
+/* V6.  Every instruction that loads one of the two viewing-distance ceilings
+   AS a ceiling.  Listed by address rather than by signature because the
+   constants are shared: `fld`/`fcomp ds:0x548030` occurs 29 times and only
+   these five are the setting.  Each is verified byte-for-byte before it is
+   written, so a wrong address is a no-op rather than corruption. */
+static const unsigned int drv_viewmax_sites[] = {
+    0x0040976bu,   /* clamp, upper branch                     */
+    0x004097a9u,   /* clamp, lower branch                     */
+    0x00409ccau,   /* menu "increase" ceiling test            */
+    0x004b7253u,   /* the settings slider bar's length        */
+    0x004d917du    /* the keyboard "increase" handler         */
+};
+static const unsigned int drv_distmax_sites[] = {
+    0x004097ddu, 0x0040981bu, 0x00409d3cu,   /* mirror, menu   */
+    0x004d9215u,                             /* mirror, keys   */
+    0x00511c5cu, 0x00511c99u,                /* view, in-race  */
+    0x00511cccu, 0x00511d0au,                /* mirror,in-race */
+    0x005122bbu, 0x0051232du                 /* in-race steps  */
+};
+
+/* V8.  The text drawers' `SetGlyphScale(sx*zoom, sy*zoom)`.  sy is loaded
+   from [ebp-0xc] and sx from [ebp-0x4]; changing the second load's
+   displacement to sy's makes the glyphs uniform.  One byte, at offset 15.
+   Three text routines share the shape (0x5193f3, 0x51950f, 0x519640). */
+static const unsigned char drv_txtscale_sig[] = {
+    0xd9,0x45,0xf4,                      /* fld  [ebp-0xc]   sy         */
+    0xd8,0x0d,0xc0,0xe6,0x2d,0x01,       /* fmul ds:uiZoom              */
+    0x51, 0xd9,0x1c,0x24,                /* push ecx ; fstp [esp]       */
+    0xd9,0x45,0xfc,                      /* fld  [ebp-0x4]   sx         */
+    0xd8,0x0d,0xc0,0xe6,0x2d,0x01,       /* fmul ds:uiZoom              */
+    0x51, 0xd9,0x1c,0x24,                /* push ecx ; fstp [esp]       */
+    0xe8                                 /* call SetGlyphScale          */
+};
+#define DRV_TXTSCALE_SLOT   15
+#define DRV_TXTSCALE_COUNT  3
+
+//
+// V9/V10.  `k * W` sizes -- the other way this engine expresses an extent.
+//
+// Each is `fild W ; fstp <local> ; fld <k> ; fmul <local>`, and each `k` is a
+// fraction of the screen width standing in for a fraction of the height,
+// because at 4:3 they are the same thing.  The correction is the same one V5
+// and V7 apply: multiply by (H*640)/(W*480), which is 1.0 at 4:3 and 1/1.8 at
+// 21:9.  Only the constant's disp32 moves, so nothing changes length.
+//
+// Measured against the 800x600 reference frame, to the pixel:
+//   mirror  0.363636*W x 0.133333*H  ->  291x80 at 800x600, 698x107 at 1920x800
+//   map     r = 0.1*W, drawn as centre +/- r  ->  160 square / 384 square
+//
+struct DrvSizeSite {
+    const unsigned char *sig;
+    unsigned int         len;
+    unsigned int         at;        /* offset of the constant's disp32 */
+    float                expect;    /* the constant it must currently hold */
+    const char          *what;
+};
+
+static const unsigned char drv_mirrorw_sig[] = {
+    0xdb,0x05,0x08,0xff,0x2e,0x01,       /* fild ds:W                   */
+    0xd9,0x5d,0x88, 0xd9,0x45,0x88,      /* fstp/fld [ebp-0x78]         */
+    0xd8,0x0d,0xb0,0x59,0x56,0x00        /* fmul ds:0x5659b0  (0.36363) */
+};
+static const unsigned char drv_mapr_sig[] = {
+    0xdb,0x05,0x08,0xff,0x2e,0x01,       /* fild ds:W                   */
+    0xd9,0x9d,0x74,0xfe,0xff,0xff,       /* fstp [ebp-0x18c]            */
+    0xd9,0x05,0xc4,0x81,0x54,0x00        /* fld  ds:0x5481c4  (0.1)     */
+};
+static const unsigned char drv_mapr2_sig[] = {
+    0xdb,0x05,0x08,0xff,0x2e,0x01,       /* fild ds:W                   */
+    0xd9,0x9d,0x70,0xfe,0xff,0xff,       /* fstp [ebp-0x190]            */
+    0xd9,0x05,0x14,0x8b,0x54,0x00        /* fld  ds:0x548b14  (0.14219) */
+};
+
+static const DrvSizeSite drv_size_sites[] = {
+    { drv_mirrorw_sig, sizeof(drv_mirrorw_sig), 14, 0.363636374f, "mirror" },
+    { drv_mapr_sig,    sizeof(drv_mapr_sig),    14, 0.100000001f, "map r"  },
+    { drv_mapr2_sig,   sizeof(drv_mapr2_sig),   14, 0.142187506f, "map r2" }
+};
+
+//
+// V12.  The Damage / Felony fill bars, at 0x50495a.
+//
+// Named by V11's log in one run: `mapx caller=00504939 x=256/16`, which is the
+// return address of the MapX call at 0x504934 -- so the bar's routine is
+// 0x5048bd, and reading it showed the same shape as the mirror and the sprite
+// drawer for the third time:
+//
+//      [ebp-0x8] = W/640        [ebp-0xc] = H/480
+//      MapX(rect->x) -> screen x            position, correct
+//      MapY(rect->y) -> screen y            position, correct
+//      width  = [ebp-0x8] * rect->w * zoom  <- sx, STRETCHED
+//      height = [ebp-0xc] * rect->h * zoom  <- sy, already right
+//
+// So the earlier worry that both edges were positions was wrong: only the
+// left edge goes through MapX, and the extent is a separate multiply. One byte,
+// swapping which local the width is taken from.
+//
+static const unsigned char drv_barw_sig[] = {
+    0xd9,0x45,0xf8,                      /* fld  [ebp-0x8]   sx = W/640 */
+    0xd8,0x48,0x08,                      /* fmul [eax+0x8]   rect width */
+    0xd8,0x0d,0xc0,0xe6,0x2d,0x01        /* fmul ds:uiZoom              */
+};
+#define DRV_BARW_SLOT  2
+#define DRV_BARW_COUNT 1
+
+/* V4.  0x4260a8 -- `fild ds:W ; fstp [ebp-0x24] ; fld [ebp-0x24] ;
+   fdiv ds:640.0`.  Two disp32s to rewrite, at offsets 2 and 14. */
+static const unsigned char drv_proj_sig[] = {
+    0xdb,0x05, 0x08,0xff,0x2e,0x01,
+    0xd9,0x5d,0xdc,
+    0xd9,0x45,0xdc,
+    0xd8,0x35, 0x60,0x80,0x54,0x00
+};
+#define DRV_PROJ_SRC 2
+#define DRV_PROJ_DIV  14
+
+static BOOL         g_drvActive   = FALSE;
+static unsigned int g_drvVirtualH = 480;
+static unsigned int g_drvDrawPct  = 0;
+static unsigned int g_drvDivisor  = DRV_REF_480;   /* where the fdiv points */
+static float        g_drvDrawTgt  = 0.0f;          /* V6's target, 0 = off   */
+static int          g_drvDrawHeld = 0;             /* times it was re-armed  */
+static char         g_drvLogPath[MAX_PATH];
+static BOOL         g_drvLogged   = FALSE;
+static LPTOP_LEVEL_EXCEPTION_FILTER g_drvPrevFilter = NULL;
+
+//
+// TEMPORARY diagnostic.  Appends one line to gxp_driver.txt beside the exe.
+//
+// Opened and closed per line rather than held: the file then survives a crash
+// or a kill, which is the whole reason it exists.  Lines are few and only
+// written on change, so the cost does not matter.
+//
+static void DrvLog(const char *fmt, ...)
+{
+    char    line[1024];
+    va_list ap;
+    HANDLE  h;
+    DWORD   done;
+    int     n;
+
+    if (!g_drvLogPath[0]) return;
+
+    va_start(ap, fmt);
+    n = wvsprintfA(line, fmt, ap);
+    va_end(ap);
+    if (n < 0 || n > 1000) return;
+    line[n]     = '\r';
+    line[n + 1] = '\n';
+
+    h = CreateFileA(g_drvLogPath, GENERIC_WRITE, FILE_SHARE_READ, NULL,
+                    g_drvLogged ? OPEN_ALWAYS : CREATE_ALWAYS,
+                    FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return;
+
+    g_drvLogged = TRUE;
+    SetFilePointer(h, 0, NULL, FILE_END);
+    WriteFile(h, line, (DWORD)(n + 2), &done, NULL);
+    CloseHandle(h);
+}
+
+//
+// Report a fault three ways, because each names a different culprit: as an RVA
+// into Game.exe (which routine), raw (so an address outside the image is
+// obvious at a glance), and with the register set.  Chained, and returns
+// CONTINUE_SEARCH so Windows still shows its own dialog.
+//
+static LONG WINAPI DrvCrashFilter(EXCEPTION_POINTERS *ep)
+{
+    if (ep && ep->ExceptionRecord && ep->ContextRecord) {
+        unsigned int at = (unsigned int)ep->ExceptionRecord->ExceptionAddress;
+
+        DrvLog("CRASH code=%08lx at=%08lx exe+%08lx",
+               (unsigned long)ep->ExceptionRecord->ExceptionCode,
+               (unsigned long)at, (unsigned long)(at - 0x00400000u));
+        DrvLog("      eax=%08lx ebx=%08lx ecx=%08lx edx=%08lx",
+               (unsigned long)ep->ContextRecord->Eax,
+               (unsigned long)ep->ContextRecord->Ebx,
+               (unsigned long)ep->ContextRecord->Ecx,
+               (unsigned long)ep->ContextRecord->Edx);
+        DrvLog("      esi=%08lx edi=%08lx ebp=%08lx esp=%08lx",
+               (unsigned long)ep->ContextRecord->Esi,
+               (unsigned long)ep->ContextRecord->Edi,
+               (unsigned long)ep->ContextRecord->Ebp,
+               (unsigned long)ep->ContextRecord->Esp);
+    }
+    if (g_drvPrevFilter) return g_drvPrevFilter(ep);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+/* Is this address inside the main image's committed range?  Cheap sanity for
+   the fixed .data/.bss addresses used below. */
+static BOOL DrvReadable(unsigned int va, unsigned int len)
+{
+    return !IsBadReadPtr((const void *)va, len);
+}
+
+//
+// A page of our own for the floats the patched instructions point at.
+//
+// x86 disp32 operands are absolute, so any address works and a VirtualAlloc'd
+// page is as good as .rdata.  This is how a resolution-dependent constant gets
+// into an instruction without lengthening it.  Never freed -- the game reads
+// these for its whole run.
+//
+static float *DrvConst(float v)
+{
+    static float *page  = NULL;
+    static int    used  = 0;
+
+    if (!page) {
+        page = (float *)VirtualAlloc(NULL, 4096, MEM_COMMIT | MEM_RESERVE,
+                                     PAGE_READWRITE);
+        if (!page) return NULL;
+    }
+    if (used >= 1024) return NULL;
+    page[used] = v;
+    return &page[used++];
+}
+
+//
+// V1.  Rewrite the 800x600 mode-table row to the override resolution.
+//
+// The name field is 12 bytes including its terminator and the widest string
+// that can be produced is "1920 x 1080" -- 11 characters -- so it always fits.
+// Game.exe never reads it (only +0x00 and +0x04 are referenced, four times in
+// the whole image); it is written so a dump of the table still reads as what
+// it now means.
+//
+static BOOL InstallDrvModeRow(unsigned char *data, unsigned int dataSize)
+{
+    unsigned char *at;
+    unsigned char  rep[28];
+    char           name[16];
+    int            n;
+
+    at = FindUnique(data, dataSize, drv_row800_find, 28);
+    if (!at) { DrvLog("drv 800x600 row: no unique match"); return FALSE; }
+
+    memcpy(rep, drv_row800_find, 28);
+    PutU32(rep + 0, g_targetW);
+    PutU32(rep + 4, g_targetH);
+
+    memset(rep + 8, 0, 12);
+    n = wsprintfA(name, "%u x %u", g_targetW, g_targetH);
+    if (n > 0 && n < 12) memcpy(rep + 8, name, (unsigned int)n);
+
+    PutU32(rep + 24, g_targetRes);
+
+    return WriteCode(at, rep, 28);
+}
+
+//
+// V2.  Teach the width -> Glide enum chain one extra width, without taking
+// anything away from it.
+//
+// The chain is a binary search and any widescreen width is > 800, so it always
+// falls out of the UPPER branch (1024 / 1280 / 1600) having matched nothing,
+// into a five-byte `jmp <fail>` at 0x4265df.  Replacing THAT jump costs no
+// existing mode: the failure path is the only thing lost, and only for widths
+// that would have failed anyway.
+//
+// An earlier version took over the 1600x1200 arm in place.  That worked, but
+// it silently removed 1600x1200 from the mode list, and the point of this is
+// that ONLY the 800x600 entry changes meaning.
+//
+// The stub re-tests the width, and on a match rebuilds the arm's argument
+// pushes with our own enum and jumps into the game's own `call` -- so the call,
+// its result test and both exits stay the game's.  It is entered by `jmp`, not
+// `call`, so esp and ebp are exactly what the surrounding function expects and
+// `[ebp-0xc]` still names the width.
+//
+static BOOL InstallDrvEnum(unsigned char *code, unsigned int codeSize)
+{
+    unsigned char *tail, *arm, *stub;
+    unsigned char  rep[18];
+    unsigned int   jmpAt, failTarget, callTarget, s;
+
+    tail = FindUnique(code, codeSize, drv_enumtail_sig,
+                      sizeof(drv_enumtail_sig));
+    if (!tail) { DrvLog("drv enum: chain tail missing"); return FALSE; }
+
+    arm = FindUnique(code, codeSize, drv_arm1600_sig, sizeof(drv_arm1600_sig));
+    if (!arm) { DrvLog("drv enum: arm missing"); return FALSE; }
+
+    // Both targets are read back out of the very instructions being displaced,
+    // so they cannot disagree with what is really there (part one, section 5b).
+    jmpAt      = (unsigned int)(tail + DRV_ENUMTAIL_JMP);
+    failTarget = jmpAt + 5 + ReadU32(tail + DRV_ENUMTAIL_JMP + 1);
+    callTarget = (unsigned int)(arm + DRV_ARM1600_CALL);
+
+    stub = (unsigned char *)VirtualAlloc(NULL, 64, MEM_COMMIT | MEM_RESERVE,
+                                         PAGE_EXECUTE_READWRITE);
+    if (!stub) { DrvLog("drv enum: stub alloc failed"); return FALSE; }
+    s = (unsigned int)stub;
+
+    stub[0] = 0x81; stub[1] = 0x7d; stub[2] = 0xf4;   /* cmp [ebp-0xc], W */
+    PutU32(stub + 3, g_targetW);
+    stub[7] = 0x0f; stub[8] = 0x85;                   /* jne failTarget   */
+    PutU32(stub + 9, failTarget - (s + 13));
+    stub[13] = 0x6a; stub[14] = 0x01;                 /* push 1  nAux     */
+    stub[15] = 0x6a; stub[16] = 0x02;                 /* push 2  nColBuf  */
+    stub[17] = 0x8b; stub[18] = 0x4d; stub[19] = 0xfc;/* mov ecx,[ebp-4]  */
+    stub[20] = 0x51;                                  /* push ecx  origin */
+    stub[21] = 0x6a; stub[22] = 0x00;                 /* push 0  colfmt   */
+    stub[23] = 0x6a; stub[24] = 0x00;                 /* push 0  refresh  */
+    stub[25] = 0x6a; stub[26] = (unsigned char)g_targetRes;
+    stub[27] = 0x8b; stub[28] = 0x55; stub[29] = 0x08;/* mov edx,[ebp+8]  */
+    stub[30] = 0x52;                                  /* push edx  hWnd   */
+    stub[31] = 0xe9;                                  /* jmp the game's call */
+    PutU32(stub + 32, callTarget - (s + 36));
+
+    memcpy(rep, drv_enumtail_sig, sizeof(drv_enumtail_sig));
+    rep[DRV_ENUMTAIL_JMP] = 0xe9;
+    PutU32(rep + DRV_ENUMTAIL_JMP + 1, s - (jmpAt + 5));
+
+    DrvLog("drv enum stub=%08lx fail=%08lx call=%08lx",
+           (unsigned long)s, (unsigned long)failTarget,
+           (unsigned long)callTarget);
+
+    return WriteCode(tail, rep, sizeof(drv_enumtail_sig));
+}
+
+//
+// V3.  The size the game has ALREADY taken out of the table.
+//
+// WinMain reads CONFIG.DAT and copies table[index] into 0x54bcc0/0x54bcc4
+// before it calls grGlideInit, so by the time we run, V1 is a patch on a table
+// that has already been consumed once.  These two globals are what the game
+// actually re-applies (0x40c431 compares them against the live size and calls
+// the mode setter when they differ), so they are the ones that decide what the
+// first race runs at.
+//
+// Rewritten ONLY when they still read exactly 800x600, which is both the
+// idempotency test and the whole of "this applies to the 800x600 entry".  Any
+// other selection is left completely alone.
+//
+static BOOL InstallDrvConfig(void)
+{
+    unsigned int w, h;
+
+    if (!DrvReadable(DRV_CFG_W, 8)) return FALSE;
+
+    w = *(volatile unsigned int *)DRV_CFG_W;
+    h = *(volatile unsigned int *)DRV_CFG_H;
+
+    if (w != 800 || h != 600) {
+        DrvLog("drv config: %ux%u selected, not 800x600 -- left alone", w, h);
+        return FALSE;
+    }
+
+    *(volatile unsigned int *)DRV_CFG_W = g_targetW;
+    *(volatile unsigned int *)DRV_CFG_H = g_targetH;
+    return TRUE;
+}
+
+//
+// V4.  Derive the world scale from the height instead of the width.
+//
+// `virtual_height` is literally the number of the game's own vertical units
+// that stay visible, so 480 reproduces the original framing exactly and larger
+// values pull the camera back.  At the default the fdiv is pointed at the
+// game's own 480.0f and nothing is allocated.
+//
+static BOOL InstallDrvProjection(unsigned char *at)
+{
+    unsigned char rep[18];
+
+    if (!at) { DrvLog("drv proj: site missing"); return FALSE; }
+
+    g_drvDivisor = DRV_REF_480;
+    if (g_drvVirtualH != 480) {
+        float *f = DrvConst((float)g_drvVirtualH);
+        /* Falling back to the game's own 480.0 is the right failure: the
+           projection stays correct for the aspect and only the knob is lost. */
+        if (f) g_drvDivisor = (unsigned int)f;
+    }
+
+    memcpy(rep, drv_proj_sig, sizeof(drv_proj_sig));
+    PutU32(rep + DRV_PROJ_SRC, DRV_LIVE_H);     /* fild H, not W */
+    PutU32(rep + DRV_PROJ_DIV, g_drvDivisor);   /* fdiv virtual_height */
+    return WriteCode(at, rep, sizeof(drv_proj_sig));
+}
+
+
+//
+// Apply a fixed-length edit at EVERY occurrence of a pattern, but only if
+// there are exactly as many as were counted when the patch was derived.
+//
+// The count is the build check.  `FindUnique` cannot be used for a shape a
+// game repeats deliberately -- two sprite drawers, three text routines -- and
+// "patch the first one" would be a guess.  Two passes so nothing is written
+// unless the whole set is present.
+//
+static int DrvPatchAll(unsigned char *code, unsigned int codeSize,
+                       const unsigned char *sig, unsigned int len,
+                       int expected, unsigned int at, const unsigned char *rep,
+                       unsigned int repLen, const char *what)
+{
+    unsigned int i;
+    int          n = 0;
+
+    if (len == 0 || codeSize < len) return 0;
+
+    for (i = 0; i <= codeSize - len; i++)
+        if (memcmp(code + i, sig, len) == 0) n++;
+
+    if (n != expected) {
+        DrvLog("drv %s: %d sites, expected %d -- skipped", what, n, expected);
+        return 0;
+    }
+
+    n = 0;
+    for (i = 0; i <= codeSize - len; i++) {
+        if (memcmp(code + i, sig, len) != 0) continue;
+        if (WriteCode(code + i + at, rep, repLen)) n++;
+    }
+    return n;
+}
+
+
+//
+// V8.  The text drawers pass `SetGlyphScale(sx*zoom, sy*zoom)` with sx = W/640
+// and sy = H/480, so glyphs come out 1.8x wider than tall at 21:9.
+//
+// One byte per site: the second `fld` reads sx from [ebp-0x4]; making it read
+// sy from [ebp-0xc] instead gives square glyphs.  Positions are computed
+// separately, earlier in the same routines, and are untouched.
+//
+static int InstallDrvTextScale(unsigned char *code, unsigned int codeSize)
+{
+    unsigned char rep[1];
+
+    rep[0] = 0xf4;      /* [ebp-0x4] -> [ebp-0xc] */
+    return DrvPatchAll(code, codeSize, drv_txtscale_sig,
+                       sizeof(drv_txtscale_sig), DRV_TXTSCALE_COUNT,
+                       DRV_TXTSCALE_SLOT, rep, 1, "text");
+}
+
+//
+// V12.  The fill bars' width: take it from H/480 rather than W/640.  See the
+// signature above -- one byte, and the height multiply beside it already uses
+// the right one, which is what makes this unambiguous.
+//
+static int InstallDrvBarScale(unsigned char *code, unsigned int codeSize)
+{
+    unsigned char rep[1];
+
+    rep[0] = 0xf4;      /* [ebp-0x8] -> [ebp-0xc] */
+    return DrvPatchAll(code, codeSize, drv_barw_sig, sizeof(drv_barw_sig),
+                       DRV_BARW_COUNT, DRV_BARW_SLOT, rep, 1, "bar");
+}
+
+//
+// V9/V10.  The `k * W` sizes: mirror width and map radius.
+//
+// Each site's constant is verified by VALUE before anything is written, so a
+// pattern that matched the wrong place cannot corrupt anything -- and the
+// disp32 is repointed rather than the constant edited, because 0.1f has three
+// references and only one of them is the map (part one, section 7e).
+//
+static int InstallDrvSizes(unsigned char *code, unsigned int codeSize)
+{
+    unsigned int i;
+    int          n = 0;
+    float        ar;
+
+    if (!g_targetW || !g_targetH) return 0;
+
+    /* (H/480) / (W/640) -- 1.0 at 4:3, 1/1.8 at 21:9. */
+    ar = ((float)g_targetH * 640.0f) / ((float)g_targetW * 480.0f);
+
+    for (i = 0; i < sizeof(drv_size_sites) / sizeof(drv_size_sites[0]); i++) {
+        const DrvSizeSite *s = &drv_size_sites[i];
+        unsigned char     *at, rep[4];
+        unsigned int       konst;
+        float             *ref;
+
+        at = FindUnique(code, codeSize, s->sig, s->len);
+        if (!at) { DrvLog("drv size %s: no unique match", s->what); continue; }
+
+        konst = ReadU32(at + s->at);
+        if (!DrvReadable(konst, 4) ||
+            *(volatile float *)konst != s->expect) {
+            DrvLog("drv size %s: constant at %08lx is not %d/1000 -- skipped",
+                   s->what, (unsigned long)konst, (int)(s->expect * 1000.0f));
+            continue;
+        }
+
+        ref = DrvConst(s->expect * ar);
+        if (!ref) return n;
+
+        PutU32(rep, (unsigned int)ref);
+        if (WriteCode(at + s->at, rep, 4)) {
+            n++;
+            DrvLog("drv size %s: %d/1000 -> %d/1000", s->what,
+                   (int)(s->expect * 1000.0f), (int)(s->expect * ar * 1000.0f));
+        }
+    }
+    return n;
+}
+
+
+
+//
+// V13.  Regenerate FRUSTRUM.DAT's visibility table for the real field of view.
+//
+// This is the one thing here that is not a scale bug, and `draw_distance`
+// cannot touch it because it is a LATERAL limit, not a depth one.
+//
+// Driver ships FRUSTRUM.DAT (32,772 bytes): a 4-byte header and then **256
+// rows of 128 bytes**, loaded at 0x4ed4e0 into 0xd380c0 and indexed by camera
+// heading -- `row = table + (heading >> 4) * 128`, the heading being the 0..4095
+// yaw at 0xb9b4aa.  Each row is a precomputed list of which map cells are
+// visible from that heading, and the consumer at 0x4f0ed7 reads it as:
+//
+//      first = (s16)row[0]              ; first used column
+//      count = (s16)row[1]              ; number of columns spanned
+//      for i in [first, first+count):
+//          a = (s16)row[4 + i*4]        ; -1 means "column empty"
+//          b = (s16)row[6 + i*4]
+//          for j in [a, a+b):  cell (camX + i - 15, camZ + j - 15)
+//
+// So it is a 31x31 cell mask around the camera, one per heading, and the whole
+// thing is regenerable in place -- the grid does not grow when the field of
+// view widens, it just fills in more of the same 31x31.
+//
+// **The shape was recovered by fitting, not guessed.**  Decoded, the stock mask
+// is a disc of radius 15 cells intersected with a cone whose apex sits 3 cells
+// BEHIND the camera:
+//
+//      hypot(dx,dz) <= 15   and   |cross| <= tan(38.75 deg) * dot
+//
+// with the vectors taken from that apex.  At 38.75 degrees this reproduces all
+// 256 stock rows with **zero missing cells** and 3.4 extra per row out of 210 --
+// a tight superset, which is the right side to err on: an extra cell costs a
+// little drawing, a missing one is a hole in the world.
+//
+// Widening is then one number.  The horizontal half-FOV satisfies
+// `tan(phi) = (W/2) * virtual_height / (384 * H)`, so relative to the stock 4:3
+// case the ratio is
+//
+//      ratio = (W * virtual_height) / (640 * H)
+//
+// which is exactly 1.0 at 4:3 with the default virtual_height -- so this is an
+// **exact no-op at 4:3**, like every other patch here -- 1.333 at 16:9 and 1.8
+// at 21:9.  Verified for all three aspects: every row's per-column run stays
+// contiguous (the region is convex, so it must), the column span stays inside
+// 31, and the cost is 213 -> 255 -> 295 cells per frame.
+//
+// No trig is imported: the 256 heading vectors come from repeatedly rotating
+// (1,0) by 2*pi/256, the cone test is a dot/cross comparison against a tangent,
+// and the radius test compares squares.
+//
+#define DRV_FRUSTUM     0x00d380c0u     /* the loaded table            */
+#define DRV_FRUS_ROWS   256
+#define DRV_FRUS_STRIDE 128
+#define DRV_FRUS_SIZE   (DRV_FRUS_ROWS * DRV_FRUS_STRIDE)
+#define DRV_FRUS_HALF   15              /* the grid is 31x31, centre 15 */
+
+/* The reciprocal table at 0xc24520 covers z in [0, 56249].  45000 * 124% is
+   55800, the most the far clip can be without indexing off the end of it. */
+#define DRV_DRAW_MAX_PCT 124
+#define DRV_DRAW_MAX_Z   55800.0f
+
+static unsigned char *g_drvFrustum = NULL;   /* our generated copy */
+
+
+
+//
+// TEMPORARY.  Catch the triangles that draw as streaks and name who made them.
+//
+// Established on hardware: at `virtual_height=267` -- exactly the game's own
+// 39.8 degree horizontal half-FOV, at the same 1920x800 -- the streaks and
+// black wedges are GONE.  So they are a function of how far to the side the
+// engine is asked to draw, not of resolution, the visibility table, or the draw
+// distance (all three eliminated by measurement).
+//
+// Six theories have now been wrong, so this stops theorising and looks at the
+// vertices actually being handed to Glide.  A streak is a triangle with at
+// least one screen coordinate wildly out of range; the game's return address
+// says which routine produced it, and that is the thing to fix.
+//
+// Deliberately cheap: a few compares per triangle, and it stops recording after
+// 24 distinct producers.
+//
+
+//
+// Voodoo triangle setup is fixed-point, so a vertex far outside the
+// framebuffer wraps and the triangle is drawn as a streak right across the
+// screen.  4096 is a deliberately generous bound: it is well past any
+// resolution this driver offers, so a legitimate vertex never trips it, while
+// the values Driver was submitting -- 293504, -88838, -34693 -- are nowhere
+// near it.
+//
+#define GAMEFIX_TRI_SAFE 4096.0f
+
+
+
+
+//
+// V16.  The triangle queue is a fixed-size static array of 2048 records.
+//
+// This is the one.  The queue lives at 0x11d9420, records are 0xb8 bytes, and
+// `0x11d9420 + 2048 * 0xb8 = 0x1235420` -- exactly the next referenced global,
+// so the capacity is 2048 and not a byte more.  The emit path at 0x42d8c5 is
+//
+//      [0x11d941c] -> record ; record[0] = clipFlag
+//      0x11d9054++                      ; count
+//      0x11d941c += 0xb8                ; advance
+//
+// with **no bounds check of any kind**.  Past 2048 triangles in one frame it
+// writes straight through whatever follows, and the drain loop then reads those
+// same overrun records back as geometry -- which is where the wild coordinates
+// (293504, -88838) came from and why they draw as streaks and black wedges.
+//
+// Part one, section 4 and part two, section 30: the engine's invariants are its
+// stock resolutions.  2048 triangles is plenty for a 4:3 view at 39.8 degrees
+// each side and is not plenty at 56 degrees, which is why every earlier theory
+// fitted the *symptom* -- narrower FOV, shorter draw distance and a tighter
+// frustum table all reduce the triangle count and so hide the overflow.  None
+// of them was the cause.
+//
+// The array is relocated rather than the count clamped, because it can be:
+// 0x11d9420 is referenced from exactly TWO places (0x42d82d and 0x42d9a0),
+// both plain immediates, and both are the "reset to the start of the queue"
+// write that the fill loop and the drain loop share.  So a bigger buffer plus
+// two four-byte writes is the whole patch, and the reference count is the build
+// check (Ignition F1's shape exactly).
+//
+#define DRV_TRIQ_BASE   0x011d9420u
+#define DRV_TRIQ_PTR    0x011d941cu
+#define DRV_TRIQ_REC    0xb8u
+#define DRV_TRIQ_STOCK  2048u
+#define DRV_TRIQ_WANT   8192u        /* 4x headroom, 1.5 MB */
+
+
+//
+// V17.  The SECOND resolution dispatch, at 0x41f411.
+//
+// Found by reading AuToMaNiAk005's DriverWidescreenFix, which the user
+// supplied.  Its patcher prints the offsets it writes, and the whole of its
+// Game.exe patch is five 32-bit integers:
+//
+//      0x0041F474 width   0x0041F47B height     <- THIS site
+//      0x004265D5 width                         <- the enum chain's cmp
+//      0x0054D838 width   0x0054D83C height     <- mode table row 6
+//
+// Two of those three sites I already had.  This one I had never seen: a jump
+// table at 0x41f40a, indexed by the CONFIG.DAT mode index, whose seven arms
+// each load a hardcoded (width, height) pair into locals and pass them to
+// 0x4215ba.  It is a completely separate latch from the mode table at
+// 0x54d790 -- the game stores its resolution twice, in two unrelated forms,
+// and patching only one leaves a subsystem configured for 1600x1200 (or
+// 800x600) while the screen is 1920x800.
+//
+// That is what all the horizon artefacts were.  Every theory that "worked" --
+// a narrower FOV, a shorter draw distance, a tighter frustum table -- reduced
+// the disagreement between the two numbers or hid its consequences, which is
+// why each looked plausible and none was the cause.
+//
+// Their fix repurposes mode row 6 and tells the user to select 1600x1200; V1
+// here rewrites BOTH row 3 and row 6, so both arms are patched to match.
+//
+static const unsigned char drv_res2_800[] = {
+    0xc7,0x45,0xfc, 0x20,0x03,0x00,0x00,     /* mov [ebp-0x4],  800 */
+    0xc7,0x45,0xf0, 0x58,0x02,0x00,0x00      /* mov [ebp-0x10], 600 */
+};
+static const unsigned char drv_res2_1600[] = {
+    0xc7,0x45,0xfc, 0x40,0x06,0x00,0x00,     /* mov [ebp-0x4], 1600 */
+    0xc7,0x45,0xf0, 0xb0,0x04,0x00,0x00      /* mov [ebp-0x10],1200 */
+};
+
+static int InstallDrvRes2(unsigned char *code, unsigned int codeSize)
+{
+    static const unsigned char *sigs[2] = { drv_res2_800, drv_res2_1600 };
+    unsigned int i;
+    int          n = 0;
+
+    for (i = 0; i < 2; i++) {
+        unsigned char *at = FindUnique(code, codeSize, sigs[i], 14);
+        unsigned char  rep[14];
+
+        if (!at) { DrvLog("drv res2: arm %lu missing", (unsigned long)i); continue; }
+
+        memcpy(rep, sigs[i], 14);
+        PutU32(rep + 3,  g_targetW);
+        PutU32(rep + 10, g_targetH);
+        if (WriteCode(at, rep, 14)) n++;
+    }
+    DrvLog("drv res2: %d of 2 arms -> %lux%lu", n,
+           (unsigned long)g_targetW, (unsigned long)g_targetH);
+    return n;
+}
+
+//
+// V18.  The near clip plane, and why it is the Hor+ blocker.
+//
+// Driver clips polygons against exactly ONE plane in 3D: the near plane, at
+// **z = 50**, in the edge clipper at 0x42dac4 (`fcomp ds:0x54809c` on the
+// vertex's +0x14, and `fsub` of the same value for the interpolation
+// parameter).  There is no left/right/top/bottom clipping in 3D at all -- the
+// engine relies on screen-space rejection and on Glide's clip window.
+//
+// That is the whole Hor+ problem.  A polygon crossing z=50 a long way to the
+// side projects to a screen X in the hundreds of thousands -- the BADTRI log
+// showed 293504 -- and at the stock field of view such polygons are simply off
+// screen, so nothing ever had to render them.  Widen the view and they land on
+// screen, where a triangle spanning 300,000 pixels has to be clipped down to
+// 1920.  The clip is geometrically right but the interpolated 1/w and s/w, t/w
+// lose their precision across that span, and the result is stretched texture:
+// exactly the "smearing along the horizon" in the screenshots.
+//
+// Raising the near plane bounds that span directly -- at z=200 the worst-case
+// screen coordinate is a quarter of what it is at z=50.  The cost is that
+// geometry closer than the new plane is clipped away, so this is a knob, not a
+// constant: `near_clip` in the ini, default 50 which is exactly stock and
+// therefore inert.
+//
+// 50.0f is a POOLED literal with 144 references across a dozen modules, so the
+// constant itself is not touched (part one, section 28 -- Driver's own
+// draw-distance ceilings were the same trap).  Only the references inside the
+// edge clipper are repointed at a float of ours.
+//
+#define DRV_CLIP_LO   0x0042dac4u
+#define DRV_CLIP_HI   0x0042dd20u
+#define DRV_NEAR_C    0x0054809cu
+
+
+
+
+
+
+//
+// V6.  Raise the ceiling on the game's own Viewing Distance setting.
+//
+// A wider field of view reaches further sideways, so the distance at which the
+// game stops drawing -- invisible at 4:3, where it sat outside the frustum --
+// comes into the corners of a 21:9 screen.  The game's own slider is the right
+// control; it simply stops at 45000.
+//
+// The ceiling constants are NOT edited in place.  45000.0f is a pooled literal
+// with 29 references and only five of them are this setting; the other 24 are
+// unrelated comparisons in the mission and replay code.  So each of the five
+// (and each of the ten for the 42000.0f used by the mirror and the in-race
+// adjust) has its disp32 repointed instead, after verifying that the two opcode
+// bytes and the operand are exactly what is expected -- which turns a wrong
+// address into a no-op rather than corruption.
+//
+// The live value is SET, not scaled, so the setting takes effect without a trip
+// through the menu; raising the ceiling is what stops the game clamping it
+// straight back the moment the options screen is opened.
+//
+// `draw_distance` is a percent of the game's own maximum (45000), and 0 -- the
+// default -- means "do not touch anything at all".  It was a percent of the
+// CURRENT value in build 2, which turned out to be unreadable: the value in
+// CONFIG.DAT was 30000, so 150% produced 45000, i.e. exactly the number the
+// slider already offered, and the run reported "does nothing".  Anchoring the
+// knob to a fixed reference makes what it asks for unambiguous.
+//
+// Both ceilings get the same value on purpose: the in-race clamp at 0x511c5c
+// tests the VIEW distance against the 42000 constant, so leaving that one lower
+// would pull the view distance back down the moment a race started.
+//
+static int InstallDrvDrawDistance(void)
+{
+    static const struct { const unsigned int *sites; unsigned int count;
+                          unsigned int konst; } tab[] = {
+        { drv_viewmax_sites, sizeof(drv_viewmax_sites) / sizeof(unsigned int),
+          DRV_VIEWMAX_C },
+        { drv_distmax_sites, sizeof(drv_distmax_sites) / sizeof(unsigned int),
+          DRV_DISTMAX_C }
+    };
+    unsigned int t, i;
+    int          n = 0;
+    float        target;
+    float       *ref;
+
+    if (g_drvDrawPct == 0) return 0;          /* off */
+
+    target = 45000.0f * (float)g_drvDrawPct / 100.0f;
+    ref    = DrvConst(target);
+    if (!ref) return 0;
+
+    for (t = 0; t < 2; t++) {
+        for (i = 0; i < tab[t].count; i++) {
+            unsigned char *at = (unsigned char *)tab[t].sites[i];
+            unsigned char  rep[6];
+
+            if (!DrvReadable((unsigned int)at, 6)) continue;
+            /* fld m32 (d9 05) or fcomp m32 (d8 1d), on the right constant. */
+            if (!((at[0] == 0xd9 && at[1] == 0x05) ||
+                  (at[0] == 0xd8 && at[1] == 0x1d))) continue;
+            if (ReadU32(at + 2) != tab[t].konst) continue;
+
+            memcpy(rep, at, 2);
+            PutU32(rep + 2, (unsigned int)ref);
+            if (WriteCode(at, rep, 6)) n++;
+        }
+    }
+
+    /* And the value itself, so it applies to the run in progress.  Logged
+       before and after, because "the setting was already higher than the log
+       shows" is exactly the ambiguity that cost the last round. */
+    if (DrvReadable(DRV_VIEW_DIST, 4)) {
+        float *v = (float *)DRV_VIEW_DIST;
+        DrvLog("drv dist: view %d -> %d (ceiling %d, %d sites)",
+               (int)*v, (int)target, (int)target, n);
+        *v = target;
+    }
+
+    //
+    // Writing it once is NOT enough, which is why build 3 still reported "does
+    // nothing".  LoadConfig (0x405618) re-reads the viewing distance out of the
+    // config buffer at 0x405885, and it has SIX call sites -- including
+    // 0x40c20e and 0x40c667, both on the mode-change path that runs as a race
+    // starts.  So the value we set at grGlideInit is overwritten with whatever
+    // CONFIG.DAT holds before the first frame of actual play.
+    //
+    // Part one, section 27: a patched global is read by code you did not patch.
+    // The ceilings are code and survive; the value has to be re-asserted, which
+    // DrvTick does every frame -- upward only, so the in-game slider can still
+    // raise it further.
+    //
+    g_drvDrawTgt = target;
+    return n;
+}
+
+//
+// TEMPORARY.  Per-frame, logged only on change and capped.
+//
+// This is the half that separates "the patch never landed" from "the patch
+// landed but its site never executes": the mode list and the config globals
+// are what we DID, and the live render size is what the game then BELIEVED.
+//
+static void DrvTick(void)
+{
+    static unsigned int lastW = 0, lastH = 0, frame = 0, records = 0;
+    unsigned int w, h;
+
+    if (!g_drvActive) return;
+    frame++;
+
+    //
+    // V6, second half.  Re-assert the viewing distance every frame -- LoadConfig
+    // puts the CONFIG.DAT value back as a race starts.
+    //
+    // The CEILING is enforced unconditionally, including when draw_distance is
+    // off, and that is not tidiness.  Earlier builds raised this to 90000 and
+    // **the game saved it into CONFIG.DAT**, so the file now restores 90000 on
+    // every load whatever the ini says -- and 90000 is past the end of the
+    // reciprocal table, which is what makes the horizon streak.  A knob that
+    // only pushed the value UP could never take back its own damage: the log
+    // showed `drv dist: view 90000 -> 45000` at patch time and `viewdist=90000`
+    // on every tick after, with held=0, because nothing was ever below target.
+    //
+    // Two-sided from now on.  The ceiling is a correctness limit, not a
+    // preference: above it the game draws garbage.
+    //
+    if (DrvReadable(DRV_VIEW_DIST, 4)) {
+        float *v = (float *)DRV_VIEW_DIST;
+
+        if (*v > DRV_DRAW_MAX_Z) {
+            if (g_drvDrawHeld < 3)
+                DrvLog("drv dist: capped at f=%lu (was %d, now %d) -- past the "
+                       "reciprocal table", (unsigned long)frame, (int)*v,
+                       (int)DRV_DRAW_MAX_Z);
+            g_drvDrawHeld++;
+            *v = DRV_DRAW_MAX_Z;
+        } else if (g_drvDrawTgt > 0.0f && *v < g_drvDrawTgt) {
+            if (g_drvDrawHeld < 3)
+                DrvLog("drv dist: re-armed at f=%lu (was %d, now %d)",
+                       (unsigned long)frame, (int)*v, (int)g_drvDrawTgt);
+            g_drvDrawHeld++;
+            *v = g_drvDrawTgt;
+        }
+    }
+
+    /* The mirror's distance shares the same table, so it needs the same cap. */
+    if (DrvReadable(DRV_MIRR_DIST, 4)) {
+        float *v = (float *)DRV_MIRR_DIST;
+        if (*v > DRV_DRAW_MAX_Z) *v = DRV_DRAW_MAX_Z;
+    }
+
+
+    if (records >= 24) return;
+    if (!DrvReadable(DRV_LIVE_W, 4) || !DrvReadable(DRV_LIVE_H, 4)) return;
+
+    w = *(volatile unsigned int *)DRV_LIVE_W;
+    h = *(volatile unsigned int *)DRV_LIVE_H;
+    if (w == lastW && h == lastH) return;
+
+    lastW = w; lastH = h;
+    records++;
+    DrvLog("tick f=%lu live=%ux%u cfg=%ux%u viewdist=%d mirror=%d held=%d "
+           "frustbl=%08lx",
+           (unsigned long)frame, w, h,
+           DrvReadable(DRV_CFG_W, 8) ? *(volatile unsigned int *)DRV_CFG_W : 0,
+           DrvReadable(DRV_CFG_W, 8) ? *(volatile unsigned int *)DRV_CFG_H : 0,
+           DrvReadable(DRV_VIEW_DIST, 4) ? (int)*(volatile float *)DRV_VIEW_DIST : -1,
+           DrvReadable(DRV_MIRR_DIST, 4) ? (int)*(volatile float *)DRV_MIRR_DIST : -1,
+           g_drvDrawHeld,
+           DrvReadable(0x00d72124u, 4)
+               ? (unsigned long)*(volatile unsigned int *)0x00d72124u : 0);
+}
+
+//
+// Called from GameFix_Apply BEFORE the resolution guard, so "ran with no
+// override" and "never ran at all" do not both produce an empty directory.
+//
+static void DrvEarlyLog(const char *exePath)
+{
+    if (!PathEndsWith(exePath, "Game.exe") &&
+        !PathEndsWith(exePath, "GAME.ICD")) return;
+
+    /* "Game.exe" is about as generic as a name gets, so pair it with the image
+       base every address in this block assumes.  Cheap, and it keeps a stray
+       gxp_driver.txt out of some unrelated game's folder. */
+    if ((unsigned int)(unsigned long)GetModuleHandleA(NULL) != 0x00400000u)
+        return;
+
+    if (!PathBesideExe("gxp_driver.txt", g_drvLogPath)) return;
+
+    DrvLog("GameFix_Apply exe=%s res=%lu %lux%lu", exePath,
+           (unsigned long)g_targetRes, (unsigned long)g_targetW,
+           (unsigned long)g_targetH);
+}
+
+static void DriverApply(const char *exePath, const char *ini, BOOL haveIni)
+{
+    HMODULE        mod;
+    unsigned char *code = NULL, *data = NULL, *proj = NULL;
+    unsigned int   codeSize = 0, dataSize = 0;
+    unsigned int   mask = DRV_P_ALL;
+    int            dist = 0, text = 0, size = 0, bar = 0, res2 = 0;
+
+    if (!PathEndsWith(exePath, "Game.exe") &&
+        !PathEndsWith(exePath, "GAME.ICD")) return;
+
+    mod = GetModuleHandleA(NULL);
+
+    // Every address above is absolute.  Game.exe does carry a .reloc, so say
+    // out loud that it landed where it was linked rather than assuming it.
+    if ((unsigned int)(unsigned long)mod != 0x00400000u) {
+        DrvLog("drv: image base %08lx, not 0x400000 -- skipped",
+               (unsigned long)(unsigned int)mod);
+        return;
+    }
+
+    if (!GetCodeRange(mod, &code, &codeSize)) return;
+    if (!GetSectionRange(mod, ".data", &data, &dataSize)) return;
+
+    if (haveIni) {
+        mask = (unsigned int)GetPrivateProfileIntA("DRIVER", "patches",
+                                                   (int)DRV_P_ALL, ini);
+        //
+        // 0 = AUTO, and it is the default because it is the only setting the
+        // engine actually supports.
+        //
+        // `640*H/W` makes the world scale come out at exactly `W/640` -- the
+        // value the game computes for itself -- so the horizontal field of view
+        // is the stock 39.8 degrees each side and the projection patch, the
+        // focal patch and the frustum widening all become exact no-ops.
+        //
+        // That is what AuToMaNiAk005's DriverWidescreenFix does: its entire
+        // patch is nine integers of resolution plumbing and no projection maths
+        // at all.  It renders Vert- -- the same width of world as 4:3, less
+        // height -- and it is artefact-free precisely because it never asks the
+        // engine for a wider view than it was built for.
+        //
+        // Anything wider than that produces the horizon streaking, and after a
+        // dozen builds I could not find what breaks.  Setting virtual_height
+        // explicitly still widens the view for anyone who prefers it with the
+        // artefacts; 480 is true Hor+.
+        //
+        g_drvVirtualH = (unsigned int)GetPrivateProfileIntA("DRIVER",
+                                                      "virtual_height", 0, ini);
+        if (g_drvVirtualH == 0 && g_targetW)
+            g_drvVirtualH = (640u * g_targetH + g_targetW / 2) / g_targetW;
+        if (g_drvVirtualH < 120)  g_drvVirtualH = 120;
+        if (g_drvVirtualH > 8192) g_drvVirtualH = 8192;
+
+        /* 0 = leave the game's own setting alone; otherwise a percent of its
+           maximum, 45000.  Anything between is clamped up to 50 rather than
+           silently reducing the draw distance. */
+        g_drvDrawPct = (unsigned int)GetPrivateProfileIntA("DRIVER",
+                                                       "draw_distance", 0, ini);
+        if (g_drvDrawPct && g_drvDrawPct < 50) g_drvDrawPct = 50;
+
+        //
+        // HARD CAP, and it is the whole reason the "culling" existed.
+        //
+        // The projection is `screenX = camX * focal * recip[z] + W/2`, and
+        // `recip` is a TABLE at 0xc24520, built at 0x528277 for indices
+        // 0..0xdbba-1 -- z up to **56249** and no further.  A vertex past that
+        // reads off the end of the array, so its reciprocal is garbage and the
+        // polygon streaks toward a vanishing point or vanishes.
+        //
+        // That is exactly what the screenshots showed -- long horizontal smears
+        // and thin black wedges at the horizon and the screen edges -- which
+        // read as "culling" and sent four builds after the visibility table.
+        // The game's own maximum of 45000 is not arbitrary: it is this table's
+        // capacity with margin, and draw_distance=200 put the far clip at
+        // 90000, 60% past the end.
+        //
+        // The array cannot simply grow: 0xc24520 + 0xdbba*4 = 0xc5b3e8 and the
+        // next referenced global is 0xc5b408, so there are 32 spare bytes.
+        // Relocating it is Ignition-F1-shaped work (345 references) for 25%
+        // more distance, so the knob is capped instead.
+        //
+        if (g_drvDrawPct > DRV_DRAW_MAX_PCT) {
+            DrvLog("drv dist: %lu%% would put the far clip past the reciprocal "
+                   "table (z limit 56249) -- capped to %d%%",
+                   (unsigned long)g_drvDrawPct, DRV_DRAW_MAX_PCT);
+            g_drvDrawPct = DRV_DRAW_MAX_PCT;
+        }
+    }
+
+    // The enum has to fit a `push imm8`; every enum in the wide driver's list
+    // does, but a sign-extended push would be a silent disaster.
+    if (g_targetRes > 0x7f) {
+        DrvLog("drv: enum %lu will not fit push imm8 -- skipped",
+               (unsigned long)g_targetRes);
+        return;
+    }
+
+    // Located before anything is written, because the patches consume their own
+    // find patterns and the `sigs` line below has to report what was there.
+    proj = FindUnique(code, codeSize, drv_proj_sig, sizeof(drv_proj_sig));
+
+    DrvLog("drv code=%08lx+%08lx data=%08lx+%08lx patches=%lu vh=%lu dd=%lu",
+           (unsigned long)(unsigned int)code, (unsigned long)codeSize,
+           (unsigned long)(unsigned int)data, (unsigned long)dataSize,
+           (unsigned long)mask, (unsigned long)g_drvVirtualH,
+           (unsigned long)g_drvDrawPct);
+    DrvLog("drv sigs row800=%d tail=%d arm=%d proj=%d",
+           FindUnique(data, dataSize, drv_row800_find, 28)              ? 1 : 0,
+           FindUnique(code, codeSize, drv_enumtail_sig,
+                      sizeof(drv_enumtail_sig))                         ? 1 : 0,
+           FindUnique(code, codeSize, drv_arm1600_sig,
+                      sizeof(drv_arm1600_sig))                          ? 1 : 0,
+           proj                                                         ? 1 : 0);
+
+    if (mask & DRV_P_MODES)  InstallDrvModeRow(data, dataSize);
+    if (mask & DRV_P_ENUM)   InstallDrvEnum(code, codeSize);
+    if (mask & DRV_P_CONFIG) InstallDrvConfig();
+    if (mask & DRV_P_RES2)   res2 = InstallDrvRes2(code, codeSize);
+    if (mask & DRV_P_PROJ)   InstallDrvProjection(proj);
+    if (mask & DRV_P_TEXT)   text = InstallDrvTextScale(code, codeSize);
+    if (mask & DRV_P_BAR)    bar  = InstallDrvBarScale(code, codeSize);
+    if (mask & DRV_P_SIZES)  size = InstallDrvSizes(code, codeSize);
+    if (mask & DRV_P_DIST)   dist = InstallDrvDrawDistance();
+
+    DrvLog("drv applied  target=%lux%lu enum=%lu divisor=%08lx "
+           "res2=%d text=%d bar=%d size=%d dist=%d",
+           (unsigned long)g_targetW, (unsigned long)g_targetH,
+           (unsigned long)g_targetRes, (unsigned long)g_drvDivisor,
+           res2, text, bar, size, dist);
+
+    g_drvActive     = TRUE;
+    g_drvPrevFilter = SetUnhandledExceptionFilter(DrvCrashFilter);
+}
+
+
+// ==========================================================================
 // Public entry points
 // ==========================================================================
 
@@ -7159,11 +8444,16 @@ void GameFix_Apply(void)
             InstallMdkInputHook(NULL, 0);
     }
 
-    if (!g_targetRes) return;
-
     exePath[0] = '\0';
     len = GetModuleFileNameA(NULL, exePath, MAX_PATH);
     if (len == 0 || len >= MAX_PATH) return;
+
+    /* Driver: one line before the guard below, so "ran with no override" and
+       "never ran at all" do not both look like an absent log file.  Writes
+       nothing to the game. */
+    DrvEarlyLog(exePath);
+
+    if (!g_targetRes) return;
 
     haveIni = PathBesideExe(GAMEFIX_INI, ini);
 
@@ -7171,4 +8461,5 @@ void GameFix_Apply(void)
     IgnitionApply(exePath);
     TurokApply(exePath, ini, haveIni);
     MdkApply(exePath, ini, haveIni);
+    DriverApply(exePath, ini, haveIni);
 }
