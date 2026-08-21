@@ -7273,7 +7273,11 @@ static void MdkApply(const char *exePath, const char *ini, BOOL haveIni)
 #define DRV_P_SIZES   0x80u
 #define DRV_P_DIST    0x100u
 #define DRV_P_FRUSP   0x200u
-#define DRV_P_ALL     0x3ffu
+#define DRV_P_UISCL   0x400u
+#define DRV_P_RANCH   0x800u
+#define DRV_P_NEEDLE  0x1000u
+#define DRV_P_STRIKE  0x2000u
+#define DRV_P_ALL     0x3fffu
 
 //
 // Signatures are byte arrays rather than string literals on purpose: two
@@ -8204,6 +8208,369 @@ static int InstallDrvFrusPlane(unsigned char *code, unsigned int codeSize)
                        0, rep, sizeof(rep), "frusplane");
 }
 
+//
+// V22.  The 2D image scale -- uniform, but taken from the WIDTH.
+//
+// Found by the corner probe, then read back up the call chain:
+//
+//   0x40b92d   the 2D image drawer.  Position is `u * scale + origin`, so both
+//              the origin and the scale come from its caller.  It ends in
+//              grDrawPolygonVertexList, which is how the probe caught it
+//              (caller=0x40bcef, box 0,0 .. 283,379 -- the stopwatch).
+//
+//   0x4e940c   one of its four callers, and the only one that pushes the SAME
+//              local for both axes:
+//
+//                  4e9380  fild  W                    ; 0x12eff08
+//                  4e938c  fdiv  640.0                ; 0x548060
+//                  4e9392  fmul  uiZoom               ; 0x12de6c0
+//                  4e9398  [ebp-0x8] = (W/640)*uiZoom ; sx
+//                  ...
+//                  4e93fc  push [ebp-0x8]             ; scaleY  <-- sx
+//                  4e9400  push [ebp-0x8]             ; scaleX  <-- sx
+//
+// So the image is scaled UNIFORMLY -- the stopwatch dial stays round, which is
+// why this never looked like the stretched-HUD bug -- but from the width.  At
+// 1920x800 that is 3.0 where the aspect-preserving value is H/480 = 1.667, so
+// every 2D image is 1.8x too big.
+//
+// The overlays on those images -- the stopwatch needle, the red strikeout
+// scribble on the to-do list -- are positioned by the ordinary proportional
+// mapping, which is correct.  So they land where the CORRECTLY sized image
+// would put them: up and left of an oversized dial.  That is the whole of the
+// reported symptom, and it is why "make the image smaller and the overlay will
+// line up" was the right instinct.
+//
+// Fixed the same way as V5/V6/V9/V10: repoint the divisor at a constant of
+// ours, so `W / K == H / 480`:
+//
+//      K = 480 * W / H
+//
+// 640 at 4:3 -- an EXACT NO-OP there -- and 1152 at 1920x800.
+//
+// ONE SITE ONLY, deliberately.  Three sites in the image compute
+// `fild W ; fdiv 640 ; fmul uiZoom` and no site anywhere computes the H/480
+// equivalent, so the engine simply has no height-derived uniform scale.  Of
+// the three:
+//
+//      0x4260b4   the WORLD scale -- V4 owns it, and V4 replaces the 18 bytes
+//                 that contain it.  Patching it here would double up.
+//      0x4b75bd   a world-space billboard sizer: the same routine reads
+//                 recip[z] at 0xc24520 and the focal at 0x12d0d44.  Different
+//                 domain, unconfirmed, left alone.
+//      0x4e938c   this one.
+//
+// Patched by explicit address rather than by scanning for the byte pattern,
+// because V4 may or may not have already consumed 0x4260b4 depending on the
+// patch mask -- a scan would then find two sites or three and could not tell
+// which.
+//
+//
+// The full site list.  V22 originally patched only 0x4e938c -- the one the
+// corner probe had confirmed -- and that fixed the stopwatch and the paper
+// while leaving the to-do list's strikeouts untouched, because they are
+// drawn by a DIFFERENT routine that computes the same scale at its own
+// site.  AuToMaNiAk005's fix does not have that problem: it rewrites the
+// shared 640.0 itself, so all 36 readers move together.  Ours repoints
+// individual divisors, which is safer but means the list has to be
+// complete.
+//
+// The five below all compute `uiZoom * W / 640` and use it as a SIZE:
+//
+//      0x4e938c   stopwatch and to-do paper   (via 0x4e940c / 0x4e9411)
+//      0x4e94c8   X scale, and
+//      0x4e94e8   Y scale -- both from the WIDTH, in the same routine
+//      0x4e978a   the strikeout marks         (via 0x4e983e / 0x4e9843)
+//      0x4e98b7   same shape, same module
+//
+// Deliberately NOT in the list, though they read the same constant:
+//
+//      0x4e9317, 0x4e944a   `fld x ; fdiv 640` immediately followed by
+//                           `fld y ; fdiv 480` -- POSITION mappers, which
+//                           are correct as they stand.  That pairing is
+//                           the discriminator: a size divides only by 640,
+//                           a position divides x by 640 and y by 480.
+//      0x4260b4             the world scale (V4 owns it).
+//      0x4b75bd             a world-space billboard sizer -- the same
+//                           routine reads recip[z] and the focal.
+//
+static const unsigned int drv_uiscale_sites[] = {
+    0x004e938cu, 0x004e94c8u, 0x004e94e8u, 0x004e978au, 0x004e98b7u
+};
+
+static int InstallDrvUiScale(void)
+{
+    static const unsigned char sig[6] = { 0xd8,0x35, 0x60,0x80,0x54,0x00 };
+    const int n = (int)(sizeof(drv_uiscale_sites) /
+                        sizeof(drv_uiscale_sites[0]));
+    float *ref;
+    float  k;
+    int    i, ok = 0, wrote = 0;
+
+    for (i = 0; i < n; i++) {
+        const unsigned char *at = (const unsigned char *)drv_uiscale_sites[i];
+        if (DrvReadable(drv_uiscale_sites[i], 6) && memcmp(at, sig, 6) == 0)
+            ok++;
+    }
+    if (ok != n) {
+        DrvLog("drv uiscale: %d of %d sites matched -- nothing written", ok, n);
+        return 0;
+    }
+
+    k = 480.0f * (float)g_targetW / (float)g_targetH;
+    ref = DrvConst(k);
+    if (!ref) return 0;
+
+    for (i = 0; i < n; i++) {
+        unsigned char *at = (unsigned char *)drv_uiscale_sites[i];
+        unsigned char  rep[6];
+        memcpy(rep, sig, 6);
+        PutU32(rep + 2, (unsigned int)ref);
+        if (WriteCode(at, rep, 6)) wrote++;
+    }
+
+    DrvLog("drv uiscale: %d sites, divisor 640 -> %d (scale %d/1000, was %d/1000)",
+           wrote, (int)k,
+           (int)(1000.0f * (float)g_targetW / k),
+           (int)(1000.0f * (float)g_targetW / 640.0f));
+    return wrote;
+}
+
+//
+// V23.  Re-anchor the right-anchored 2D images.
+//
+// V22 made 2D image SIZES uniform (H/480) while positions still map with
+// W/640.  For a top-left-anchored image that is fine -- its origin is at the
+// left edge either way.  For a RIGHT-anchored one it is not, and the to-do
+// list showed it: the image got smaller but its left edge stayed put, so it
+// pulled away from the right edge of the screen.
+//
+// The engine expresses a right anchor in 640-space, at two sites of identical
+// shape:
+//
+//      4e7cb3  cl = [0xd82aa0 + 0xb]      the image's width, a byte
+//      4e7cbf  fld  640.0
+//      4e7cc5  fsub w
+//      4e7cc8  [ebp-0x8] = 640 - w        origin, top-right anchored
+//
+// That origin maps to `W - w*W/640`, but the image is now `w*H/480` wide, so
+// its right edge falls short of the screen by exactly `w*(W/640 - H/480)`.
+//
+// The origin has to become `640 - w*K` with
+//
+//      K = (640 * H) / (480 * W)
+//
+// because then `(640 - w*K) * W/640` is exactly `W - w*H/480`.  K is 1.0 at
+// 4:3, so both sites are an EXACT NO-OP there, and 0.5556 at 1920x800.
+//
+// Twelve bytes at each site, and the replacement needs eighteen, so each gets
+// a small stub reached by `call rel32` + nops.  Entered by CALL, so ebp is
+// untouched and the stub can read and write the same locals the original did;
+// their displacements are copied out of the site rather than hardcoded,
+// because the two sites use different ones (-0x1c/-0x8 and -0x10/-0x4).
+//
+static const unsigned int drv_ranchor_sites[2] = { 0x004e7cbfu, 0x004e811fu };
+
+static int InstallDrvRightAnchor(void)
+{
+    static const unsigned char head[6] = { 0xd9,0x05, 0x60,0x80,0x54,0x00 };
+    float *k;
+    int    i, n = 0;
+
+    k = DrvConst((640.0f * (float)g_targetH) /
+                 (480.0f * (float)g_targetW));
+    if (!k) return 0;
+
+    /* Two passes: a half-applied pair would leave one right-anchored element
+       correct and the other not, which is harder to read than neither. */
+    for (i = 0; i < 2; i++) {
+        const unsigned char *at = (const unsigned char *)drv_ranchor_sites[i];
+        if (!DrvReadable(drv_ranchor_sites[i], 12)) return 0;
+        if (memcmp(at, head, 6) != 0)    return 0;   /* fld ds:0x548060   */
+        if (at[6] != 0xd8 || at[7] != 0x65) return 0; /* fsub [ebp-disp8] */
+        if (at[9] != 0xd9 || at[10] != 0x5d) return 0;/* fstp [ebp-disp8] */
+    }
+
+    for (i = 0; i < 2; i++) {
+        unsigned char *at = (unsigned char *)drv_ranchor_sites[i];
+        unsigned char *stub;
+        unsigned char  rep[12];
+        unsigned char  src = at[8];      /* fsub's ebp disp8 */
+        unsigned char  dst = at[11];     /* fstp's ebp disp8 */
+
+        stub = (unsigned char *)VirtualAlloc(NULL, 32,
+                   MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        if (!stub) return n;
+
+        stub[0] = 0xd9; stub[1] = 0x45; stub[2] = src;      /* fld  [ebp-src] */
+        stub[3] = 0xd8; stub[4] = 0x0d;                     /* fmul ds:K      */
+        PutU32(stub + 5, (unsigned int)k);
+        stub[9] = 0xd8; stub[10] = 0x2d;                    /* fsubr ds:640.0 */
+        PutU32(stub + 11, 0x00548060u);
+        stub[15] = 0xd9; stub[16] = 0x5d; stub[17] = dst;   /* fstp [ebp-dst] */
+        stub[18] = 0xc3;                                    /* ret            */
+
+        rep[0] = 0xe8;
+        PutU32(rep + 1, (unsigned int)stub - (drv_ranchor_sites[i] + 5));
+        memset(rep + 5, 0x90, 7);
+        if (WriteCode(at, rep, sizeof(rep))) n++;
+    }
+
+    DrvLog("drv ranchor: %d sites, w scaled by %d/1000 before the 640 subtract",
+           n, (int)(1000.0f * (640.0f * (float)g_targetH) /
+                    (480.0f * (float)g_targetW) + 0.5f));
+    return n;
+}
+
+//
+// V24.  The stopwatch needle.
+//
+// Named by the corner probe once it recorded the caller's caller: every 2D
+// line goes through the shared rect mapper at 0x42683e, so depth 0 is always
+// that mapper and identifies nothing.  Depth 1 was 0x4e7c8e -- the call at
+// 0x4e7c89 -- and that routine reads in one go:
+//
+//      4e7c02  [ebp-0x4]  = 47.0        x0, the dial centre in 640-space
+//      4e7c09  [ebp-0x10] = 87.0        y0
+//      4e7c10  [ebp-0x8]  = 32.0        radius, X
+//      4e7c17  [ebp-0x14] = -32.0       radius, Y
+//      4e7c42  [ebp-0x8]  = cos[a] * 32         cos table at 0xc13400
+//      4e7c52  [ebp-0x14] = sin[a] * -32        sin table at 0xc14400
+//      4e7c62  [ebp-0x8]  += ds:0x548a98        = 47.0
+//      4e7c6e  [ebp-0x14] += ds:0x548a94        = 87.0
+//      4e7c89  call the rect mapper             draws centre -> centre+radius
+//
+// The mapper sends x through W/640 and y through H/480.  Y is therefore
+// already right -- 87 * H/480 = 145, which is where the probe found it -- and
+// only X is wrong: 47 * W/640 = 141 where the dial's centre now sits at
+// 47 * H/480 = 78.  Hence a needle pinned to the right edge of the dial.
+//
+// So every X quantity is pre-multiplied by the same factor V23 uses:
+//
+//      K = (640 * H) / (480 * W)
+//
+// because (x*K) * W/640 == x * H/480 exactly.  Three in-place, same-length
+// edits: the two immediates and the additive centre.  K is 1.0 at 4:3, so all
+// three are an EXACT NO-OP there.
+//
+// The Y immediates (87.0, -32.0) and 0x548a94 are deliberately untouched.
+//
+// 0x548a94 and 0x548a98 have exactly ONE reference each -- they are private to
+// this routine -- but the disp32 is repointed at a constant of ours rather
+// than rewriting .rdata in place, so nothing else can ever be affected by it.
+//
+#define DRV_NEEDLE_CX   0x004e7c02u     /* mov [ebp-0x4], 47.0  */
+#define DRV_NEEDLE_RX   0x004e7c10u     /* mov [ebp-0x8], 32.0  */
+#define DRV_NEEDLE_ADD  0x004e7c62u     /* fadd ds:0x548a98     */
+
+static int InstallDrvNeedle(void)
+{
+    unsigned char *cx  = (unsigned char *)DRV_NEEDLE_CX;
+    unsigned char *rx  = (unsigned char *)DRV_NEEDLE_RX;
+    unsigned char *add = (unsigned char *)DRV_NEEDLE_ADD;
+    unsigned char  rep[7];
+    float         *ref;
+    float          k;
+    int            n = 0;
+
+    if (!DrvReadable(DRV_NEEDLE_CX, 7) || !DrvReadable(DRV_NEEDLE_RX, 7) ||
+        !DrvReadable(DRV_NEEDLE_ADD, 6)) return 0;
+
+    /* verify all three are exactly what the analysis found */
+    if (cx[0] != 0xc7 || cx[1] != 0x45 || cx[2] != 0xfc ||
+        ReadU32(cx + 3) != FloatBits(47.0f))  { DrvLog("drv needle: cx moved"); return 0; }
+    if (rx[0] != 0xc7 || rx[1] != 0x45 || rx[2] != 0xf8 ||
+        ReadU32(rx + 3) != FloatBits(32.0f))  { DrvLog("drv needle: rx moved"); return 0; }
+    if (add[0] != 0xd8 || add[1] != 0x05 ||
+        ReadU32(add + 2) != 0x00548a98u)      { DrvLog("drv needle: add moved"); return 0; }
+
+    k = (640.0f * (float)g_targetH) / (480.0f * (float)g_targetW);
+
+    memcpy(rep, cx, 7);
+    PutU32(rep + 3, FloatBits(47.0f * k));
+    if (WriteCode(cx, rep, 7)) n++;
+
+    memcpy(rep, rx, 7);
+    PutU32(rep + 3, FloatBits(32.0f * k));
+    if (WriteCode(rx, rep, 7)) n++;
+
+    ref = DrvConst(47.0f * k);
+    if (ref) {
+        memcpy(rep, add, 6);
+        PutU32(rep + 2, (unsigned int)ref);
+        if (WriteCode(add, rep, 6)) n++;
+    }
+
+    DrvLog("drv needle: %d sites, x scaled by %d/1000 (centre 47 -> %d, r 32 -> %d)",
+           n, (int)(k * 1000.0f + 0.5f), (int)(47.0f * k), (int)(32.0f * k));
+    return n;
+}
+
+//
+// V25.  The strikeout x offsets.
+//
+// Each crossed-off line is drawn at `paperOrigin + record[0]`, where the
+// record comes from a 16-byte table at 0x564df0 holding
+// {x_offset, width, y0, y1} for each of the NINE list rows -- which is
+// exactly the maximum the list can show:
+//
+//      4e8108  [ebp-0x8] = 0x564df0 + index*16
+//      4e811f  [ebp-0x4] = 640 - w          the paper origin (V23)
+//      4e8161  fld  [ebp-0x4]
+//      4e8164  fadd [eax]                   + record[0]
+//
+// The paper origin is already right and the y goes through MapY, which
+// divides by 480 and is therefore uniform already.  Only the x OFFSET is
+// still in stretched units: MapX multiplies it by W/640 where the paper's
+// own content is now drawn at H/480.
+//
+// Scaling the offsets by the usual K = (640*H)/(480*W) puts them back:
+// the first row goes from (570+21)*3.0 = 1773 to (570+21*0.5556)*3.0 =
+// 1745, which is the ~27 px the marks were out by at 1920x800.
+//
+// A pure DATA patch -- no code changes -- and the table has exactly one
+// reference in .text, so nothing else can be reading it.  The widths and
+// the y fields are deliberately untouched: the strokes are already the
+// right size and the right height.
+//
+// K is 1.0 at 4:3, so this is an EXACT NO-OP there.
+//
+#define DRV_STRIKE_TAB 0x00564df0u
+#define DRV_STRIKE_N   9
+
+static int InstallDrvStrikeX(void)
+{
+    static const float want[DRV_STRIKE_N] = {
+        21.0f, 17.0f, 18.0f, 21.0f, 23.0f, 20.0f, 25.0f, 25.0f, 31.0f
+    };
+    float k;
+    int   i, n = 0;
+
+    if (!DrvReadable(DRV_STRIKE_TAB, DRV_STRIKE_N * 16)) return 0;
+
+    /* Two passes -- a partly-scaled table would stagger the rows. */
+    for (i = 0; i < DRV_STRIKE_N; i++) {
+        float v = *(const float *)(DRV_STRIKE_TAB + i * 16);
+        if (v < want[i] - 0.01f || v > want[i] + 0.01f) {
+            DrvLog("drv strikex: row %d is %d, expected %d -- skipped",
+                   i, (int)v, (int)want[i]);
+            return 0;
+        }
+    }
+
+    k = (640.0f * (float)g_targetH) / (480.0f * (float)g_targetW);
+
+    for (i = 0; i < DRV_STRIKE_N; i++) {
+        unsigned char rep[4];
+        PutU32(rep, FloatBits(want[i] * k));
+        if (WriteCode((unsigned char *)(DRV_STRIKE_TAB + i * 16), rep, 4)) n++;
+    }
+
+    DrvLog("drv strikex: %d rows, x offsets scaled by %d/1000 (21 -> %d)",
+           n, (int)(k * 1000.0f + 0.5f), (int)(21.0f * k));
+    return n;
+}
+
 static int InstallDrvDrawDistance(void)
 {
     static const struct { const unsigned int *sites; unsigned int count;
@@ -8375,7 +8742,7 @@ static void DriverApply(const char *exePath, const char *ini, BOOL haveIni)
     unsigned int   codeSize = 0, dataSize = 0;
     unsigned int   mask = DRV_P_ALL;
     int            dist = 0, text = 0, size = 0, bar = 0, res2 = 0;
-    int            frusp = 0;
+    int            frusp = 0, uiscl = 0, ranch = 0, needle = 0, strike = 0;
 
     if (!PathEndsWith(exePath, "Game.exe") &&
         !PathEndsWith(exePath, "GAME.ICD")) return;
@@ -8477,12 +8844,17 @@ static void DriverApply(const char *exePath, const char *ini, BOOL haveIni)
     if (mask & DRV_P_SIZES)  size = InstallDrvSizes(code, codeSize);
     if (mask & DRV_P_DIST)   dist = InstallDrvDrawDistance();
     if (mask & DRV_P_FRUSP)  frusp = InstallDrvFrusPlane(code, codeSize);
+    if (mask & DRV_P_UISCL)  uiscl = InstallDrvUiScale();
+    if (mask & DRV_P_RANCH)  ranch = InstallDrvRightAnchor();
+    if (mask & DRV_P_NEEDLE) needle = InstallDrvNeedle();
+    if (mask & DRV_P_STRIKE) strike = InstallDrvStrikeX();
 
     DrvLog("drv applied  target=%lux%lu enum=%lu divisor=%08lx "
-           "res2=%d text=%d bar=%d size=%d dist=%d frusp=%d",
+           "res2=%d text=%d bar=%d size=%d dist=%d frusp=%d uiscl=%d ranch=%d "
+           "needle=%d strike=%d",
            (unsigned long)g_targetW, (unsigned long)g_targetH,
            (unsigned long)g_targetRes, (unsigned long)g_drvDivisor,
-           res2, text, bar, size, dist, frusp);
+           res2, text, bar, size, dist, frusp, uiscl, ranch, needle, strike);
 
     g_drvActive     = TRUE;
     g_drvPrevFilter = SetUnhandledExceptionFilter(DrvCrashFilter);
