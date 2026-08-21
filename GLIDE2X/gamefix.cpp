@@ -7272,7 +7272,8 @@ static void MdkApply(const char *exePath, const char *ini, BOOL haveIni)
 #define DRV_P_BAR     0x40u
 #define DRV_P_SIZES   0x80u
 #define DRV_P_DIST    0x100u
-#define DRV_P_ALL     0x1ffu
+#define DRV_P_FRUSP   0x200u
+#define DRV_P_ALL     0x3ffu
 
 //
 // Signatures are byte arrays rather than string literals on purpose: two
@@ -7429,7 +7430,29 @@ static const unsigned char drv_proj_sig[] = {
 
 static BOOL         g_drvActive   = FALSE;
 static unsigned int g_drvVirtualH = 480;
-static unsigned int g_drvDrawPct  = 0;
+//
+// V21's overdraw, in percent.  100 = the side clip planes sit exactly on the
+// screen edge, which is correct in principle and still leaves a visible seam:
+// the engine culls tightly, so a polygon whose plane test fails by a hair is
+// dropped even though part of it belongs on screen.
+//
+// Not an ini key.  It is not a preference -- nobody wants the seam -- and per
+// the project's own rule a confirmed correctness fix becomes unconditional.
+// Change it here if a future resolution ever needs more.
+//
+static const unsigned int g_drvFrusMargin = 110;
+
+//
+// V6's Viewing Distance knob, a percent of the game's own 45000 maximum.
+// Permanently 0 = "leave the game's setting alone", and no longer an ini
+// key: it was only ever a diagnostic, and a knob that writes a value the
+// game PERSISTS into CONFIG.DAT can outlive the build that set it.
+//
+// The CEILING in DrvTick is unaffected and still applies unconditionally --
+// that half is a correctness limit, not a preference.
+//
+static const unsigned int g_drvDrawPct = 0;
+
 static unsigned int g_drvDivisor  = DRV_REF_480;   /* where the fdiv points */
 static float        g_drvDrawTgt  = 0.0f;          /* V6's target, 0 = off   */
 static int          g_drvDrawHeld = 0;             /* times it was re-armed  */
@@ -8075,6 +8098,112 @@ static int InstallDrvRes2(unsigned char *code, unsigned int codeSize)
 // tests the VIEW distance against the 42000 constant, so leaving that one lower
 // would pull the view distance back down the moment a race started.
 //
+//
+// V21.  The left/right view-frustum clip planes.
+//
+// THIS IS THE FIX for "surfaces missing at the screen edges with the skybox
+// showing through".  Confirmed on hardware.
+//
+// Driver builds its side clip planes from a hardcoded 4:3 aspect.  Two sites
+// have the identical shape:
+//
+//      0x12733a0 = <aspect>            <- 0.75, i.e. 480/640
+//      0x1288924 = <y>
+//      fld <aspect> ; fchs             ; -aspect
+//      fld <y>      ; fchs
+//      lea edx,[ebp-0x10] ; call 0x4019a1     ; normalise a 3-vector
+//      -> 0x1288950 / 0x1288954 / 0x1288958   ; middle component is 0
+//
+// Two normalised vectors of the form (+/-aspect, 0, -y).  A zero Y component
+// makes them VERTICAL planes: the left and right edges of the view frustum.
+//
+// Widening the projection -- by V4, by V15, or by rewriting the shared 640.0
+// the way AuToMaNiAk005's fix does -- moves the picture wider and leaves these
+// two planes at 4:3.  Everything outside the old frustum is then clipped, and
+// it gets worse the further you widen.  It is a CLIP, not a cull, which is why
+// it scaled smoothly with field of view instead of switching on at a
+// threshold, and why it shows on the Direct3D renderer too.
+//
+// The correction is to divide the aspect by the same factor the projection was
+// widened by:
+//
+//      F     = (W * virtual_height) / (640 * H)      the widening factor
+//      value = 0.75 / F = 480 * H / (W * virtual_height)
+//
+// 0.75 at the AUTO default, so this is an EXACT NO-OP at 4:3 and whenever the
+// view is not widened; H/W at virtual_height=480.  It is correct for any
+// virtual_height because it is derived from the same factor the projection
+// uses, and it does not care whether the widening came from V4 or V15.
+//
+// WHY THIS TOOK SO LONG TO FIND, worth recording:
+//
+// In OUR build the aspect is read from 0xc14b6c, which is past the end of raw
+// .data -- BSS, written at run time through some pointer, so a search for
+// direct writes finds none.  In the 1999-11-18 build the compiler folded the
+// same value to a literal in .rdata.  When the two binaries were compared
+// instruction by instruction, every address was normalised away first, so
+//
+//      mov eax,ds:0x547064      (his)
+//      mov eax,ds:0xc14b6c      (ours)
+//
+// compared EQUAL, and four rounds of comparison concluded "identical program".
+// The lesson is narrow and worth keeping: normalising operands to compare code
+// across builds hides exactly the class of difference that matters when the
+// bug IS an operand.  Compare shapes to find candidates, then compare the
+// operands of the candidates.
+//
+// The base 0.75 is taken from the other build rather than read from 0xc14b6c,
+// because that global is still zero when grGlideInit runs.
+//
+static const unsigned char drv_frusplane_sig[5] = {
+    0xa1, 0x6c, 0x4b, 0xc1, 0x00        /* mov eax, ds:0xc14b6c */
+};
+#define DRV_FRUSPLANE_DISP 1
+#define DRV_FRUSPLANE_N    2            /* exactly two, and that is the check */
+
+static int InstallDrvFrusPlane(unsigned char *code, unsigned int codeSize)
+{
+    unsigned char rep[5];
+    float        *ref;
+    float         value, widen;
+    unsigned int  margin;
+
+    value = (480.0f * (float)g_targetH) /
+            ((float)g_targetW * (float)g_drvVirtualH);
+
+    //
+    // The margin.  Exactly matching the frustum to the screen is correct in
+    // principle and still visible in practice: the engine culls tightly, so a
+    // polygon whose plane test fails by a hair is dropped even though part of
+    // it belongs on screen.  Pushing the side planes out a few percent draws a
+    // little outside the viewport and moves the seam off the edge.
+    //
+    // Applied ONLY when the view is actually widened.  At 4:3, and at
+    // virtual_height=0, the aspect stays exactly 0.75 so the patch keeps its
+    // exact-no-op property and cannot be blamed for anything there.
+    //
+    widen  = 0.75f / value;
+    /* 1.01, not 1.001: AUTO rounds virtual_height to a whole number, which
+       leaves a 0.1%% residue -- that must still count as "not widened". */
+    margin = (widen > 1.01f) ? g_drvFrusMargin : 100u;
+    if (margin > 100u) value = value * 100.0f / (float)margin;
+
+    ref = DrvConst(value);
+    if (!ref) return 0;
+
+    memcpy(rep, drv_frusplane_sig, sizeof(drv_frusplane_sig));
+    PutU32(rep + DRV_FRUSPLANE_DISP, (unsigned int)ref);
+
+    DrvLog("drv frusplane: aspect 0.750 -> %d/1000 (widening %d/1000, "
+           "margin %u%%)",
+           (int)(value * 1000.0f + 0.5f),
+           (int)(0.75f / value * 1000.0f + 0.5f), margin);
+
+    return DrvPatchAll(code, codeSize, drv_frusplane_sig,
+                       sizeof(drv_frusplane_sig), DRV_FRUSPLANE_N,
+                       0, rep, sizeof(rep), "frusplane");
+}
+
 static int InstallDrvDrawDistance(void)
 {
     static const struct { const unsigned int *sites; unsigned int count;
@@ -8246,6 +8375,7 @@ static void DriverApply(const char *exePath, const char *ini, BOOL haveIni)
     unsigned int   codeSize = 0, dataSize = 0;
     unsigned int   mask = DRV_P_ALL;
     int            dist = 0, text = 0, size = 0, bar = 0, res2 = 0;
+    int            frusp = 0;
 
     if (!PathEndsWith(exePath, "Game.exe") &&
         !PathEndsWith(exePath, "GAME.ICD")) return;
@@ -8267,66 +8397,49 @@ static void DriverApply(const char *exePath, const char *ini, BOOL haveIni)
         mask = (unsigned int)GetPrivateProfileIntA("DRIVER", "patches",
                                                    (int)DRV_P_ALL, ini);
         //
-        // 0 = AUTO, and it is the default because it is the only setting the
-        // engine actually supports.
+        // 480 = true Hor+, and it is now the default: the full vertical view
+        // plus extra world at the sides.  That is the point of the exercise.
         //
-        // `640*H/W` makes the world scale come out at exactly `W/640` -- the
-        // value the game computes for itself -- so the horizontal field of view
-        // is the stock 39.8 degrees each side and the projection patch, the
-        // focal patch and the frustum widening all become exact no-ops.
+        // It was 0 (AUTO / Vert-) for a long time because widening the view
+        // made distant geometry vanish at the screen edges.  V21 is the cause:
+        // the engine builds its left/right frustum clip planes from a
+        // hardcoded 4:3 aspect, so a wider projection was clipped back to the
+        // 4:3 frustum.  With that corrected the artefact is gone and there is
+        // no reason to ship the narrower view.
         //
-        // That is what AuToMaNiAk005's DriverWidescreenFix does: its entire
-        // patch is nine integers of resolution plumbing and no projection maths
-        // at all.  It renders Vert- -- the same width of world as 4:3, less
-        // height -- and it is artefact-free precisely because it never asks the
-        // engine for a wider view than it was built for.
-        //
-        // Anything wider than that produces the horizon streaking, and after a
-        // dozen builds I could not find what breaks.  Setting virtual_height
-        // explicitly still widens the view for anyone who prefers it with the
-        // artefacts; 480 is true Hor+.
+        // 0 still means AUTO -- `640*H/W`, which makes the world scale come out
+        // at exactly `W/640`, the value the game computes for itself.  Every
+        // patch here is then an exact no-op and the picture is Vert-, the same
+        // width of world as 4:3 with less height.  Kept as a fallback and as a
+        // one-line bisect: if something ever looks wrong at the edges again,
+        // virtual_height=0 says immediately whether it is the widened view.
         //
         g_drvVirtualH = (unsigned int)GetPrivateProfileIntA("DRIVER",
-                                                      "virtual_height", 0, ini);
+                                                    "virtual_height", 480, ini);
         if (g_drvVirtualH == 0 && g_targetW)
             g_drvVirtualH = (640u * g_targetH + g_targetW / 2) / g_targetW;
         if (g_drvVirtualH < 120)  g_drvVirtualH = 120;
         if (g_drvVirtualH > 8192) g_drvVirtualH = 8192;
 
-        /* 0 = leave the game's own setting alone; otherwise a percent of its
-           maximum, 45000.  Anything between is clamped up to 50 rather than
-           silently reducing the draw distance. */
-        g_drvDrawPct = (unsigned int)GetPrivateProfileIntA("DRIVER",
-                                                       "draw_distance", 0, ini);
-        if (g_drvDrawPct && g_drvDrawPct < 50) g_drvDrawPct = 50;
-
         //
-        // HARD CAP, and it is the whole reason the "culling" existed.
-        //
-        // The projection is `screenX = camX * focal * recip[z] + W/2`, and
-        // `recip` is a TABLE at 0xc24520, built at 0x528277 for indices
-        // 0..0xdbba-1 -- z up to **56249** and no further.  A vertex past that
-        // reads off the end of the array, so its reciprocal is garbage and the
-        // polygon streaks toward a vanishing point or vanishes.
-        //
-        // That is exactly what the screenshots showed -- long horizontal smears
-        // and thin black wedges at the horizon and the screen edges -- which
-        // read as "culling" and sent four builds after the visibility table.
-        // The game's own maximum of 45000 is not arbitrary: it is this table's
-        // capacity with margin, and draw_distance=200 put the far clip at
-        // 90000, 60% past the end.
+        // The reciprocal table is why the ceiling in DrvTick exists.  The
+        // projection is `screenX = camX * focal * recip[z] + W/2`, and `recip`
+        // is a TABLE at 0xc24520, built at 0x528277 for indices 0..0xdbba-1 --
+        // z up to 56249 and no further.  A vertex past that reads off the end
+        // of the array, so its reciprocal is garbage and the polygon streaks
+        // toward a vanishing point.  The game's own 45000 maximum is that
+        // table's capacity with margin.
         //
         // The array cannot simply grow: 0xc24520 + 0xdbba*4 = 0xc5b3e8 and the
         // next referenced global is 0xc5b408, so there are 32 spare bytes.
         // Relocating it is Ignition-F1-shaped work (345 references) for 25%
-        // more distance, so the knob is capped instead.
+        // more distance.
         //
-        if (g_drvDrawPct > DRV_DRAW_MAX_PCT) {
-            DrvLog("drv dist: %lu%% would put the far clip past the reciprocal "
-                   "table (z limit 56249) -- capped to %d%%",
-                   (unsigned long)g_drvDrawPct, DRV_DRAW_MAX_PCT);
-            g_drvDrawPct = DRV_DRAW_MAX_PCT;
-        }
+        // NOTE: this is NOT what made surfaces vanish at the screen edges.
+        // That was V21, the 4:3 frustum clip planes.  The streaking this
+        // paragraph describes is a different artefact, and reading one as the
+        // other cost four builds.
+        //
     }
 
     // The enum has to fit a `push imm8`; every enum in the wide driver's list
@@ -8363,12 +8476,13 @@ static void DriverApply(const char *exePath, const char *ini, BOOL haveIni)
     if (mask & DRV_P_BAR)    bar  = InstallDrvBarScale(code, codeSize);
     if (mask & DRV_P_SIZES)  size = InstallDrvSizes(code, codeSize);
     if (mask & DRV_P_DIST)   dist = InstallDrvDrawDistance();
+    if (mask & DRV_P_FRUSP)  frusp = InstallDrvFrusPlane(code, codeSize);
 
     DrvLog("drv applied  target=%lux%lu enum=%lu divisor=%08lx "
-           "res2=%d text=%d bar=%d size=%d dist=%d",
+           "res2=%d text=%d bar=%d size=%d dist=%d frusp=%d",
            (unsigned long)g_targetW, (unsigned long)g_targetH,
            (unsigned long)g_targetRes, (unsigned long)g_drvDivisor,
-           res2, text, bar, size, dist);
+           res2, text, bar, size, dist, frusp);
 
     g_drvActive     = TRUE;
     g_drvPrevFilter = SetUnhandledExceptionFilter(DrvCrashFilter);
