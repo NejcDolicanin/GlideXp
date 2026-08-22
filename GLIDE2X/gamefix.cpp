@@ -6959,8 +6959,8 @@ static void DrvTick(void);
 
 void GameFix_Tick(void)
 {
-    /* TEMPORARY -- Driver's per-frame status line.  Inert for every other
-       game, and inert for Driver until DriverApply has run. */
+    /* V6's viewing-distance ceiling.  Inert for every other game, and inert
+       for Driver until DriverApply has run. */
     DrvTick();
 
     // K9.  Called from the wrapper's grBufferSwap AFTER the swap, so this
@@ -7259,11 +7259,17 @@ static void MdkApply(const char *exePath, const char *ini, BOOL haveIni)
 
 /* Their ceilings, in .rdata: 45000.0f and 42000.0f.  NOT patched in place --
    45000.0f alone has 29 references and only five of them are this. */
-#define DRV_VIEWMAX_C 0x00548030u
-#define DRV_DISTMAX_C 0x00548028u
 
-/* One bit per installer, in install order, so a hardware session can bisect
-   without a rebuild.  Scaffolding -- it leaves with the diagnostic. */
+
+
+/* One bit per installer, in install order.  `mask` is a constant, so the
+   compiler folds every test away and these cost nothing; they are kept so a
+   future bisect is a one-line edit rather than a redesign.
+
+   0x100 is retired (V6's draw_distance installer, deleted -- only its
+   ceiling survives, unconditionally, in DrvTick).  The gap is deliberate:
+   renumbering would invalidate every bit value recorded in CLAUDE.md and in
+   the shipped README. */
 #define DRV_P_MODES   0x01u
 #define DRV_P_ENUM    0x02u
 #define DRV_P_CONFIG  0x04u
@@ -7272,7 +7278,6 @@ static void MdkApply(const char *exePath, const char *ini, BOOL haveIni)
 #define DRV_P_TEXT    0x20u
 #define DRV_P_BAR     0x40u
 #define DRV_P_SIZES   0x80u
-#define DRV_P_DIST    0x100u
 #define DRV_P_FRUSP   0x200u
 #define DRV_P_UISCL   0x400u
 #define DRV_P_RANCH   0x800u
@@ -7312,26 +7317,6 @@ static const unsigned char drv_arm1600_sig[] = {
     0x6a,0x0e, 0x8b,0x55,0x08, 0x52, 0xe8
 };
 #define DRV_ARM1600_CALL 18
-
-/* V6.  Every instruction that loads one of the two viewing-distance ceilings
-   AS a ceiling.  Listed by address rather than by signature because the
-   constants are shared: `fld`/`fcomp ds:0x548030` occurs 29 times and only
-   these five are the setting.  Each is verified byte-for-byte before it is
-   written, so a wrong address is a no-op rather than corruption. */
-static const unsigned int drv_viewmax_sites[] = {
-    0x0040976bu,   /* clamp, upper branch                     */
-    0x004097a9u,   /* clamp, lower branch                     */
-    0x00409ccau,   /* menu "increase" ceiling test            */
-    0x004b7253u,   /* the settings slider bar's length        */
-    0x004d917du    /* the keyboard "increase" handler         */
-};
-static const unsigned int drv_distmax_sites[] = {
-    0x004097ddu, 0x0040981bu, 0x00409d3cu,   /* mirror, menu   */
-    0x004d9215u,                             /* mirror, keys   */
-    0x00511c5cu, 0x00511c99u,                /* view, in-race  */
-    0x00511cccu, 0x00511d0au,                /* mirror,in-race */
-    0x005122bbu, 0x0051232du                 /* in-race steps  */
-};
 
 /* V8.  The text drawers' `SetGlyphScale(sx*zoom, sy*zoom)`.  sy is loaded
    from [ebp-0xc] and sx from [ebp-0x4]; changing the second load's
@@ -7452,78 +7437,8 @@ static const unsigned int g_drvFrusMargin = 110;
 // The CEILING in DrvTick is unaffected and still applies unconditionally --
 // that half is a correctness limit, not a preference.
 //
-static const unsigned int g_drvDrawPct = 0;
 
 static unsigned int g_drvDivisor  = DRV_REF_480;   /* where the fdiv points */
-static float        g_drvDrawTgt  = 0.0f;          /* V6's target, 0 = off   */
-static int          g_drvDrawHeld = 0;             /* times it was re-armed  */
-static char         g_drvLogPath[MAX_PATH];
-static BOOL         g_drvLogged   = FALSE;
-static LPTOP_LEVEL_EXCEPTION_FILTER g_drvPrevFilter = NULL;
-
-//
-// TEMPORARY diagnostic.  Appends one line to gxp_driver.txt beside the exe.
-//
-// Opened and closed per line rather than held: the file then survives a crash
-// or a kill, which is the whole reason it exists.  Lines are few and only
-// written on change, so the cost does not matter.
-//
-static void DrvLog(const char *fmt, ...)
-{
-    char    line[1024];
-    va_list ap;
-    HANDLE  h;
-    DWORD   done;
-    int     n;
-
-    if (!g_drvLogPath[0]) return;
-
-    va_start(ap, fmt);
-    n = wvsprintfA(line, fmt, ap);
-    va_end(ap);
-    if (n < 0 || n > 1000) return;
-    line[n]     = '\r';
-    line[n + 1] = '\n';
-
-    h = CreateFileA(g_drvLogPath, GENERIC_WRITE, FILE_SHARE_READ, NULL,
-                    g_drvLogged ? OPEN_ALWAYS : CREATE_ALWAYS,
-                    FILE_ATTRIBUTE_NORMAL, NULL);
-    if (h == INVALID_HANDLE_VALUE) return;
-
-    g_drvLogged = TRUE;
-    SetFilePointer(h, 0, NULL, FILE_END);
-    WriteFile(h, line, (DWORD)(n + 2), &done, NULL);
-    CloseHandle(h);
-}
-
-//
-// Report a fault three ways, because each names a different culprit: as an RVA
-// into Game.exe (which routine), raw (so an address outside the image is
-// obvious at a glance), and with the register set.  Chained, and returns
-// CONTINUE_SEARCH so Windows still shows its own dialog.
-//
-static LONG WINAPI DrvCrashFilter(EXCEPTION_POINTERS *ep)
-{
-    if (ep && ep->ExceptionRecord && ep->ContextRecord) {
-        unsigned int at = (unsigned int)ep->ExceptionRecord->ExceptionAddress;
-
-        DrvLog("CRASH code=%08lx at=%08lx exe+%08lx",
-               (unsigned long)ep->ExceptionRecord->ExceptionCode,
-               (unsigned long)at, (unsigned long)(at - 0x00400000u));
-        DrvLog("      eax=%08lx ebx=%08lx ecx=%08lx edx=%08lx",
-               (unsigned long)ep->ContextRecord->Eax,
-               (unsigned long)ep->ContextRecord->Ebx,
-               (unsigned long)ep->ContextRecord->Ecx,
-               (unsigned long)ep->ContextRecord->Edx);
-        DrvLog("      esi=%08lx edi=%08lx ebp=%08lx esp=%08lx",
-               (unsigned long)ep->ContextRecord->Esi,
-               (unsigned long)ep->ContextRecord->Edi,
-               (unsigned long)ep->ContextRecord->Ebp,
-               (unsigned long)ep->ContextRecord->Esp);
-    }
-    if (g_drvPrevFilter) return g_drvPrevFilter(ep);
-    return EXCEPTION_CONTINUE_SEARCH;
-}
 
 /* Is this address inside the main image's committed range?  Cheap sanity for
    the fixed .data/.bss addresses used below. */
@@ -7634,7 +7549,6 @@ static BOOL InstallDrvModeRow(unsigned char *data, unsigned int dataSize)
         if (ReadU32((const unsigned char *)at)      != drv_modes[i].w ||
             ReadU32((const unsigned char *)at + 4)  != drv_modes[i].h ||
             ReadU32((const unsigned char *)at + 24) != drv_modes[i].glideEnum) {
-            DrvLog("drv modes: row %d is not stock -- table left alone", i);
             return FALSE;
         }
     }
@@ -7656,9 +7570,6 @@ static BOOL InstallDrvModeRow(unsigned char *data, unsigned int dataSize)
         if (WriteCode(at, rep, DRV_MODE_STRIDE)) wrote++;
     }
 
-    DrvLog("drv modes: %d of %d rows -> %lux%lu enum=%lu", wrote, DRV_MODE_N,
-           (unsigned long)g_targetW, (unsigned long)g_targetH,
-           (unsigned long)g_targetRes);
     return wrote == DRV_MODE_N;
 }
 
@@ -7690,10 +7601,10 @@ static BOOL InstallDrvEnum(unsigned char *code, unsigned int codeSize)
 
     tail = FindUnique(code, codeSize, drv_enumtail_sig,
                       sizeof(drv_enumtail_sig));
-    if (!tail) { DrvLog("drv enum: chain tail missing"); return FALSE; }
+    if (!tail) {  return FALSE; }
 
     arm = FindUnique(code, codeSize, drv_arm1600_sig, sizeof(drv_arm1600_sig));
-    if (!arm) { DrvLog("drv enum: arm missing"); return FALSE; }
+    if (!arm) {  return FALSE; }
 
     // Both targets are read back out of the very instructions being displaced,
     // so they cannot disagree with what is really there (part one, section 5b).
@@ -7703,7 +7614,7 @@ static BOOL InstallDrvEnum(unsigned char *code, unsigned int codeSize)
 
     stub = (unsigned char *)VirtualAlloc(NULL, 64, MEM_COMMIT | MEM_RESERVE,
                                          PAGE_EXECUTE_READWRITE);
-    if (!stub) { DrvLog("drv enum: stub alloc failed"); return FALSE; }
+    if (!stub) {  return FALSE; }
     s = (unsigned int)stub;
 
     stub[0] = 0x81; stub[1] = 0x7d; stub[2] = 0xf4;   /* cmp [ebp-0xc], W */
@@ -7726,9 +7637,6 @@ static BOOL InstallDrvEnum(unsigned char *code, unsigned int codeSize)
     rep[DRV_ENUMTAIL_JMP] = 0xe9;
     PutU32(rep + DRV_ENUMTAIL_JMP + 1, s - (jmpAt + 5));
 
-    DrvLog("drv enum stub=%08lx fail=%08lx call=%08lx",
-           (unsigned long)s, (unsigned long)failTarget,
-           (unsigned long)callTarget);
 
     return WriteCode(tail, rep, sizeof(drv_enumtail_sig));
 }
@@ -7758,12 +7666,9 @@ static BOOL InstallDrvConfig(void)
         if (w == drv_modes[i].w && h == drv_modes[i].h) {
             *(volatile unsigned int *)DRV_CFG_W = g_targetW;
             *(volatile unsigned int *)DRV_CFG_H = g_targetH;
-            DrvLog("drv config: latched %ux%u -> %lux%lu", w, h,
-                   (unsigned long)g_targetW, (unsigned long)g_targetH);
             return TRUE;
         }
 
-    DrvLog("drv config: latched %ux%u is not a stock mode -- left alone", w, h);
     return FALSE;
 }
 
@@ -7779,7 +7684,7 @@ static BOOL InstallDrvProjection(unsigned char *at)
 {
     unsigned char rep[18];
 
-    if (!at) { DrvLog("drv proj: site missing"); return FALSE; }
+    if (!at) {  return FALSE; }
 
     g_drvDivisor = DRV_REF_480;
     if (g_drvVirtualH != 480) {
@@ -7819,7 +7724,6 @@ static int DrvPatchAll(unsigned char *code, unsigned int codeSize,
         if (memcmp(code + i, sig, len) == 0) n++;
 
     if (n != expected) {
-        DrvLog("drv %s: %d sites, expected %d -- skipped", what, n, expected);
         return 0;
     }
 
@@ -7890,13 +7794,11 @@ static int InstallDrvSizes(unsigned char *code, unsigned int codeSize)
         float             *ref;
 
         at = FindUnique(code, codeSize, s->sig, s->len);
-        if (!at) { DrvLog("drv size %s: no unique match", s->what); continue; }
+        if (!at) {  continue; }
 
         konst = ReadU32(at + s->at);
         if (!DrvReadable(konst, 4) ||
             *(volatile float *)konst != s->expect) {
-            DrvLog("drv size %s: constant at %08lx is not %d/1000 -- skipped",
-                   s->what, (unsigned long)konst, (int)(s->expect * 1000.0f));
             continue;
         }
 
@@ -7906,8 +7808,6 @@ static int InstallDrvSizes(unsigned char *code, unsigned int codeSize)
         PutU32(rep, (unsigned int)ref);
         if (WriteCode(at + s->at, rep, 4)) {
             n++;
-            DrvLog("drv size %s: %d/1000 -> %d/1000", s->what,
-                   (int)(s->expect * 1000.0f), (int)(s->expect * ar * 1000.0f));
         }
     }
     return n;
@@ -7973,7 +7873,7 @@ static int InstallDrvSizes(unsigned char *code, unsigned int codeSize)
 
 /* The reciprocal table at 0xc24520 covers z in [0, 56249].  45000 * 124% is
    55800, the most the far clip can be without indexing off the end of it. */
-#define DRV_DRAW_MAX_PCT 124
+
 #define DRV_DRAW_MAX_Z   55800.0f
 
 static unsigned char *g_drvFrustum = NULL;   /* our generated copy */
@@ -8093,7 +7993,6 @@ static int InstallDrvRes2(unsigned char *code, unsigned int codeSize)
         if (memcmp(at, head1, 3) != 0 || memcmp(at + 7, head2, 3) != 0 ||
             ReadU32(at + 3)  != drv_modes[i].w ||
             ReadU32(at + 10) != drv_modes[i].h) {
-            DrvLog("drv res2: arm %d is not stock -- none written", i);
             return 0;
         }
     }
@@ -8108,8 +8007,6 @@ static int InstallDrvRes2(unsigned char *code, unsigned int codeSize)
         PutU32(rep + 10, g_targetH);
         if (WriteCode(at, rep, 14)) n++;
     }
-    DrvLog("drv res2: %d of %d arms -> %lux%lu", n, DRV_MODE_N,
-           (unsigned long)g_targetW, (unsigned long)g_targetH);
     return n;
 }
 
@@ -8278,10 +8175,6 @@ static int InstallDrvFrusPlane(unsigned char *code, unsigned int codeSize)
     memcpy(rep, drv_frusplane_sig, sizeof(drv_frusplane_sig));
     PutU32(rep + DRV_FRUSPLANE_DISP, (unsigned int)ref);
 
-    DrvLog("drv frusplane: aspect 0.750 -> %d/1000 (widening %d/1000, "
-           "margin %u%%)",
-           (int)(value * 1000.0f + 0.5f),
-           (int)(0.75f / value * 1000.0f + 0.5f), margin);
 
     return DrvPatchAll(code, codeSize, drv_frusplane_sig,
                        sizeof(drv_frusplane_sig), DRV_FRUSPLANE_N,
@@ -8393,7 +8286,6 @@ static int InstallDrvUiScale(void)
             ok++;
     }
     if (ok != n) {
-        DrvLog("drv uiscale: %d of %d sites matched -- nothing written", ok, n);
         return 0;
     }
 
@@ -8409,10 +8301,6 @@ static int InstallDrvUiScale(void)
         if (WriteCode(at, rep, 6)) wrote++;
     }
 
-    DrvLog("drv uiscale: %d sites, divisor 640 -> %d (scale %d/1000, was %d/1000)",
-           wrote, (int)k,
-           (int)(1000.0f * (float)g_targetW / k),
-           (int)(1000.0f * (float)g_targetW / 640.0f));
     return wrote;
 }
 
@@ -8496,9 +8384,6 @@ static int InstallDrvRightAnchor(void)
         if (WriteCode(at, rep, sizeof(rep))) n++;
     }
 
-    DrvLog("drv ranchor: %d sites, w scaled by %d/1000 before the 640 subtract",
-           n, (int)(1000.0f * (640.0f * (float)g_targetH) /
-                    (480.0f * (float)g_targetW) + 0.5f));
     return n;
 }
 
@@ -8558,11 +8443,11 @@ static int InstallDrvNeedle(void)
 
     /* verify all three are exactly what the analysis found */
     if (cx[0] != 0xc7 || cx[1] != 0x45 || cx[2] != 0xfc ||
-        ReadU32(cx + 3) != FloatBits(47.0f))  { DrvLog("drv needle: cx moved"); return 0; }
+        ReadU32(cx + 3) != FloatBits(47.0f))  {  return 0; }
     if (rx[0] != 0xc7 || rx[1] != 0x45 || rx[2] != 0xf8 ||
-        ReadU32(rx + 3) != FloatBits(32.0f))  { DrvLog("drv needle: rx moved"); return 0; }
+        ReadU32(rx + 3) != FloatBits(32.0f))  {  return 0; }
     if (add[0] != 0xd8 || add[1] != 0x05 ||
-        ReadU32(add + 2) != 0x00548a98u)      { DrvLog("drv needle: add moved"); return 0; }
+        ReadU32(add + 2) != 0x00548a98u)      {  return 0; }
 
     k = (640.0f * (float)g_targetH) / (480.0f * (float)g_targetW);
 
@@ -8581,8 +8466,6 @@ static int InstallDrvNeedle(void)
         if (WriteCode(add, rep, 6)) n++;
     }
 
-    DrvLog("drv needle: %d sites, x scaled by %d/1000 (centre 47 -> %d, r 32 -> %d)",
-           n, (int)(k * 1000.0f + 0.5f), (int)(47.0f * k), (int)(32.0f * k));
     return n;
 }
 
@@ -8632,8 +8515,6 @@ static int InstallDrvStrikeX(void)
     for (i = 0; i < DRV_STRIKE_N; i++) {
         float v = *(const float *)(DRV_STRIKE_TAB + i * 16);
         if (v < want[i] - 0.01f || v > want[i] + 0.01f) {
-            DrvLog("drv strikex: row %d is %d, expected %d -- skipped",
-                   i, (int)v, (int)want[i]);
             return 0;
         }
     }
@@ -8646,8 +8527,6 @@ static int InstallDrvStrikeX(void)
         if (WriteCode((unsigned char *)(DRV_STRIKE_TAB + i * 16), rep, 4)) n++;
     }
 
-    DrvLog("drv strikex: %d rows, x offsets scaled by %d/1000 (21 -> %d)",
-           n, (int)(k * 1000.0f + 0.5f), (int)(21.0f * k));
     return n;
 }
 
@@ -9000,12 +8879,10 @@ static int InstallDrvMenu(void)
 
     if (!DrvReadable(DRV_FE_SET16, 10) || !DrvReadable(DRV_FE_SET32, 10) ||
         memcmp(s16, head, 6) != 0 || memcmp(s32, head, 6) != 0) {
-        DrvLog("drv menu: blit-pointer sites not as expected -- nothing written");
         return 0;
     }
     if (ReadU32(s16 + 6) != DRV_FE_ORIG16 ||
         ReadU32(s32 + 6) != DRV_FE_ORIG32) {
-        DrvLog("drv menu: already patched, or a different build -- skipped");
         return 0;
     }
 
@@ -9015,7 +8892,6 @@ static int InstallDrvMenu(void)
     // install a slower copy of it.
     //
     if (!DrvFeBand()) {
-        DrvLog("drv menu: band is 640x480 at the origin -- left alone");
         return 0;
     }
 
@@ -9029,10 +8905,6 @@ static int InstallDrvMenu(void)
         if (!WriteCode(s32 + 6, rep, 4)) return 0;
     }
 
-    DrvLog("drv menu: 640x480 -> %dx%d at %d,%d (scale %d/1000) blit=%08lx",
-           g_drvFeW, g_drvFeH, g_drvFeX0, g_drvFeY0,
-           (g_drvFeW * 1000) / DRV_FE_SRC_W,
-           (unsigned long)(unsigned int)(void *)DrvFrontEndBlit);
     return 1;
 }
 
@@ -9190,7 +9062,6 @@ static int InstallDrvLoad(void)
     int i, clips = 0;
 
     if (!DrvFeBand()) {
-        DrvLog("drv load: band is 640x480 at the origin -- left alone");
         return 0;
     }
 
@@ -9224,7 +9095,6 @@ static int InstallDrvLoad(void)
     if (!DrvReadable(DRV_LS_QUAD, DRV_LS_QUAD_LEN)) return 0;
     if (at[0] != 0xdb || at[1] != 0x45 || at[2] != 0x08 ||
         at[3] != 0xd9 || at[4] != 0x9d) {
-        DrvLog("drv load: quad site not as expected -- clips=%d, no hook", clips);
         return 0;
     }
     memcpy(displaced, at, DRV_LS_QUAD_LEN);
@@ -9248,9 +9118,6 @@ static int InstallDrvLoad(void)
     memset(rep + 5, 0x90, DRV_LS_QUAD_LEN - 5);
     if (!WriteCode(at, rep, DRV_LS_QUAD_LEN)) return 0;
 
-    DrvLog("drv load: clips=%d stub=%08lx  640x480 -> %dx%d at %d,%d",
-           clips, (unsigned long)(unsigned int)stub,
-           g_drvFeW, g_drvFeH, g_drvFeX0, g_drvFeY0);
     return 1;
 }
 
@@ -9292,13 +9159,12 @@ static int InstallDrvButton(unsigned char *code, unsigned int codeSize)
                                    sizeof(drv_btnw_sig));
     unsigned char  rep[sizeof(drv_btnw_sig)];
 
-    if (!at) { DrvLog("drv button: no unique match"); return 0; }
+    if (!at) {  return 0; }
 
     memcpy(rep, drv_btnw_sig, sizeof(rep));
     rep[DRV_BTNW_SLOT] = 0x3c;           /* [ebp-0xc0] -> [ebp-0xc4] */
     if (!WriteCode(at, rep, sizeof(rep))) return 0;
 
-    DrvLog("drv button: width now from H/480 -- 45-unit sprite is round again");
     return 1;
 }
 
@@ -9363,7 +9229,6 @@ static int InstallDrvTimer(void)
     if (!DrvReadable(DRV_MEAS_THUNK, 5)) return 0;
     if (th[0] != 0xe9 ||
         (unsigned int)(DRV_MEAS_THUNK + 5 + (int)ReadU32(th + 1)) != DRV_MEAS_FUNC) {
-        DrvLog("drv timer: measure thunk is not as expected -- skipped");
         return 0;
     }
 
@@ -9393,10 +9258,6 @@ static int InstallDrvTimer(void)
     PutU32(rep + 1, (unsigned int)stub - (DRV_MEAS_THUNK + 5));
     if (!WriteCode(th, rep, 5)) return 0;
 
-    DrvLog("drv timer: advance scaled by %d/1000, stub=%08lx",
-           (int)(1000.0f * (640.0f * (float)g_targetH) /
-                 (480.0f * (float)g_targetW) + 0.5f),
-           (unsigned long)(unsigned int)stub);
     return 1;
 }
 
@@ -9559,7 +9420,7 @@ static int InstallDrvFlare(unsigned char *code, unsigned int codeSize)
     radius = (640u * g_targetH + g_drvVirtualH / 2u) / g_drvVirtualH;
 
     at = FindUnique(code, codeSize, drv_flare_sig, sizeof(drv_flare_sig));
-    if (!at) { DrvLog("drv flare: no unique match -- skipped"); return 0; }
+    if (!at) {  return 0; }
 
     r = DrvConstI(radius);
     if (!r) return 0;
@@ -9568,124 +9429,35 @@ static int InstallDrvFlare(unsigned char *code, unsigned int codeSize)
     PutU32(rep + DRV_FLARE_SLOT, (unsigned int)r);
     if (!WriteCode(at, rep, sizeof(rep))) return 0;
 
-    DrvLog("drv flare: falloff radius %lu -> %lu px (640 * %lu / %lu)",
-           (unsigned long)g_targetW, (unsigned long)radius,
-           (unsigned long)g_targetH, (unsigned long)g_drvVirtualH);
     return 1;
 }
 
-static int InstallDrvDrawDistance(void)
-{
-    static const struct { const unsigned int *sites; unsigned int count;
-                          unsigned int konst; } tab[] = {
-        { drv_viewmax_sites, sizeof(drv_viewmax_sites) / sizeof(unsigned int),
-          DRV_VIEWMAX_C },
-        { drv_distmax_sites, sizeof(drv_distmax_sites) / sizeof(unsigned int),
-          DRV_DISTMAX_C }
-    };
-    unsigned int t, i;
-    int          n = 0;
-    float        target;
-    float       *ref;
-
-    if (g_drvDrawPct == 0) return 0;          /* off */
-
-    target = 45000.0f * (float)g_drvDrawPct / 100.0f;
-    ref    = DrvConst(target);
-    if (!ref) return 0;
-
-    for (t = 0; t < 2; t++) {
-        for (i = 0; i < tab[t].count; i++) {
-            unsigned char *at = (unsigned char *)tab[t].sites[i];
-            unsigned char  rep[6];
-
-            if (!DrvReadable((unsigned int)at, 6)) continue;
-            /* fld m32 (d9 05) or fcomp m32 (d8 1d), on the right constant. */
-            if (!((at[0] == 0xd9 && at[1] == 0x05) ||
-                  (at[0] == 0xd8 && at[1] == 0x1d))) continue;
-            if (ReadU32(at + 2) != tab[t].konst) continue;
-
-            memcpy(rep, at, 2);
-            PutU32(rep + 2, (unsigned int)ref);
-            if (WriteCode(at, rep, 6)) n++;
-        }
-    }
-
-    /* And the value itself, so it applies to the run in progress.  Logged
-       before and after, because "the setting was already higher than the log
-       shows" is exactly the ambiguity that cost the last round. */
-    if (DrvReadable(DRV_VIEW_DIST, 4)) {
-        float *v = (float *)DRV_VIEW_DIST;
-        DrvLog("drv dist: view %d -> %d (ceiling %d, %d sites)",
-               (int)*v, (int)target, (int)target, n);
-        *v = target;
-    }
-
-    //
-    // Writing it once is NOT enough, which is why build 3 still reported "does
-    // nothing".  LoadConfig (0x405618) re-reads the viewing distance out of the
-    // config buffer at 0x405885, and it has SIX call sites -- including
-    // 0x40c20e and 0x40c667, both on the mode-change path that runs as a race
-    // starts.  So the value we set at grGlideInit is overwritten with whatever
-    // CONFIG.DAT holds before the first frame of actual play.
-    //
-    // Part one, section 27: a patched global is read by code you did not patch.
-    // The ceilings are code and survive; the value has to be re-asserted, which
-    // DrvTick does every frame -- upward only, so the in-game slider can still
-    // raise it further.
-    //
-    g_drvDrawTgt = target;
-    return n;
-}
-
 //
-// TEMPORARY.  Per-frame, logged only on change and capped.
+// V6's ceiling -- the only per-frame work Driver needs.
 //
-// This is the half that separates "the patch never landed" from "the patch
-// landed but its site never executes": the mode list and the config globals
-// are what we DID, and the live render size is what the game then BELIEVED.
+// The viewing distance must be re-asserted every frame because LoadConfig
+// (0x405618, SIX call sites, two of them on the mode-change path that runs as
+// a race starts) puts the CONFIG.DAT value back underneath us.
+//
+// This is a CORRECTNESS limit, not a preference.  The projection is
+// `screenX = camX * focal * recip[z] + W/2`, and `recip` is a TABLE at
+// 0xc24520 built at 0x528277 for indices 0..0xdbba-1 -- z up to 56249 and no
+// further.  A vertex past that reads off the end of the array, so its
+// reciprocal is garbage and the polygon streaks toward a vanishing point.  The
+// game's own 45000 maximum is that table's capacity with margin.
+//
+// Enforced unconditionally, and that is deliberate: an earlier build raised
+// the value to 90000 and **the game saved it into CONFIG.DAT**, so the file
+// restores 90000 on every load regardless of what we do now.  Reverting the
+// code that set it does not revert the save file.
 //
 static void DrvTick(void)
 {
-    static unsigned int lastW = 0, lastH = 0, frame = 0, records = 0;
-    unsigned int w, h;
-
     if (!g_drvActive) return;
-    frame++;
 
-    //
-    // V6, second half.  Re-assert the viewing distance every frame -- LoadConfig
-    // puts the CONFIG.DAT value back as a race starts.
-    //
-    // The CEILING is enforced unconditionally, including when draw_distance is
-    // off, and that is not tidiness.  Earlier builds raised this to 90000 and
-    // **the game saved it into CONFIG.DAT**, so the file now restores 90000 on
-    // every load whatever the ini says -- and 90000 is past the end of the
-    // reciprocal table, which is what makes the horizon streak.  A knob that
-    // only pushed the value UP could never take back its own damage: the log
-    // showed `drv dist: view 90000 -> 45000` at patch time and `viewdist=90000`
-    // on every tick after, with held=0, because nothing was ever below target.
-    //
-    // Two-sided from now on.  The ceiling is a correctness limit, not a
-    // preference: above it the game draws garbage.
-    //
     if (DrvReadable(DRV_VIEW_DIST, 4)) {
         float *v = (float *)DRV_VIEW_DIST;
-
-        if (*v > DRV_DRAW_MAX_Z) {
-            if (g_drvDrawHeld < 3)
-                DrvLog("drv dist: capped at f=%lu (was %d, now %d) -- past the "
-                       "reciprocal table", (unsigned long)frame, (int)*v,
-                       (int)DRV_DRAW_MAX_Z);
-            g_drvDrawHeld++;
-            *v = DRV_DRAW_MAX_Z;
-        } else if (g_drvDrawTgt > 0.0f && *v < g_drvDrawTgt) {
-            if (g_drvDrawHeld < 3)
-                DrvLog("drv dist: re-armed at f=%lu (was %d, now %d)",
-                       (unsigned long)frame, (int)*v, (int)g_drvDrawTgt);
-            g_drvDrawHeld++;
-            *v = g_drvDrawTgt;
-        }
+        if (*v > DRV_DRAW_MAX_Z) *v = DRV_DRAW_MAX_Z;
     }
 
     /* The mirror's distance shares the same table, so it needs the same cap. */
@@ -9693,49 +9465,6 @@ static void DrvTick(void)
         float *v = (float *)DRV_MIRR_DIST;
         if (*v > DRV_DRAW_MAX_Z) *v = DRV_DRAW_MAX_Z;
     }
-
-
-    if (records >= 24) return;
-    if (!DrvReadable(DRV_LIVE_W, 4) || !DrvReadable(DRV_LIVE_H, 4)) return;
-
-    w = *(volatile unsigned int *)DRV_LIVE_W;
-    h = *(volatile unsigned int *)DRV_LIVE_H;
-    if (w == lastW && h == lastH) return;
-
-    lastW = w; lastH = h;
-    records++;
-    DrvLog("tick f=%lu live=%ux%u cfg=%ux%u viewdist=%d mirror=%d held=%d "
-           "frustbl=%08lx",
-           (unsigned long)frame, w, h,
-           DrvReadable(DRV_CFG_W, 8) ? *(volatile unsigned int *)DRV_CFG_W : 0,
-           DrvReadable(DRV_CFG_W, 8) ? *(volatile unsigned int *)DRV_CFG_H : 0,
-           DrvReadable(DRV_VIEW_DIST, 4) ? (int)*(volatile float *)DRV_VIEW_DIST : -1,
-           DrvReadable(DRV_MIRR_DIST, 4) ? (int)*(volatile float *)DRV_MIRR_DIST : -1,
-           g_drvDrawHeld,
-           DrvReadable(0x00d72124u, 4)
-               ? (unsigned long)*(volatile unsigned int *)0x00d72124u : 0);
-}
-
-//
-// Called from GameFix_Apply BEFORE the resolution guard, so "ran with no
-// override" and "never ran at all" do not both produce an empty directory.
-//
-static void DrvEarlyLog(const char *exePath)
-{
-    if (!PathEndsWith(exePath, "Game.exe") &&
-        !PathEndsWith(exePath, "GAME.ICD")) return;
-
-    /* "Game.exe" is about as generic as a name gets, so pair it with the image
-       base every address in this block assumes.  Cheap, and it keeps a stray
-       gxp_driver.txt out of some unrelated game's folder. */
-    if ((unsigned int)(unsigned long)GetModuleHandleA(NULL) != 0x00400000u)
-        return;
-
-    if (!PathBesideExe("gxp_driver.txt", g_drvLogPath)) return;
-
-    DrvLog("GameFix_Apply exe=%s res=%lu %lux%lu", exePath,
-           (unsigned long)g_targetRes, (unsigned long)g_targetW,
-           (unsigned long)g_targetH);
 }
 
 static void DriverApply(const char *exePath, const char *ini, BOOL haveIni)
@@ -9744,118 +9473,78 @@ static void DriverApply(const char *exePath, const char *ini, BOOL haveIni)
     unsigned char *code = NULL, *data = NULL, *proj = NULL;
     unsigned int   codeSize = 0, dataSize = 0;
     unsigned int   mask = DRV_P_ALL;
-    int            dist = 0, text = 0, size = 0, bar = 0, res2 = 0;
-    int            flare = 0;
-    int            frusp = 0, uiscl = 0, ranch = 0, needle = 0, strike = 0;
-    int            menu = 0, load = 0, btn = 0, timer = 0, sprsz = 0;
 
     if (!PathEndsWith(exePath, "Game.exe") &&
         !PathEndsWith(exePath, "GAME.ICD")) return;
 
     mod = GetModuleHandleA(NULL);
 
-    // Every address above is absolute.  Game.exe does carry a .reloc, so say
-    // out loud that it landed where it was linked rather than assuming it.
-    if ((unsigned int)(unsigned long)mod != 0x00400000u) {
-        DrvLog("drv: image base %08lx, not 0x400000 -- skipped",
-               (unsigned long)(unsigned int)mod);
-        return;
-    }
+    // Every address here is absolute.  Game.exe does carry a .reloc, so check
+    // that it landed where it was linked rather than assuming it.
+    if ((unsigned int)(unsigned long)mod != 0x00400000u) return;
 
     if (!GetCodeRange(mod, &code, &codeSize)) return;
     if (!GetSectionRange(mod, ".data", &data, &dataSize)) return;
 
     //
     // NO INI.  Driver has no preferences left: every patch here is either a
-    // correctness fix or an exact no-op, and the two knobs that used to exist
-    // are both settled.
+    // correctness fix or an exact no-op, and both knobs that used to exist are
+    // settled.
     //
-    //   virtual_height  480 = true Hor+, the full vertical view plus extra
-    //                   world at the sides, which is the point of the exercise
-    //                   and confirmed on hardware.  It was 0 (AUTO / Vert-)
-    //                   for a long time only because widening the view made
-    //                   distant geometry vanish at the screen edges -- and
-    //                   that turned out to be V21, the 4:3 frustum clip
-    //                   planes, not the width of the view.  With V21 in there
-    //                   is no reason to ship the narrower picture.
+    //   virtual_height  fixed at 480 = true Hor+, the full vertical view plus
+    //                   extra world at the sides.  It was 0 (AUTO / Vert-) for
+    //                   a long time only because widening the view made distant
+    //                   geometry vanish at the screen edges -- and that turned
+    //                   out to be V21, the 4:3 frustum clip planes, not the
+    //                   width of the view.  With V21 in there is no reason to
+    //                   ship the narrower picture.
+    //
+    //   draw_distance   gone, and its installer with it.  It was only ever a
+    //                   diagnostic, and worse, it wrote a value the game
+    //                   PERSISTS into CONFIG.DAT, so it could outlive the build
+    //                   that set it.  The ceiling it needed lives on in DrvTick
+    //                   and is enforced unconditionally -- see the comment
+    //                   there for why that half is a correctness limit.
     //
     //   patches         one bit per installer, for bisecting on hardware.
     //                   Scaffolding by the project's own rule, and everything
     //                   it could bisect is confirmed.  The bits are kept
-    //                   because they cost nothing -- mask is a constant, so
-    //                   the compiler folds every test away -- and because a
-    //                   future bisect is then one edit rather than a redesign.
-    //
-    // The reciprocal table is why the ceiling in DrvTick exists and why
-    // draw_distance went the same way.  The projection is
-    // `screenX = camX * focal * recip[z] + W/2` and `recip` is a TABLE at
-    // 0xc24520, built at 0x528277 for indices 0..0xdbba-1 -- z up to 56249 and
-    // no further.  A vertex past that reads off the end of the array, so its
-    // reciprocal is garbage and the polygon streaks toward a vanishing point.
-    // The game's own 45000 maximum is that table's capacity with margin, so
-    // the ceiling is a correctness limit and is enforced unconditionally.
-    //
-    // NOTE: that streaking is NOT what made surfaces vanish at the screen
-    // edges.  That was V21.  Reading one as the other cost four builds.
+    //                   because they cost nothing -- mask is a constant, so the
+    //                   compiler folds every test away -- and because a future
+    //                   bisect is then one edit rather than a redesign.
     //
     (void)ini; (void)haveIni;
     g_drvVirtualH = 480;
 
     // The enum has to fit a `push imm8`; every enum in the wide driver's list
     // does, but a sign-extended push would be a silent disaster.
-    if (g_targetRes > 0x7f) {
-        DrvLog("drv: enum %lu will not fit push imm8 -- skipped",
-               (unsigned long)g_targetRes);
-        return;
-    }
+    if (g_targetRes > 0x7f) return;
 
-    // Located before anything is written, because the patches consume their own
-    // find patterns and the `sigs` line below has to report what was there.
+    // Located BEFORE anything is written: the patches consume their own find
+    // patterns, so a later search would come back empty.
     proj = FindUnique(code, codeSize, drv_proj_sig, sizeof(drv_proj_sig));
-
-    DrvLog("drv code=%08lx+%08lx data=%08lx+%08lx patches=%lu vh=%lu dd=%lu",
-           (unsigned long)(unsigned int)code, (unsigned long)codeSize,
-           (unsigned long)(unsigned int)data, (unsigned long)dataSize,
-           (unsigned long)mask, (unsigned long)g_drvVirtualH,
-           (unsigned long)g_drvDrawPct);
-    DrvLog("drv sigs tail=%d arm=%d proj=%d",
-           FindUnique(code, codeSize, drv_enumtail_sig,
-                      sizeof(drv_enumtail_sig))                         ? 1 : 0,
-           FindUnique(code, codeSize, drv_arm1600_sig,
-                      sizeof(drv_arm1600_sig))                          ? 1 : 0,
-           proj                                                         ? 1 : 0);
 
     if (mask & DRV_P_MODES)  InstallDrvModeRow(data, dataSize);
     if (mask & DRV_P_ENUM)   InstallDrvEnum(code, codeSize);
     if (mask & DRV_P_CONFIG) InstallDrvConfig();
-    if (mask & DRV_P_RES2)   res2 = InstallDrvRes2(code, codeSize);
+    if (mask & DRV_P_RES2)   InstallDrvRes2(code, codeSize);
     if (mask & DRV_P_PROJ)   InstallDrvProjection(proj);
-    if (mask & DRV_P_TEXT)   text = InstallDrvTextScale(code, codeSize);
-    if (mask & DRV_P_BAR)    bar  = InstallDrvBarScale(code, codeSize);
-    if (mask & DRV_P_SIZES)  size = InstallDrvSizes(code, codeSize);
-    if (mask & DRV_P_DIST)   dist = InstallDrvDrawDistance();
-    if (mask & DRV_P_FRUSP)  frusp = InstallDrvFrusPlane(code, codeSize);
-    if (mask & DRV_P_UISCL)  uiscl = InstallDrvUiScale();
-    if (mask & DRV_P_RANCH)  ranch = InstallDrvRightAnchor();
-    if (mask & DRV_P_NEEDLE) needle = InstallDrvNeedle();
-    if (mask & DRV_P_STRIKE) strike = InstallDrvStrikeX();
-    if (mask & DRV_P_MENU)   menu   = InstallDrvMenu();
-    if (mask & DRV_P_LOAD)   load   = InstallDrvLoad();
-    if (mask & DRV_P_BTN)    btn    = InstallDrvButton(code, codeSize);
-    if (mask & DRV_P_TIMER)  timer  = InstallDrvTimer();
-    if (mask & DRV_P_SPRSZ)  sprsz  = InstallDrvSpriteSize(code, codeSize);
-    if (mask & DRV_P_FLARE)  flare  = InstallDrvFlare(code, codeSize);
+    if (mask & DRV_P_TEXT)   InstallDrvTextScale(code, codeSize);
+    if (mask & DRV_P_BAR)    InstallDrvBarScale(code, codeSize);
+    if (mask & DRV_P_SIZES)  InstallDrvSizes(code, codeSize);
+    if (mask & DRV_P_FRUSP)  InstallDrvFrusPlane(code, codeSize);
+    if (mask & DRV_P_UISCL)  InstallDrvUiScale();
+    if (mask & DRV_P_RANCH)  InstallDrvRightAnchor();
+    if (mask & DRV_P_NEEDLE) InstallDrvNeedle();
+    if (mask & DRV_P_STRIKE) InstallDrvStrikeX();
+    if (mask & DRV_P_MENU)   InstallDrvMenu();
+    if (mask & DRV_P_LOAD)   InstallDrvLoad();
+    if (mask & DRV_P_BTN)    InstallDrvButton(code, codeSize);
+    if (mask & DRV_P_TIMER)  InstallDrvTimer();
+    if (mask & DRV_P_SPRSZ)  InstallDrvSpriteSize(code, codeSize);
+    if (mask & DRV_P_FLARE)  InstallDrvFlare(code, codeSize);
 
-    DrvLog("drv applied  target=%lux%lu enum=%lu divisor=%08lx "
-           "res2=%d text=%d bar=%d size=%d dist=%d frusp=%d uiscl=%d ranch=%d "
-           "needle=%d strike=%d menu=%d load=%d btn=%d timer=%d sprsz=%d flare=%d",
-           (unsigned long)g_targetW, (unsigned long)g_targetH,
-           (unsigned long)g_targetRes, (unsigned long)g_drvDivisor,
-           res2, text, bar, size, dist, frusp, uiscl, ranch, needle, strike,
-           menu, load, btn, timer, sprsz, flare);
-
-    g_drvActive     = TRUE;
-    g_drvPrevFilter = SetUnhandledExceptionFilter(DrvCrashFilter);
+    g_drvActive = TRUE;
 }
 
 
@@ -9935,7 +9624,6 @@ void GameFix_Apply(void)
     /* Driver: one line before the guard below, so "ran with no override" and
        "never ran at all" do not both look like an absent log file.  Writes
        nothing to the game. */
-    DrvEarlyLog(exePath);
 
     if (!g_targetRes) return;
 
