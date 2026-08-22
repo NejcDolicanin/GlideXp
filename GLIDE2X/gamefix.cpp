@@ -36,6 +36,7 @@
 
 #include <windows.h>
 #include <stdarg.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "gamefix.h"
@@ -7277,7 +7278,9 @@ static void MdkApply(const char *exePath, const char *ini, BOOL haveIni)
 #define DRV_P_RANCH   0x800u
 #define DRV_P_NEEDLE  0x1000u
 #define DRV_P_STRIKE  0x2000u
-#define DRV_P_ALL     0x3fffu
+#define DRV_P_MENU    0x4000u
+#define DRV_P_LOAD    0x8000u
+#define DRV_P_ALL     0xffffu
 
 //
 // Signatures are byte arrays rather than string literals on purpose: two
@@ -8571,6 +8574,609 @@ static int InstallDrvStrikeX(void)
     return n;
 }
 
+//
+// V26.  The front-end menu -- scaled into a centred 4:3 band.
+//
+// THE SHAPE OF DRIVER'S FRONT END, which is what makes this small.
+//
+// The menu is not drawn with Glide at all.  The whole front end -- background
+// art, logo, every menu item, all the text -- is rendered into ONE plain
+// 640x480 EIGHT-BIT paletted framebuffer in system memory, and a single leaf
+// function copies it to the screen once a frame:
+//
+//      0x57d9b4   the 640x480 8bpp buffer.  0x407ee8 plots into it:
+//                 `imul edx,0x280` for the row, base 0x57d9b4, one byte/pixel
+//      0x12f0ec0  a 256-entry palette, entries ALREADY in the screen's pixel
+//                 format (filled at 0x407e57 with a 0x400-byte copy)
+//      0x407e7c   the per-frame present: grLfbLock, call [0x57d9b0], unlock.
+//                 One caller (0x40ceca), and it is front-end only.
+//      0x57d9b0   the blit pointer, chosen by depth at 0x407b4e / 0x407b5a
+//      0x52b0a3   Blit8to16(src, dst, w, h)   <- what we replace
+//      0x52b121   Blit8to32, same shape, a full palette dword per pixel
+//
+// So the entire menu reaches the screen through one function with a known
+// signature, and everything upstream of it stays in its own 640x480 world.
+// That is why this is a function replacement rather than the ~20-site
+// per-element job GTA2 needed: there is nothing to re-lay-out.
+//
+// Worth knowing about the routine being replaced: it IGNORES its `w` argument.
+// The inner count is a hardcoded 0xa0 = 160 iterations of 4 pixels, and the row
+// advance is `stride - 0x500` with 0x500 = 640*2.  It is hardwired to 640 wide,
+// which is exactly why the game could never have been asked politely for a
+// bigger menu.
+//
+// WHAT THE REPLACEMENT DOES.  Nearest-neighbour scale of the 640x480 source
+// into the largest 4:3 box that fits, centred, with the rest painted black:
+//
+//      s    = min(W/640, H/480)         uniform, so the art is not distorted
+//      band = 640*s x 480*s, centred
+//
+// At 1920x800 that is 1066x800 at x=427 -- full height, 427px bars either side.
+//
+// It is a NO-OP AT 640x480 in the strongest sense: the installer declines
+// outright when the band comes out exactly 640x480 at the origin, so the game
+// keeps its own hand-tuned assembly and we add nothing at all.
+//
+// The bars are repainted every frame rather than once.  Once would do within a
+// single visit to the menu -- nothing else writes there -- but coming back from
+// a race leaves that race's pixels in them and there is no signal for it.  Two
+// sequential fills of the non-band area is not a cost worth reasoning about on
+// a menu.
+//
+// This is a patch to Driver's own code and data.  Nothing here touches the
+// wrapper, so it applies just as well baked into the exe and run under any
+// other Glide implementation.
+//
+
+#define DRV_FE_BUF      0x0057d9b4u   /* 640x480 8bpp front-end framebuffer   */
+#define DRV_FE_PAL      0x012f0ec0u   /* 256 dwords, already in screen format  */
+#define DRV_FE_STRIDE   0x005c89d8u   /* the framebuffer's strideInBytes       */
+#define DRV_FE_BPP      0x005c89b8u   /* 16 or 32, captured at 0x407b64        */
+#define DRV_FE_SET16    0x00407b4eu   /* mov [0x57d9b0], 0x402324              */
+#define DRV_FE_SET32    0x00407b5au   /* mov [0x57d9b0], 0x402301              */
+#define DRV_FE_ORIG16   0x00402324u
+#define DRV_FE_ORIG32   0x00402301u
+#define DRV_FE_SRC_W    640
+#define DRV_FE_SRC_H    480
+
+typedef void (__cdecl *DrvFeBlit_t)(const unsigned char *src, void *dst,
+                                    int w, int h);
+
+static DrvFeBlit_t g_drvFeOrig16 = NULL;
+static DrvFeBlit_t g_drvFeOrig32 = NULL;
+static int         g_drvFeW  = 0, g_drvFeH  = 0;   /* the band, in pixels */
+static int         g_drvFeX0 = 0, g_drvFeY0 = 0;
+
+//
+// Bilinear, done in the DESTINATION's own packed format.
+//
+// The palette at 0x12f0ec0 already holds screen-format pixels, so blending
+// there costs no unpacking and no repacking -- which is the whole reason this
+// is affordable on a 1997 CPU.  Both passes use the standard two-field trick:
+// spread the components so they cannot carry into each other, take a weighted
+// sum, shift back.
+//
+//      565: (A*(32-t) + B*t) >> 5   with the fields spread to 0x07E0F81F
+//      888: (A*(256-t) + B*t) >> 8  with the fields split 0x00ff00ff / 0xff00
+//
+// Both are checked for overflow at their widest: 63<<21 times 32 is 4227858432
+// and 255<<16 times 256 is 4278190080, each just inside 32 bits, and the
+// weights sum to exactly one step so a flat area stays flat.
+//
+// SEPARABLE, which is what keeps it to roughly two or three times the cost of
+// the nearest-neighbour version rather than seven.  Each SOURCE row is scaled
+// horizontally once into a two-row cache -- 480 of those -- and every
+// DESTINATION row is then one vertical blend of two cached rows.  The cache
+// slots rotate: the vertical source index only ever advances by zero or one,
+// because the band is never smaller than the source.
+//
+//
+// 565 is handled in three pieces rather than one, because the row cache holds
+// pixels in the SPREAD form.  The horizontal pass then blends and stores
+// without folding, and the vertical pass folds once on the way out -- which
+// takes two spreads and a fold per pixel out of the inner loop.
+//
+static unsigned int Spread565(unsigned int p)
+{
+    return (p | (p << 16)) & 0x07E0F81Fu;
+}
+
+static unsigned int LerpSpread(unsigned int A, unsigned int B, unsigned int t)
+{
+    return (((A * (32u - t)) + (B * t)) >> 5) & 0x07E0F81Fu;
+}
+
+static unsigned int Fold565(unsigned int C)
+{
+    return (C | (C >> 16)) & 0xffffu;
+}
+
+static unsigned int Lerp888(unsigned int a, unsigned int b, unsigned int t)
+{
+    unsigned int rb = ((((a & 0x00ff00ffu) * (256u - t)) +
+                        ((b & 0x00ff00ffu) * t)) >> 8) & 0x00ff00ffu;
+    unsigned int g  = ((((a & 0x0000ff00u) * (256u - t)) +
+                        ((b & 0x0000ff00u) * t)) >> 8) & 0x0000ff00u;
+    return (a & 0xff000000u) | rb | g;
+}
+
+/* Scratch, all sized together and only when the band changes. */
+static unsigned char *g_drvFeMem     = NULL;
+static int            g_drvFeMemCap  = 0;
+static unsigned int  *g_drvFeCol     = NULL;  /* per dest column: sx<<8 | wx */
+static unsigned char *g_drvFeCache   = NULL;  /* two horizontally-scaled rows */
+static unsigned char *g_drvFeOut     = NULL;  /* one destination row          */
+static int            g_drvFeCacheA  = -1;    /* which source row is in slot 0 */
+static int            g_drvFeTabW    = 0;     /* the band the tables are for   */
+static int            g_drvFeTabSrcW = 0;
+
+static void __cdecl DrvFrontEndBlit(const unsigned char *src, void *dst,
+                                    int w, int h)
+{
+    const unsigned int *pal    = (const unsigned int *)DRV_FE_PAL;
+    int                 bpp    = (int)*(volatile unsigned int *)DRV_FE_BPP;
+    int                 stride = (int)*(volatile unsigned int *)DRV_FE_STRIDE;
+    int   bandW = g_drvFeW, bandH = g_drvFeH;
+    int   x0 = g_drvFeX0, y0 = g_drvFeY0;
+    int   px, dy;
+    unsigned int dxStep, dyStep, sy16;
+
+    //
+    // Anything not the exact shape this was written against goes to the game's
+    // own routine.  Delegating is always safe; guessing is not.
+    //
+    // The 16bpp case additionally requires the framebuffer to really be 565 in
+    // the usual bit order, because Lerp565 is written against that layout.
+    // The game publishes its own answer at 0x5c89bc..0x5c89d0 (the shift-right
+    // and shift-left counts its blit uses), so this is asked rather than
+    // assumed.
+    //
+    if (!src || !dst || w != DRV_FE_SRC_W || h <= 1 ||
+        bandW <= 0 || bandH <= 0 || stride <= 0 ||
+        (bpp != 16 && bpp != 32)) {
+        DrvFeBlit_t o = (bpp == 32) ? g_drvFeOrig32 : g_drvFeOrig16;
+        if (o) o(src, dst, w, h);
+        return;
+    }
+    if (bpp == 16) {
+        const volatile unsigned int *f = (const volatile unsigned int *)0x005c89bcu;
+        if (f[0] != 3 || f[1] != 2 || f[2] != 3 ||
+            f[3] != 11 || f[4] != 5 || f[5] != 0) {
+            if (g_drvFeOrig16) g_drvFeOrig16(src, dst, w, h);
+            return;
+        }
+    }
+
+    px = bpp >> 3;
+
+    /* One allocation for the column table, the two-row cache and the output
+       row, resized only when the band does -- which is never, in practice. */
+    {
+        int need = bandW * (int)sizeof(unsigned int)   /* column table   */
+                 + bandW * (int)sizeof(unsigned int) * 2 /* two cached rows,
+                                                            u32 either way */
+                 + bandW * px;                         /* output row     */
+        if (need > g_drvFeMemCap) {
+            unsigned char *p = (unsigned char *)realloc(g_drvFeMem,
+                                                        (unsigned int)need);
+            if (!p) {
+                DrvFeBlit_t o = (bpp == 32) ? g_drvFeOrig32 : g_drvFeOrig16;
+                if (o) o(src, dst, w, h);
+                return;
+            }
+            g_drvFeMem = p; g_drvFeMemCap = need;
+            g_drvFeTabW = 0;                 /* force the tables rebuilt */
+        }
+        g_drvFeCol   = (unsigned int *)g_drvFeMem;
+        g_drvFeCache = g_drvFeMem + bandW * (int)sizeof(unsigned int);
+        g_drvFeOut   = g_drvFeCache + bandW * (int)sizeof(unsigned int) * 2;
+    }
+
+    dxStep = ((unsigned int)w << 16) / (unsigned int)bandW;
+    dyStep = ((unsigned int)h << 16) / (unsigned int)bandH;
+
+    /* The column table never changes while the band does not, so it is built
+       once rather than 800 times a frame. */
+    if (g_drvFeTabW != bandW || g_drvFeTabSrcW != w) {
+        unsigned int fx = 0;
+        int dx;
+        for (dx = 0; dx < bandW; dx++, fx += dxStep) {
+            int sx = (int)(fx >> 16);
+            unsigned int wt = (fx >> 8) & 0xffu;
+            /* Clamp so sx+1 is always inside the row: the last destination
+               pixels then blend towards the last source pixel instead of
+               reading past it. */
+            if (sx > w - 2) { sx = w - 2; wt = 0xffu; }
+            g_drvFeCol[dx] = ((unsigned int)sx << 8) | wt;
+        }
+        g_drvFeTabW = bandW; g_drvFeTabSrcW = w;
+        g_drvFeCacheA = -1;
+    }
+
+    /* The bars.  Black is 0 in both output formats, so memset serves. */
+    {
+        int x1 = x0 + bandW, y1 = y0 + bandH;
+        int W  = (int)g_targetW, H = (int)g_targetH;
+        int y;
+
+        for (y = 0; y < H; y++) {
+            unsigned char *p = (unsigned char *)dst + y * stride;
+            if (x0 > 0) memset(p, 0, (unsigned int)(x0 * px));
+            if (x1 < W) memset(p + x1 * px, 0, (unsigned int)((W - x1) * px));
+        }
+        for (y = 0; y < y0; y++)
+            memset((unsigned char *)dst + y * stride + x0 * px, 0,
+                   (unsigned int)(bandW * px));
+        for (y = y1; y < H; y++)
+            memset((unsigned char *)dst + y * stride + x0 * px, 0,
+                   (unsigned int)(bandW * px));
+    }
+
+    g_drvFeCacheA = -1;          /* the source buffer changed under us */
+    sy16 = 0;
+
+    for (dy = 0; dy < bandH; dy++, sy16 += dyStep) {
+        int          sy = (int)(sy16 >> 16);
+        unsigned int wy = (sy16 >> 8) & 0xffu;
+        int          slot;
+
+        if (sy > h - 2) { sy = h - 2; wy = 0xffu; }
+
+        //
+        // Make sure the cache holds source rows sy and sy+1.  sy only ever
+        // advances by 0 or 1, so the common case is to keep the second row and
+        // build one new one.
+        //
+        if (g_drvFeCacheA != sy) {
+            int first = 0;
+            if (g_drvFeCacheA == sy - 1) {
+                /* shift: old slot 1 becomes slot 0 */
+                memcpy(g_drvFeCache,
+                       g_drvFeCache + bandW * (int)sizeof(unsigned int),
+                       (unsigned int)(bandW * (int)sizeof(unsigned int)));
+                first = 1;
+            }
+            for (slot = first; slot < 2; slot++) {
+                const unsigned char *s = src + (unsigned int)(sy + slot) * DRV_FE_SRC_W;
+                unsigned int *o = (unsigned int *)(g_drvFeCache
+                                  + slot * bandW * (int)sizeof(unsigned int));
+                int dx;
+
+                if (bpp == 16) {
+                    for (dx = 0; dx < bandW; dx++) {
+                        unsigned int c  = g_drvFeCol[dx];
+                        unsigned int sx = c >> 8;
+                        o[dx] = LerpSpread(Spread565(pal[s[sx]] & 0xffffu),
+                                           Spread565(pal[s[sx + 1]] & 0xffffu),
+                                           (c & 0xffu) >> 3);
+                    }
+                } else {
+                    for (dx = 0; dx < bandW; dx++) {
+                        unsigned int c  = g_drvFeCol[dx];
+                        unsigned int sx = c >> 8;
+                        o[dx] = Lerp888(pal[s[sx]], pal[s[sx + 1]], c & 0xffu);
+                    }
+                }
+            }
+            g_drvFeCacheA = sy;
+        }
+
+        /* Vertical blend of the two cached rows into the output row. */
+        {
+            const unsigned int *a = (const unsigned int *)g_drvFeCache;
+            const unsigned int *b = (const unsigned int *)(g_drvFeCache
+                                    + bandW * (int)sizeof(unsigned int));
+            int dx;
+
+            if (bpp == 16) {
+                unsigned short *o16 = (unsigned short *)g_drvFeOut;
+                unsigned int t = wy >> 3;
+                for (dx = 0; dx < bandW; dx++)
+                    o16[dx] = (unsigned short)Fold565(LerpSpread(a[dx], b[dx], t));
+            } else {
+                unsigned int *o32 = (unsigned int *)g_drvFeOut;
+                for (dx = 0; dx < bandW; dx++)
+                    o32[dx] = Lerp888(a[dx], b[dx], wy);
+            }
+        }
+
+        memcpy((unsigned char *)dst + (y0 + dy) * stride + x0 * px,
+               g_drvFeOut, (unsigned int)(bandW * px));
+    }
+}
+
+//
+// The band: the largest 4:3 box that fits the screen, centred.
+//
+// Shared by the menu (V26) and the pre-menu screens (V27).  The whole front end
+// has to agree on one rectangle or its pieces would not line up with each
+// other, so it is computed once here rather than twice.
+//
+// Returns 0 when the band comes out exactly the source size at the origin,
+// which is the signal to leave the game completely alone.
+//
+static int DrvFeBand(void)
+{
+    float sx = (float)g_targetW / (float)DRV_FE_SRC_W;
+    float sy = (float)g_targetH / (float)DRV_FE_SRC_H;
+    float s  = (sx < sy) ? sx : sy;
+    int bandW = (int)((float)DRV_FE_SRC_W * s);
+    int bandH = (int)((float)DRV_FE_SRC_H * s);
+    int x0 = ((int)g_targetW - bandW) / 2;
+    int y0 = ((int)g_targetH - bandH) / 2;
+
+    if (bandW <= 0 || bandH <= 0 || x0 < 0 || y0 < 0) return 0;
+    if (bandW == DRV_FE_SRC_W && bandH == DRV_FE_SRC_H && x0 == 0 && y0 == 0)
+        return 0;
+
+    g_drvFeW  = bandW; g_drvFeH  = bandH;
+    g_drvFeX0 = x0;    g_drvFeY0 = y0;
+    return 1;
+}
+
+static int InstallDrvMenu(void)
+{
+    /* mov DWORD PTR ds:0x57d9b0, imm32 */
+    static const unsigned char head[6] = { 0xc7,0x05, 0xb0,0xd9,0x57,0x00 };
+    unsigned char *s16 = (unsigned char *)DRV_FE_SET16;
+    unsigned char *s32 = (unsigned char *)DRV_FE_SET32;
+
+    if (!DrvReadable(DRV_FE_SET16, 10) || !DrvReadable(DRV_FE_SET32, 10) ||
+        memcmp(s16, head, 6) != 0 || memcmp(s32, head, 6) != 0) {
+        DrvLog("drv menu: blit-pointer sites not as expected -- nothing written");
+        return 0;
+    }
+    if (ReadU32(s16 + 6) != DRV_FE_ORIG16 ||
+        ReadU32(s32 + 6) != DRV_FE_ORIG32) {
+        DrvLog("drv menu: already patched, or a different build -- skipped");
+        return 0;
+    }
+
+    //
+    // Exactly the source size at the origin means the game's own hand-written
+    // assembly already does the right thing, faster.  Decline rather than
+    // install a slower copy of it.
+    //
+    if (!DrvFeBand()) {
+        DrvLog("drv menu: band is 640x480 at the origin -- left alone");
+        return 0;
+    }
+
+    g_drvFeOrig16 = (DrvFeBlit_t)DRV_FE_ORIG16;
+    g_drvFeOrig32 = (DrvFeBlit_t)DRV_FE_ORIG32;
+
+    {
+        unsigned char rep[4];
+        PutU32(rep, (unsigned int)(void *)DrvFrontEndBlit);
+        if (!WriteCode(s16 + 6, rep, 4)) return 0;
+        if (!WriteCode(s32 + 6, rep, 4)) return 0;
+    }
+
+    DrvLog("drv menu: 640x480 -> %dx%d at %d,%d (scale %d/1000) blit=%08lx",
+           g_drvFeW, g_drvFeH, g_drvFeX0, g_drvFeY0,
+           (g_drvFeW * 1000) / DRV_FE_SRC_W,
+           (unsigned long)(unsigned int)(void *)DrvFrontEndBlit);
+    return 1;
+}
+
+//
+// V27.  The pre-menu screens -- the copyright / GT / Reflections logos.
+//
+// A THIRD draw path, and nothing it shares with the menu but the band.
+//
+// The start-up sequence at 0x412cd0 is:
+//
+//      clear x4 ; ShowImage("DATA\USCOPYRIGHT.BMP" or "DATA\COPYRIGHT.BMP")
+//      clear x4 ; ShowImage("DATA\GT.BMP")
+//      clear x4 ; ShowImage("DATA\REFLECT.BMP")
+//      front-end init (0x40c180)
+//
+// ShowImage is 0x40c8f1: it allocates 0x12c000 = 640*480*4, loads the bitmap,
+// and fades it in and out through 0x40de21, which tiles the 640x480 image as a
+// 3x2 grid of <=256x256 textured quads and draws each through 0x40df13 ->
+// grDrawPolygonVertexList.  So unlike the menu this really is Glide geometry,
+// in ABSOLUTE PIXEL COORDINATES, laid out against a hardcoded 640x480:
+//
+//      for (y = 0; y < 480; y += 256)  { h = (y+256 > 480) ? 224 : 256;
+//      for (x = 0; x < 640; x += 256)  { w = (x+256 > 640) ? 128 : 256;
+//          DrawQuad(x, y, w, h, tile++, colour); } }
+//
+// THE TRAP, and it is section 7b exactly: `w` and `h` are TWO QUANTITIES.
+// 0x40df13 reads them at 0x40df3b and 0x40df56 as the TEXTURE extent (it
+// stores w-0.5 and h-0.5, later scaled by 1.0 or 1/64 into the s/t fields),
+// and then again at 0x40e00d, 0x40e0b5, 0x40e0ca and 0x40e157 as the SCREEN
+// extent, via x+w and y+h.  Scaling the arguments at entry would stretch the
+// geometry and the texture coordinates together, which samples off the end of
+// the tile.
+//
+// The two uses are cleanly separated in time, which is what makes this a
+// one-site patch: both texture reads happen before 0x40df71, and every read
+// after it is screen geometry.  Verified by listing all 30 argument reads in
+// the function.  So the hook goes at 0x40df71 -- the first instruction that
+// touches a screen coordinate -- and rewrites the four arguments there.
+//
+// (The vertex array is [ebp-0xf0]: 4 vertices x 60 bytes = 0xf0, which is also
+// how the four corner computations were told apart from the texture ones.)
+//
+// Both edges are mapped and the extent is taken as the DIFFERENCE, rather than
+// scaling w and h directly.  That is what keeps the 3x2 grid seamless: the
+// right edge of one tile and the left edge of the next round to the same pixel
+// by construction.  The map is exact at the boundaries too -- 0 -> band origin
+// and 640 -> band origin + band width -- so the image reaches the band edges.
+//
+// THE CLIP.  0x40c8f1 opens with grClipWindow(0, 0, liveW, liveH), and liveW /
+// liveH are 640x480 in the front end, so band-space quads would be clipped
+// away at x=640.  The same shape appears at 0x40c7f4 (the clear-and-swap loop
+// the sequence above calls between images) and 0x40c846 (the LFB image path).
+// All three read the two globals through a disp32, so all six reads are simply
+// repointed at our own copies of the REAL screen size.
+//
+// Repointing rather than rewriting the immediates has a property worth having:
+// during a race liveW/liveH already hold the real screen size, so the patch is
+// an EXACT NO-OP everywhere except the front end.  And widening 0x40c7f4 is
+// what paints the bars -- its clear-to-black now covers the whole screen
+// instead of the top-left 640x480, and it swaps between iterations, so both
+// buffers get one.
+//
+// 0x40de21 has ten callers, all in 0x40c97f..0x40ca31 -- the fade loops of the
+// two image routines and nothing else.  0x40df13 has one.  So this cannot
+// reach anything but a full-screen front-end image.
+//
+
+/* The game's own grTexFilterMode pointer, from its GetProcAddress table. */
+#define DRV_GR_TEXFILTER 0x005cac4cu
+typedef void (__stdcall *DrvTexFilter_t)(int tmu, int minFilter, int magFilter);
+
+#define DRV_LS_QUAD     0x0040df71u   /* fild [ebp+8] ; fstp [ebp-0xf0] */
+#define DRV_LS_QUAD_LEN 9
+
+/* The six `mov reg, ds:live{W,H}` reads that feed a full-screen grClipWindow. */
+struct DrvLsClip {
+    unsigned int  at;       /* the instruction                        */
+    unsigned char op0, op1; /* its opcode bytes                       */
+    int           opLen;
+    int           isHeight;
+};
+
+static const struct DrvLsClip drv_ls_clips[6] = {
+    { 0x0040c7f8u, 0xa1, 0x00, 1, 1 },   /* the clear-and-swap loop */
+    { 0x0040c7feu, 0x8b, 0x0d, 2, 0 },
+    { 0x0040c84au, 0xa1, 0x00, 1, 1 },   /* the LFB image path      */
+    { 0x0040c850u, 0x8b, 0x0d, 2, 0 },
+    { 0x0040c8f7u, 0xa1, 0x00, 1, 1 },   /* the geometry image path */
+    { 0x0040c8fdu, 0x8b, 0x0d, 2, 0 }
+};
+
+/* Our own copies of the real screen size, for those disp32s to point at. */
+static int g_drvScrW = 0;
+static int g_drvScrH = 0;
+
+//
+// Map one quad from the front end's 640x480 space into the band.
+//
+// Integer throughout: v is at most 640, so v*bandW tops out around 682,000 and
+// the division is exact at both ends.  Called with the game's frame pointer, so
+// the arguments are reached at the displacements 0x40df13 itself uses.
+//
+static void __cdecl DrvLoadQuadFix(unsigned char *frame)
+{
+    int *px = (int *)(frame + 0x08);
+    int *py = (int *)(frame + 0x0c);
+    int *pw = (int *)(frame + 0x10);
+    int *ph = (int *)(frame + 0x14);
+    int x0, y0, x1, y1;
+
+    if (g_drvFeW <= 0 || g_drvFeH <= 0) return;
+
+    //
+    // Bilinear, on the first tile of each image.
+    //
+    // Glide's own default from grSstWinOpen is POINT_SAMPLED (gsst.c:1018),
+    // and the only two places Driver sets bilinear -- 0x418790, the in-game
+    // renderer init, and 0x42b056, deep in the world code -- run long after
+    // the front end.  So these logos were being magnified nearest-neighbour by
+    // the HARDWARE, and one state call fixes it for free.
+    //
+    // Called through the game's own imported pointer rather than by patching a
+    // call site, and keyed on the first tile (the tiler always starts at 0,0)
+    // rather than done once per process: a mode change re-opens the Glide
+    // window and resets the filter, so once would not survive one.
+    //
+    // The drawer's texture coordinates already run 0.5 .. w-0.5 -- the
+    // half-texel inset bilinear wants -- so the 3x2 grid does not seam.
+    //
+    if (*px == 0 && *py == 0) {
+        DrvTexFilter_t f = *(DrvTexFilter_t *)DRV_GR_TEXFILTER;
+        if (f) f(0 /* GR_TMU0 */, 1 /* BILINEAR */, 1 /* BILINEAR */);
+    }
+
+    x1 = *px + *pw;
+    y1 = *py + *ph;
+
+    x0 = g_drvFeX0 + (*px * g_drvFeW) / DRV_FE_SRC_W;
+    y0 = g_drvFeY0 + (*py * g_drvFeH) / DRV_FE_SRC_H;
+    x1 = g_drvFeX0 + (x1  * g_drvFeW) / DRV_FE_SRC_W;
+    y1 = g_drvFeY0 + (y1  * g_drvFeH) / DRV_FE_SRC_H;
+
+    *px = x0;
+    *py = y0;
+    *pw = x1 - x0;
+    *ph = y1 - y0;
+}
+
+static int InstallDrvLoad(void)
+{
+    unsigned char *at = (unsigned char *)DRV_LS_QUAD;
+    unsigned char  displaced[DRV_LS_QUAD_LEN];
+    unsigned char *stub;
+    unsigned char  rep[DRV_LS_QUAD_LEN];
+    int i, clips = 0;
+
+    if (!DrvFeBand()) {
+        DrvLog("drv load: band is 640x480 at the origin -- left alone");
+        return 0;
+    }
+
+    g_drvScrW = (int)g_targetW;
+    g_drvScrH = (int)g_targetH;
+
+    /* Two passes over the clip sites: a half-applied set would leave one
+       full-screen image clipped and another not, which is harder to read than
+       neither being touched. */
+    for (i = 0; i < 6; i++) {
+        const struct DrvLsClip *c = &drv_ls_clips[i];
+        const unsigned char *p = (const unsigned char *)c->at;
+
+        if (!DrvReadable(c->at, (unsigned int)(c->opLen + 4))) return 0;
+        if (p[0] != c->op0) return 0;
+        if (c->opLen == 2 && p[1] != c->op1) return 0;
+        if (ReadU32(p + c->opLen) !=
+            (c->isHeight ? DRV_LIVE_H : DRV_LIVE_W)) return 0;
+    }
+    for (i = 0; i < 6; i++) {
+        const struct DrvLsClip *c = &drv_ls_clips[i];
+        unsigned char *p = (unsigned char *)c->at;
+        unsigned char  d32[4];
+
+        PutU32(d32, (unsigned int)(void *)(c->isHeight ? &g_drvScrH
+                                                       : &g_drvScrW));
+        if (WriteCode(p + c->opLen, d32, 4)) clips++;
+    }
+
+    /* The quad hook. */
+    if (!DrvReadable(DRV_LS_QUAD, DRV_LS_QUAD_LEN)) return 0;
+    if (at[0] != 0xdb || at[1] != 0x45 || at[2] != 0x08 ||
+        at[3] != 0xd9 || at[4] != 0x9d) {
+        DrvLog("drv load: quad site not as expected -- clips=%d, no hook", clips);
+        return 0;
+    }
+    memcpy(displaced, at, DRV_LS_QUAD_LEN);
+
+    stub = (unsigned char *)VirtualAlloc(NULL, 64, MEM_COMMIT | MEM_RESERVE,
+                                         PAGE_EXECUTE_READWRITE);
+    if (!stub) return 0;
+
+    stub[0] = 0x60;                                   /* pushad            */
+    stub[1] = 0x55;                                   /* push ebp          */
+    stub[2] = 0xe8;                                   /* call DrvLoadQuadFix */
+    PutU32(stub + 3, (unsigned int)(void *)DrvLoadQuadFix
+                     - ((unsigned int)stub + 7));
+    stub[7] = 0x83; stub[8] = 0xc4; stub[9] = 0x04;   /* add esp,4         */
+    stub[10] = 0x61;                                  /* popad             */
+    memcpy(stub + 11, displaced, DRV_LS_QUAD_LEN);    /* the displaced work */
+    stub[11 + DRV_LS_QUAD_LEN] = 0xc3;                /* ret               */
+
+    rep[0] = 0xe8;
+    PutU32(rep + 1, (unsigned int)stub - (DRV_LS_QUAD + 5));
+    memset(rep + 5, 0x90, DRV_LS_QUAD_LEN - 5);
+    if (!WriteCode(at, rep, DRV_LS_QUAD_LEN)) return 0;
+
+    DrvLog("drv load: clips=%d stub=%08lx  640x480 -> %dx%d at %d,%d",
+           clips, (unsigned long)(unsigned int)stub,
+           g_drvFeW, g_drvFeH, g_drvFeX0, g_drvFeY0);
+    return 1;
+}
+
 static int InstallDrvDrawDistance(void)
 {
     static const struct { const unsigned int *sites; unsigned int count;
@@ -8743,6 +9349,7 @@ static void DriverApply(const char *exePath, const char *ini, BOOL haveIni)
     unsigned int   mask = DRV_P_ALL;
     int            dist = 0, text = 0, size = 0, bar = 0, res2 = 0;
     int            frusp = 0, uiscl = 0, ranch = 0, needle = 0, strike = 0;
+    int            menu = 0, load = 0;
 
     if (!PathEndsWith(exePath, "Game.exe") &&
         !PathEndsWith(exePath, "GAME.ICD")) return;
@@ -8848,13 +9455,16 @@ static void DriverApply(const char *exePath, const char *ini, BOOL haveIni)
     if (mask & DRV_P_RANCH)  ranch = InstallDrvRightAnchor();
     if (mask & DRV_P_NEEDLE) needle = InstallDrvNeedle();
     if (mask & DRV_P_STRIKE) strike = InstallDrvStrikeX();
+    if (mask & DRV_P_MENU)   menu   = InstallDrvMenu();
+    if (mask & DRV_P_LOAD)   load   = InstallDrvLoad();
 
     DrvLog("drv applied  target=%lux%lu enum=%lu divisor=%08lx "
            "res2=%d text=%d bar=%d size=%d dist=%d frusp=%d uiscl=%d ranch=%d "
-           "needle=%d strike=%d",
+           "needle=%d strike=%d menu=%d load=%d",
            (unsigned long)g_targetW, (unsigned long)g_targetH,
            (unsigned long)g_targetRes, (unsigned long)g_drvDivisor,
-           res2, text, bar, size, dist, frusp, uiscl, ranch, needle, strike);
+           res2, text, bar, size, dist, frusp, uiscl, ranch, needle, strike,
+           menu, load);
 
     g_drvActive     = TRUE;
     g_drvPrevFilter = SetUnhandledExceptionFilter(DrvCrashFilter);
