@@ -7280,7 +7280,10 @@ static void MdkApply(const char *exePath, const char *ini, BOOL haveIni)
 #define DRV_P_STRIKE  0x2000u
 #define DRV_P_MENU    0x4000u
 #define DRV_P_LOAD    0x8000u
-#define DRV_P_ALL     0xffffu
+#define DRV_P_BTN     0x10000u
+#define DRV_P_TIMER   0x20000u
+#define DRV_P_SPRSZ   0x40000u
+#define DRV_P_ALL     0x7ffffu
 
 //
 // Signatures are byte arrays rather than string literals on purpose: two
@@ -9250,6 +9253,205 @@ static int InstallDrvLoad(void)
     return 1;
 }
 
+//
+// V28.  The tape-recorder menu buttons -- round again.
+//
+// The four selection buttons (rewind / play / forward / accept) were drawn as
+// ellipses 1.80x wider than tall, which is exactly (W/640) / (H/480) at
+// 1920x800.  Measured off the screenshot: 151 x 84, three of them identical.
+//
+// It is the same bug V12 fixed for the fill bars, in a different routine.
+// 0x506b2a builds a size pair from two constants:
+//
+//      0x506c0d   fld ds:0x548b0c (22.5) ; fmul [ebp-0xc0] (W/640) ; fmul zoom
+//      0x506c27   fld ds:0x5481f8 (45.0) ; fmul [ebp-0xc4] (H/480) ; fmul zoom
+//
+// 22.5 is a HALF-width and 45.0 a full height, so at uiZoom 1.12 that is
+// 2*22.5*3.0*1.12 = 151.2 wide and 45*1.6667*1.12 = 84.0 tall -- both matching
+// the measurement to the pixel, which is what identified the site.
+//
+// One byte: point the width multiply at the height scale, so a 45-unit square
+// sprite comes out square.  [ebp-0xc0] -> [ebp-0xc4], i.e. the disp32's low
+// byte 0x40 -> 0x3c.  At 4:3 the two scales are equal and this is an EXACT
+// NO-OP.
+//
+// 0x548b0c (22.5) has exactly one reference in the image, so the 18-byte
+// signature is unambiguous; verified unique in .text.
+//
+static const unsigned char drv_btnw_sig[] = {
+    0xd9,0x05, 0x0c,0x8b,0x54,0x00,      /* fld  ds:0x548b0c   22.5      */
+    0xd8,0x8d, 0x40,0xff,0xff,0xff,      /* fmul [ebp-0xc0]    sx=W/640  */
+    0xd8,0x0d, 0xc0,0xe6,0x2d,0x01       /* fmul ds:uiZoom               */
+};
+#define DRV_BTNW_SLOT 8      /* the disp32's low byte */
+
+static int InstallDrvButton(unsigned char *code, unsigned int codeSize)
+{
+    unsigned char *at = FindUnique(code, codeSize, drv_btnw_sig,
+                                   sizeof(drv_btnw_sig));
+    unsigned char  rep[sizeof(drv_btnw_sig)];
+
+    if (!at) { DrvLog("drv button: no unique match"); return 0; }
+
+    memcpy(rep, drv_btnw_sig, sizeof(rep));
+    rep[DRV_BTNW_SLOT] = 0x3c;           /* [ebp-0xc0] -> [ebp-0xc4] */
+    if (!WriteCode(at, rep, sizeof(rep))) return 0;
+
+    DrvLog("drv button: width now from H/480 -- 45-unit sprite is round again");
+    return 1;
+}
+
+//
+// V29.  The race timer's milliseconds.
+//
+// The clock reads "01:13" bottom-left with ".82" beside it, and the ".82" sat
+// far out to the right.  Measured: the clock's anchor is 640-space x=10 and
+// the milliseconds' is x=176, both landing on exact integers through the x3.0
+// position map.
+//
+// THE GAME IS SELF-CONSISTENT AND STILL WRONG, which is the interesting part.
+// 0x4fdb44 draws the clock, then measures the string it just drew and places
+// the milliseconds one advance-width later:
+//
+//      0x4fdba4   DrawShadowText(10, 424, "01:13", ...)
+//      0x4fdbb2   width = MeasureString(buf, 1)
+//      0x4fdbd9   msX   = 10 + (int)width
+//      0x4fdc17   DrawShadowText(msX, 426, ".82", ...)
+//
+// and MeasureString (0x40b3fc) sums glyph advances straight out of the font
+// table **with no glyph-scale multiply at all** -- unlike the renderer's own
+// centring pass at 0x40aee4, which multiplies each advance by ds:0x54cad4.
+// So `width` is in NATIVE 640-space units and `10 + width` is a correct
+// 640-space x.
+//
+// It comes apart at the map: positions go through MapX at W/640 = 3.0 while
+// the glyphs, since V8, are drawn at H/480 = 1.6667.  The advance is therefore
+// tripled while the digits it is meant to step over only grow by 1.667, and
+// the milliseconds land 1.8x too far along.  Exactly the shape of V23.
+//
+// So the measured advance is multiplied by
+//
+//      K = (640 * H) / (480 * W)
+//
+// which is 1.0 at 4:3 -- an EXACT NO-OP there -- and 0.5556 at 1920x800.  The
+// milliseconds' anchor then sits one CORRECTLY SCALED advance after the
+// clock's: 30 + 166*0.5556*3.0 = 306.7 screen pixels, and 166 * 1.6667 = 276.7
+// is the same distance, so it lands exactly where the digits end.
+//
+// PATCHED AT THE MEASURE, not at either use, because MeasureString has exactly
+// TWO callers and both are this timer -- 0x4fdbb2 for the bottom-left layout
+// and 0x4fdc6f for the centred one, which does `320 + width/2` and needs the
+// same correction on its half-width.  One patch, both layouts, and no other
+// code can be affected.
+//
+// The thunk is redirected rather than the function edited: 0x40b3fc ends
+// `fld [ebp-0x4] ; mov esp,ebp ; pop ebp ; ret` in seven bytes with the next
+// function immediately after, so there is no room for a six-byte fmul.  Both
+// callers reach it through the thunk, so one displacement covers them.
+//
+#define DRV_MEAS_THUNK 0x00401839u   /* jmp 0x40b3fc */
+#define DRV_MEAS_FUNC  0x0040b3fcu
+
+static int InstallDrvTimer(void)
+{
+    unsigned char *th = (unsigned char *)DRV_MEAS_THUNK;
+    unsigned char *stub;
+    unsigned char  rep[5];
+    float         *k;
+
+    if (!DrvReadable(DRV_MEAS_THUNK, 5)) return 0;
+    if (th[0] != 0xe9 ||
+        (unsigned int)(DRV_MEAS_THUNK + 5 + (int)ReadU32(th + 1)) != DRV_MEAS_FUNC) {
+        DrvLog("drv timer: measure thunk is not as expected -- skipped");
+        return 0;
+    }
+
+    k = DrvConst((640.0f * (float)g_targetH) / (480.0f * (float)g_targetW));
+    if (!k) return 0;
+
+    stub = (unsigned char *)VirtualAlloc(NULL, 32, MEM_COMMIT | MEM_RESERVE,
+                                         PAGE_EXECUTE_READWRITE);
+    if (!stub) return 0;
+
+    //
+    // Entered by JMP, so the frame is the original caller's: [esp] is its
+    // return address and the two arguments sit above it.  They have to be
+    // pushed again for the real call, which is why this is not simply a
+    // `call ; fmul ; ret`.
+    //
+    stub[0] = 0xff; stub[1] = 0x74; stub[2] = 0x24; stub[3] = 0x08; /* push [esp+8]  font */
+    stub[4] = 0xff; stub[5] = 0x74; stub[6] = 0x24; stub[7] = 0x08; /* push [esp+8]  str  */
+    stub[8] = 0xe8;                                                 /* call 0x40b3fc      */
+    PutU32(stub + 9, DRV_MEAS_FUNC - ((unsigned int)stub + 13));
+    stub[13] = 0x83; stub[14] = 0xc4; stub[15] = 0x08;              /* add esp,8          */
+    stub[16] = 0xd8; stub[17] = 0x0d;                               /* fmul ds:K          */
+    PutU32(stub + 18, (unsigned int)k);
+    stub[22] = 0xc3;                                                /* ret                */
+
+    rep[0] = 0xe9;
+    PutU32(rep + 1, (unsigned int)stub - (DRV_MEAS_THUNK + 5));
+    if (!WriteCode(th, rep, 5)) return 0;
+
+    DrvLog("drv timer: advance scaled by %d/1000, stub=%08lx",
+           (int)(1000.0f * (640.0f * (float)g_targetH) /
+                 (480.0f * (float)g_targetW) + 0.5f),
+           (unsigned long)(unsigned int)stub);
+    return 1;
+}
+
+//
+// V30.  The HUD sprite drawer's SIZE -- this is V7, reinstated.
+//
+// V7 was written on 2026-08-18, applied cleanly at both its sites, produced no
+// visible difference across two hardware runs, and was deleted in the cleanup
+// under the project's own rule that a patch never observed to do anything is
+// scaffolding.  That deletion was wrong, and the reason is worth recording:
+// **both of those runs were in-race**, and the screen that exercises this
+// drawer is the tape-recorder menu, which nobody had looked at yet.  "Never
+// observed to do anything" was really "never yet shown a screen that uses it".
+//
+// The bug is plain in the code.  0x419340 computes four quantities from the
+// same pair of globals that 0x418790 fills with W/640 and H/480:
+//
+//      0x419495  fld [ebp+0x8]   ; fmul 0x550660 (W/640)   POSITION x  correct
+//      0x4194a1  fld [ebp+0xc]   ; fmul 0x550664 (H/480)   POSITION y  correct
+//      0x4194ad  fld [ebp-0x11c] ; fmul 0x550660 (W/640)   SIZE w      WRONG
+//      0x4194bc  fld [ebp-0x120] ; fmul 0x550664 (H/480)   SIZE h      correct
+//
+// where [ebp-0x11c] and [ebp-0x120] are the sprite's own width and height
+// bytes (sprite[+0xb] and sprite[+0xc], each less 0.5).  Using the width scale
+// for the width and the height scale for the height is correct for a POSITION
+// and wrong for a SIZE: at 4:3 the two are equal and it cannot be seen, and at
+// 21:9 every sprite comes out (W/640)/(H/480) = 1.80x wider than tall.
+//
+// That is exactly the reported symptom -- the four selection buttons on the
+// tape-recorder menu measured 151 x 84, a ratio of 1.80 to three digits.
+//
+// Two sites, 0x4194b3 and 0x4199d3, in a drawer and its sibling.  Four bytes
+// each: repoint the disp32 from the width scale to the height scale.  The
+// count of two is the build check, and it is an EXACT NO-OP at 4:3.
+//
+// The position multiplies are deliberately untouched -- those are right, and
+// they are what keeps corner-anchored HUD sprites in the corners.
+//
+static const unsigned char drv_sprsz_sig[] = {
+    0xd9,0x85, 0xe4,0xfe,0xff,0xff,      /* fld  [ebp-0x11c]  sprite width */
+    0xd8,0x0d, 0x60,0x06,0x55,0x00       /* fmul ds:0x550660  W/640        */
+};
+#define DRV_SPRSZ_SLOT  8                /* the disp32 */
+#define DRV_SPRSZ_COUNT 2
+
+static int InstallDrvSpriteSize(unsigned char *code, unsigned int codeSize)
+{
+    unsigned char rep[4];
+
+    PutU32(rep, 0x00550664u);                    /* -> H/480 */
+
+    return DrvPatchAll(code, codeSize, drv_sprsz_sig, sizeof(drv_sprsz_sig),
+                       DRV_SPRSZ_COUNT, DRV_SPRSZ_SLOT, rep, sizeof(rep),
+                       "sprite size");
+}
+
 static int InstallDrvDrawDistance(void)
 {
     static const struct { const unsigned int *sites; unsigned int count;
@@ -9422,7 +9624,7 @@ static void DriverApply(const char *exePath, const char *ini, BOOL haveIni)
     unsigned int   mask = DRV_P_ALL;
     int            dist = 0, text = 0, size = 0, bar = 0, res2 = 0;
     int            frusp = 0, uiscl = 0, ranch = 0, needle = 0, strike = 0;
-    int            menu = 0, load = 0;
+    int            menu = 0, load = 0, btn = 0, timer = 0, sprsz = 0;
 
     if (!PathEndsWith(exePath, "Game.exe") &&
         !PathEndsWith(exePath, "GAME.ICD")) return;
@@ -9515,15 +9717,18 @@ static void DriverApply(const char *exePath, const char *ini, BOOL haveIni)
     if (mask & DRV_P_NEEDLE) needle = InstallDrvNeedle();
     if (mask & DRV_P_STRIKE) strike = InstallDrvStrikeX();
     if (mask & DRV_P_MENU)   menu   = InstallDrvMenu();
-    if (mask & DRV_P_LOAD)   load   = InstallDrvLoad();
+    if (mask & DRV_P_LOAD)   load   = InstallDrvLoad();
+    if (mask & DRV_P_BTN)    btn    = InstallDrvButton(code, codeSize);
+    if (mask & DRV_P_TIMER)  timer  = InstallDrvTimer();
+    if (mask & DRV_P_SPRSZ)  sprsz  = InstallDrvSpriteSize(code, codeSize);
 
     DrvLog("drv applied  target=%lux%lu enum=%lu divisor=%08lx "
            "res2=%d text=%d bar=%d size=%d dist=%d frusp=%d uiscl=%d ranch=%d "
-           "needle=%d strike=%d menu=%d load=%d",
+           "needle=%d strike=%d menu=%d load=%d btn=%d timer=%d sprsz=%d",
            (unsigned long)g_targetW, (unsigned long)g_targetH,
            (unsigned long)g_targetRes, (unsigned long)g_drvDivisor,
            res2, text, bar, size, dist, frusp, uiscl, ranch, needle, strike,
-           menu, load);
+           menu, load, btn, timer, sprsz);
 
     g_drvActive     = TRUE;
     g_drvPrevFilter = SetUnhandledExceptionFilter(DrvCrashFilter);
