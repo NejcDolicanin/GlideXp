@@ -7289,16 +7289,6 @@ static void MdkApply(const char *exePath, const char *ini, BOOL haveIni)
 // initialiser cannot suffer that.
 //
 
-/* V1.  The 800x600 mode-table row, matched whole so the check doubles as the
-   idempotency test -- a row already carrying the new size does not match and is
-   skipped.  ONLY this row is taken over; 320x240, 512x384, 640x480, 1024x768,
-   1280x1024 and 1600x1200 all keep meaning exactly what they say. */
-static const unsigned char drv_row800_find[] = {
-    0x20,0x03,0x00,0x00,  0x58,0x02,0x00,0x00,
-    '8','0','0',' ','x',' ','6','0','0',0x00,0x00,0x00,
-    0x00,0x00,0x00,0x00,  0x08,0x00,0x00,0x00
-};
-
 /* V2.  0x4265d2 -- the tail of the width -> Glide enum chain's upper branch:
    `cmp [ebp-0xc],1600 ; je <1600 arm> ; jmp <fail>`.
    Only the five-byte `jmp` at offset 13 is rewritten, so the 1600x1200 arm
@@ -7570,27 +7560,102 @@ static float *DrvConst(float v)
 // the whole image); it is written so a dump of the table still reads as what
 // it now means.
 //
+//
+// V1/V3/V17.  The mode plumbing -- EVERY entry, not just one.
+//
+// This reverses the requirement of 2026-08-18, which was "with an override
+// active, patch the in-game 800x600 entry and nothing else".  The reasoning
+// then was that the other modes should keep meaning what they say.  It does not
+// survive contact with what the override actually does:
+//
+//   the driver forces its override resolution inside grSstWinOpen whatever the
+//   game asked for, so EVERY mode already displays at the override size.
+//
+// An unpatched selection therefore does not mean "1024x768 as labelled" -- it
+// means the game believes 1024x768 while the screen is 1920x800, which is the
+// corner-island failure with the projection, the HUD and the front end all
+// laid out for the wrong size.  There is no selection that behaves correctly
+// unpatched, so leaving six of the seven alone protected nothing.  Taking all
+// seven means whatever is already in CONFIG.DAT works, and nobody has to be
+// told which entry to pick.
+//
+// With the override Disabled, g_targetRes is 0, GameFix_Apply returns before
+// any of this, and the mode list is untouched -- so the game is stock.
+//
+// The three places a mode lives, and all three have to agree:
+//
+//   0x54d790   the mode TABLE, 7 records of 28 bytes
+//              { u32 w; u32 h; char name[12]; u32 flags; u32 glideEnum }
+//   0x54bcc0   the size WinMain already latched out of it at 0x524477,
+//              before we ran -- what 0x40c431 and 0x40c6b6 re-apply
+//   0x41f411   the jump table's 7 arms, 16 bytes apart, each
+//              `mov [ebp-0x4],w ; mov [ebp-0x10],h` -- a second, unrelated
+//              latch that took six builds to find (see V17's history)
+//
+// Every row and every arm is verified against the stock value it must still
+// hold before anything is written, so the seven checks double as the build
+// check and a second application is a no-op.
+//
+#define DRV_MODE_TAB   0x0054d790u   /* 7 x 28 bytes                      */
+#define DRV_MODE_N     7
+#define DRV_MODE_STRIDE 28
+#define DRV_ARM_TAB    0x0041f411u   /* 7 x 16 bytes, 14 of them ours     */
+#define DRV_ARM_STRIDE 16
+
+struct DrvMode { unsigned int w, h, glideEnum; };
+
+static const struct DrvMode drv_modes[DRV_MODE_N] = {
+    {  320,  240, 0x01 },
+    {  512,  384, 0x03 },
+    {  640,  480, 0x07 },
+    {  800,  600, 0x08 },
+    { 1024,  768, 0x0c },
+    { 1280, 1024, 0x0d },
+    { 1600, 1200, 0x0e }
+};
+
 static BOOL InstallDrvModeRow(unsigned char *data, unsigned int dataSize)
 {
-    unsigned char *at;
-    unsigned char  rep[28];
-    char           name[16];
-    int            n;
+    unsigned char name[12];
+    char          buf[16];
+    int           i, n, wrote = 0;
 
-    at = FindUnique(data, dataSize, drv_row800_find, 28);
-    if (!at) { DrvLog("drv 800x600 row: no unique match"); return FALSE; }
+    (void)data; (void)dataSize;
 
-    memcpy(rep, drv_row800_find, 28);
-    PutU32(rep + 0, g_targetW);
-    PutU32(rep + 4, g_targetH);
+    /* Verify all seven first: a half-rewritten table would leave some
+       selections working and others not, which is worse than none. */
+    for (i = 0; i < DRV_MODE_N; i++) {
+        unsigned int at = DRV_MODE_TAB + (unsigned int)i * DRV_MODE_STRIDE;
+        if (!DrvReadable(at, DRV_MODE_STRIDE)) return FALSE;
+        if (ReadU32((const unsigned char *)at)      != drv_modes[i].w ||
+            ReadU32((const unsigned char *)at + 4)  != drv_modes[i].h ||
+            ReadU32((const unsigned char *)at + 24) != drv_modes[i].glideEnum) {
+            DrvLog("drv modes: row %d is not stock -- table left alone", i);
+            return FALSE;
+        }
+    }
 
-    memset(rep + 8, 0, 12);
-    n = wsprintfA(name, "%u x %u", g_targetW, g_targetH);
-    if (n > 0 && n < 12) memcpy(rep + 8, name, (unsigned int)n);
+    memset(name, 0, sizeof(name));
+    n = wsprintfA(buf, "%u x %u", g_targetW, g_targetH);
+    if (n > 0 && n < (int)sizeof(name)) memcpy(name, buf, (unsigned int)n);
 
-    PutU32(rep + 24, g_targetRes);
+    for (i = 0; i < DRV_MODE_N; i++) {
+        unsigned char *at = (unsigned char *)(DRV_MODE_TAB +
+                            (unsigned int)i * DRV_MODE_STRIDE);
+        unsigned char  rep[DRV_MODE_STRIDE];
 
-    return WriteCode(at, rep, 28);
+        memcpy(rep, at, DRV_MODE_STRIDE);
+        PutU32(rep + 0, g_targetW);
+        PutU32(rep + 4, g_targetH);
+        memcpy(rep + 8, name, 12);
+        PutU32(rep + 24, g_targetRes);
+        if (WriteCode(at, rep, DRV_MODE_STRIDE)) wrote++;
+    }
+
+    DrvLog("drv modes: %d of %d rows -> %lux%lu enum=%lu", wrote, DRV_MODE_N,
+           (unsigned long)g_targetW, (unsigned long)g_targetH,
+           (unsigned long)g_targetRes);
+    return wrote == DRV_MODE_N;
 }
 
 //
@@ -7665,36 +7730,37 @@ static BOOL InstallDrvEnum(unsigned char *code, unsigned int codeSize)
 }
 
 //
-// V3.  The size the game has ALREADY taken out of the table.
+// V3.  The size WinMain already latched, before we ran.
 //
-// WinMain reads CONFIG.DAT and copies table[index] into 0x54bcc0/0x54bcc4
-// before it calls grGlideInit, so by the time we run, V1 is a patch on a table
-// that has already been consumed once.  These two globals are what the game
-// actually re-applies (0x40c431 compares them against the live size and calls
-// the mode setter when they differ), so they are the ones that decide what the
-// first race runs at.
-//
-// Rewritten ONLY when they still read exactly 800x600, which is both the
-// idempotency test and the whole of "this applies to the 800x600 entry".  Any
-// other selection is left completely alone.
+// LoadConfig has six call sites and 0x40c431 / 0x40c6b6 compare these against
+// the live size and re-apply the mode when they differ, so these decide what
+// the first race runs at.  Accepting any of the seven stock sizes rather than
+// only 800x600 is the whole of this change; the test also serves as the
+// idempotency check, since the target is never one of them.
 //
 static BOOL InstallDrvConfig(void)
 {
     unsigned int w, h;
+    int i;
 
     if (!DrvReadable(DRV_CFG_W, 8)) return FALSE;
 
     w = *(volatile unsigned int *)DRV_CFG_W;
     h = *(volatile unsigned int *)DRV_CFG_H;
 
-    if (w != 800 || h != 600) {
-        DrvLog("drv config: %ux%u selected, not 800x600 -- left alone", w, h);
-        return FALSE;
-    }
+    if (w == g_targetW && h == g_targetH) return TRUE;   /* already done */
 
-    *(volatile unsigned int *)DRV_CFG_W = g_targetW;
-    *(volatile unsigned int *)DRV_CFG_H = g_targetH;
-    return TRUE;
+    for (i = 0; i < DRV_MODE_N; i++)
+        if (w == drv_modes[i].w && h == drv_modes[i].h) {
+            *(volatile unsigned int *)DRV_CFG_W = g_targetW;
+            *(volatile unsigned int *)DRV_CFG_H = g_targetH;
+            DrvLog("drv config: latched %ux%u -> %lux%lu", w, h,
+                   (unsigned long)g_targetW, (unsigned long)g_targetH);
+            return TRUE;
+        }
+
+    DrvLog("drv config: latched %ux%u is not a stock mode -- left alone", w, h);
+    return FALSE;
 }
 
 //
@@ -8002,36 +8068,43 @@ static unsigned char *g_drvFrustum = NULL;   /* our generated copy */
 // the disagreement between the two numbers or hid its consequences, which is
 // why each looked plausible and none was the cause.
 //
-// Their fix repurposes mode row 6 and tells the user to select 1600x1200; V1
-// here rewrites BOTH row 3 and row 6, so both arms are patched to match.
+// Their fix repurposes mode row 6 and tells the user to select 1600x1200.  We
+// take all seven rows and all seven arms instead, so no selection is special
+// and CONFIG.DAT can say whatever it already says -- see V1 above.
 //
-static const unsigned char drv_res2_800[] = {
-    0xc7,0x45,0xfc, 0x20,0x03,0x00,0x00,     /* mov [ebp-0x4],  800 */
-    0xc7,0x45,0xf0, 0x58,0x02,0x00,0x00      /* mov [ebp-0x10], 600 */
-};
-static const unsigned char drv_res2_1600[] = {
-    0xc7,0x45,0xfc, 0x40,0x06,0x00,0x00,     /* mov [ebp-0x4], 1600 */
-    0xc7,0x45,0xf0, 0xb0,0x04,0x00,0x00      /* mov [ebp-0x10],1200 */
-};
-
 static int InstallDrvRes2(unsigned char *code, unsigned int codeSize)
 {
-    static const unsigned char *sigs[2] = { drv_res2_800, drv_res2_1600 };
-    unsigned int i;
-    int          n = 0;
+    /* mov DWORD PTR [ebp-0x4], imm32 ; mov DWORD PTR [ebp-0x10], imm32 */
+    static const unsigned char head1[3] = { 0xc7, 0x45, 0xfc };
+    static const unsigned char head2[3] = { 0xc7, 0x45, 0xf0 };
+    int i, n = 0;
 
-    for (i = 0; i < 2; i++) {
-        unsigned char *at = FindUnique(code, codeSize, sigs[i], 14);
+    (void)code; (void)codeSize;
+
+    /* All seven verified against stock before any is written. */
+    for (i = 0; i < DRV_MODE_N; i++) {
+        const unsigned char *at = (const unsigned char *)
+            (DRV_ARM_TAB + (unsigned int)i * DRV_ARM_STRIDE);
+        if (!DrvReadable((unsigned int)(unsigned long)at, 14)) return 0;
+        if (memcmp(at, head1, 3) != 0 || memcmp(at + 7, head2, 3) != 0 ||
+            ReadU32(at + 3)  != drv_modes[i].w ||
+            ReadU32(at + 10) != drv_modes[i].h) {
+            DrvLog("drv res2: arm %d is not stock -- none written", i);
+            return 0;
+        }
+    }
+
+    for (i = 0; i < DRV_MODE_N; i++) {
+        unsigned char *at = (unsigned char *)
+            (DRV_ARM_TAB + (unsigned int)i * DRV_ARM_STRIDE);
         unsigned char  rep[14];
 
-        if (!at) { DrvLog("drv res2: arm %lu missing", (unsigned long)i); continue; }
-
-        memcpy(rep, sigs[i], 14);
+        memcpy(rep, at, 14);
         PutU32(rep + 3,  g_targetW);
         PutU32(rep + 10, g_targetH);
         if (WriteCode(at, rep, 14)) n++;
     }
-    DrvLog("drv res2: %d of 2 arms -> %lux%lu", n,
+    DrvLog("drv res2: %d of %d arms -> %lux%lu", n, DRV_MODE_N,
            (unsigned long)g_targetW, (unsigned long)g_targetH);
     return n;
 }
@@ -9367,54 +9440,41 @@ static void DriverApply(const char *exePath, const char *ini, BOOL haveIni)
     if (!GetCodeRange(mod, &code, &codeSize)) return;
     if (!GetSectionRange(mod, ".data", &data, &dataSize)) return;
 
-    if (haveIni) {
-        mask = (unsigned int)GetPrivateProfileIntA("DRIVER", "patches",
-                                                   (int)DRV_P_ALL, ini);
-        //
-        // 480 = true Hor+, and it is now the default: the full vertical view
-        // plus extra world at the sides.  That is the point of the exercise.
-        //
-        // It was 0 (AUTO / Vert-) for a long time because widening the view
-        // made distant geometry vanish at the screen edges.  V21 is the cause:
-        // the engine builds its left/right frustum clip planes from a
-        // hardcoded 4:3 aspect, so a wider projection was clipped back to the
-        // 4:3 frustum.  With that corrected the artefact is gone and there is
-        // no reason to ship the narrower view.
-        //
-        // 0 still means AUTO -- `640*H/W`, which makes the world scale come out
-        // at exactly `W/640`, the value the game computes for itself.  Every
-        // patch here is then an exact no-op and the picture is Vert-, the same
-        // width of world as 4:3 with less height.  Kept as a fallback and as a
-        // one-line bisect: if something ever looks wrong at the edges again,
-        // virtual_height=0 says immediately whether it is the widened view.
-        //
-        g_drvVirtualH = (unsigned int)GetPrivateProfileIntA("DRIVER",
-                                                    "virtual_height", 480, ini);
-        if (g_drvVirtualH == 0 && g_targetW)
-            g_drvVirtualH = (640u * g_targetH + g_targetW / 2) / g_targetW;
-        if (g_drvVirtualH < 120)  g_drvVirtualH = 120;
-        if (g_drvVirtualH > 8192) g_drvVirtualH = 8192;
-
-        //
-        // The reciprocal table is why the ceiling in DrvTick exists.  The
-        // projection is `screenX = camX * focal * recip[z] + W/2`, and `recip`
-        // is a TABLE at 0xc24520, built at 0x528277 for indices 0..0xdbba-1 --
-        // z up to 56249 and no further.  A vertex past that reads off the end
-        // of the array, so its reciprocal is garbage and the polygon streaks
-        // toward a vanishing point.  The game's own 45000 maximum is that
-        // table's capacity with margin.
-        //
-        // The array cannot simply grow: 0xc24520 + 0xdbba*4 = 0xc5b3e8 and the
-        // next referenced global is 0xc5b408, so there are 32 spare bytes.
-        // Relocating it is Ignition-F1-shaped work (345 references) for 25%
-        // more distance.
-        //
-        // NOTE: this is NOT what made surfaces vanish at the screen edges.
-        // That was V21, the 4:3 frustum clip planes.  The streaking this
-        // paragraph describes is a different artefact, and reading one as the
-        // other cost four builds.
-        //
-    }
+    //
+    // NO INI.  Driver has no preferences left: every patch here is either a
+    // correctness fix or an exact no-op, and the two knobs that used to exist
+    // are both settled.
+    //
+    //   virtual_height  480 = true Hor+, the full vertical view plus extra
+    //                   world at the sides, which is the point of the exercise
+    //                   and confirmed on hardware.  It was 0 (AUTO / Vert-)
+    //                   for a long time only because widening the view made
+    //                   distant geometry vanish at the screen edges -- and
+    //                   that turned out to be V21, the 4:3 frustum clip
+    //                   planes, not the width of the view.  With V21 in there
+    //                   is no reason to ship the narrower picture.
+    //
+    //   patches         one bit per installer, for bisecting on hardware.
+    //                   Scaffolding by the project's own rule, and everything
+    //                   it could bisect is confirmed.  The bits are kept
+    //                   because they cost nothing -- mask is a constant, so
+    //                   the compiler folds every test away -- and because a
+    //                   future bisect is then one edit rather than a redesign.
+    //
+    // The reciprocal table is why the ceiling in DrvTick exists and why
+    // draw_distance went the same way.  The projection is
+    // `screenX = camX * focal * recip[z] + W/2` and `recip` is a TABLE at
+    // 0xc24520, built at 0x528277 for indices 0..0xdbba-1 -- z up to 56249 and
+    // no further.  A vertex past that reads off the end of the array, so its
+    // reciprocal is garbage and the polygon streaks toward a vanishing point.
+    // The game's own 45000 maximum is that table's capacity with margin, so
+    // the ceiling is a correctness limit and is enforced unconditionally.
+    //
+    // NOTE: that streaking is NOT what made surfaces vanish at the screen
+    // edges.  That was V21.  Reading one as the other cost four builds.
+    //
+    (void)ini; (void)haveIni;
+    g_drvVirtualH = 480;
 
     // The enum has to fit a `push imm8`; every enum in the wide driver's list
     // does, but a sign-extended push would be a silent disaster.
@@ -9433,8 +9493,7 @@ static void DriverApply(const char *exePath, const char *ini, BOOL haveIni)
            (unsigned long)(unsigned int)data, (unsigned long)dataSize,
            (unsigned long)mask, (unsigned long)g_drvVirtualH,
            (unsigned long)g_drvDrawPct);
-    DrvLog("drv sigs row800=%d tail=%d arm=%d proj=%d",
-           FindUnique(data, dataSize, drv_row800_find, 28)              ? 1 : 0,
+    DrvLog("drv sigs tail=%d arm=%d proj=%d",
            FindUnique(code, codeSize, drv_enumtail_sig,
                       sizeof(drv_enumtail_sig))                         ? 1 : 0,
            FindUnique(code, codeSize, drv_arm1600_sig,
