@@ -7283,7 +7283,8 @@ static void MdkApply(const char *exePath, const char *ini, BOOL haveIni)
 #define DRV_P_BTN     0x10000u
 #define DRV_P_TIMER   0x20000u
 #define DRV_P_SPRSZ   0x40000u
-#define DRV_P_ALL     0x7ffffu
+#define DRV_P_FLARE   0x80000u
+#define DRV_P_ALL     0xfffffu
 
 //
 // Signatures are byte arrays rather than string literals on purpose: two
@@ -9452,6 +9453,127 @@ static int InstallDrvSpriteSize(unsigned char *code, unsigned int codeSize)
                        "sprite size");
 }
 
+//
+// V31.  The sun flare's falloff radius -- the "severely overbright" effect.
+//
+// Reported as: driving toward the sun washes the whole screen out.  Measured
+// off a matched pair of 1920x800 screenshots with the effect on and off (the
+// car parked, so ON minus OFF *is* the additive contribution):
+//
+//      mean luma  163.7 -> 217.1        pixels at >= 250:  1.0% -> 54.9%
+//      delta is +73..76 across the WHOLE screen, peaking at 156 at the sun
+//
+// So it is one very large additive glow centred on the sun, not a sprite in
+// the wrong place -- and the user's own observation pins the mechanism
+// exactly: "very subtle at 4:3, a bit more visible at 16:9, and just very
+// overbright at 21:9".  That progression is 1.0 / 1.33 / 1.8, which is the
+// project's recurring factor (W/640) / (H/480).
+//
+// The drawer is 0x4b594d (it owns the SUN2 texture handle by way of 0x117a3b0
+// and sets additive blending three times).  Its intensity is a plain linear
+// falloff in SCREEN PIXELS:
+//
+//      0x4b5a75   sunOff = camOff * focal * recip[32000]     ; pixels
+//      0x4b5ead   d      = sqrt(sunOffX^2 + sunOffY^2)       ; pixels
+//      0x4b5996   R      = screenWidth * uiZoom              ; <-- THE BUG
+//      0x4b5ef9   I      = (R - min(d,R)) / R * scale
+//
+// R and d are both in pixels, so this looks self-consistent -- and at 4:3 it
+// is.  The projection scale S multiplies d, so
+//
+//      d / R  =  k * theta * S / W
+//
+// and at 4:3 S is W/640, which cancels W outright: d/R = k*theta/640,
+// identical at 320x240 and at 1600x1200.  That invariance is exactly what
+// makes it look right on every mode the game shipped.
+//
+// V4 breaks it.  Hor+ derives S from the HEIGHT (H/480) so the vertical field
+// stays put and the extra width buys world, which means W no longer cancels:
+//
+//      d / R  =  k * theta / (640 * AR)      AR = (W/640)/(H/480) = 1.8
+//
+// so d/R comes out 1.8x too small and the flare stays near full intensity far
+// off-axis.  A sun that gives I = 0.1 at 4:3 -- "very subtle" -- gives 0.5 at
+// 21:9.  It is worse the further off-axis the sun is, which is why the report
+// is "severely" overbright rather than a fixed amount, and it is why nothing
+// about the sprite's SIZE could have explained it (V28 narrows that sprite and
+// was rightly exonerated: an additive quad's peak does not rise when it
+// shrinks).
+//
+// The fix is to give R the same units d is measured in.  Stock says R = W when
+// S = W/640, so for any S the intended radius is
+//
+//      R = 640 * S = 640 * H / virtual_height
+//
+// which is 4H/3 at the default virtual_height of 480.  That is EXACTLY W at
+// every 4:3 mode the game offers -- 640, 800, 1024, 1600 all come out as whole
+// numbers equal to their own width -- so this is an exact no-op there, and
+// 1067 instead of 1920 at 1920x800.
+//
+// Four bytes: the `fild` reads a DWORD, so pointing its disp32 at an int32 of
+// ours is the whole patch.  Nothing lengthens, nothing moves.  The 27-byte
+// signature is unique in the image, and every other use of [ebp-0x48] in the
+// routine is the same R in the same falloff, so one edit covers all of them.
+//
+// NOT patched, and recorded rather than guessed at: 0x4b5f45 computes
+// (sunX << 10) / (640 * uiZoom) from the sun's real screen x -- another
+// hardcoded 640 where the screen width belongs, feeding 0x40106e.  It is a
+// texture or table coordinate of some kind, its element has not been
+// identified, and it is not the reported symptom.
+//
+static const unsigned char drv_flare_sig[] = {
+    0xdb,0x05, 0x08,0xff,0x2e,0x01,      /* fild ds:0x12eff08   screen width */
+    0xd9,0x9d, 0x30,0xfe,0xff,0xff,      /* fstp [ebp-0x1d0]                 */
+    0xd9,0x05, 0xc0,0xe6,0x2d,0x01,      /* fld  ds:0x12de6c0   uiZoom       */
+    0xd8,0x8d, 0x30,0xfe,0xff,0xff,      /* fmul [ebp-0x1d0]                 */
+    0xd9,0x5d, 0xb8                      /* fstp [ebp-0x48]     R            */
+};
+#define DRV_FLARE_SLOT 2                 /* the fild's disp32 */
+
+static unsigned int *DrvConstI(unsigned int v)
+{
+    static unsigned int *page = NULL;
+    static int           used = 0;
+
+    if (!page) {
+        page = (unsigned int *)VirtualAlloc(NULL, 4096, MEM_COMMIT | MEM_RESERVE,
+                                            PAGE_READWRITE);
+        if (!page) return NULL;
+    }
+    if (used >= 1024) return NULL;
+    page[used] = v;
+    return &page[used++];
+}
+
+static int InstallDrvFlare(unsigned char *code, unsigned int codeSize)
+{
+    unsigned char *at;
+    unsigned char  rep[sizeof(drv_flare_sig)];
+    unsigned int  *r;
+    unsigned int   radius;
+
+    if (!g_drvVirtualH) return 0;
+
+    /* R = 640 * S, S being the projection scale V4 installs.  Rounded, though
+       at every 4:3 mode it is already a whole number equal to the width. */
+    radius = (640u * g_targetH + g_drvVirtualH / 2u) / g_drvVirtualH;
+
+    at = FindUnique(code, codeSize, drv_flare_sig, sizeof(drv_flare_sig));
+    if (!at) { DrvLog("drv flare: no unique match -- skipped"); return 0; }
+
+    r = DrvConstI(radius);
+    if (!r) return 0;
+
+    memcpy(rep, drv_flare_sig, sizeof(rep));
+    PutU32(rep + DRV_FLARE_SLOT, (unsigned int)r);
+    if (!WriteCode(at, rep, sizeof(rep))) return 0;
+
+    DrvLog("drv flare: falloff radius %lu -> %lu px (640 * %lu / %lu)",
+           (unsigned long)g_targetW, (unsigned long)radius,
+           (unsigned long)g_targetH, (unsigned long)g_drvVirtualH);
+    return 1;
+}
+
 static int InstallDrvDrawDistance(void)
 {
     static const struct { const unsigned int *sites; unsigned int count;
@@ -9623,6 +9745,7 @@ static void DriverApply(const char *exePath, const char *ini, BOOL haveIni)
     unsigned int   codeSize = 0, dataSize = 0;
     unsigned int   mask = DRV_P_ALL;
     int            dist = 0, text = 0, size = 0, bar = 0, res2 = 0;
+    int            flare = 0;
     int            frusp = 0, uiscl = 0, ranch = 0, needle = 0, strike = 0;
     int            menu = 0, load = 0, btn = 0, timer = 0, sprsz = 0;
 
@@ -9721,14 +9844,15 @@ static void DriverApply(const char *exePath, const char *ini, BOOL haveIni)
     if (mask & DRV_P_BTN)    btn    = InstallDrvButton(code, codeSize);
     if (mask & DRV_P_TIMER)  timer  = InstallDrvTimer();
     if (mask & DRV_P_SPRSZ)  sprsz  = InstallDrvSpriteSize(code, codeSize);
+    if (mask & DRV_P_FLARE)  flare  = InstallDrvFlare(code, codeSize);
 
     DrvLog("drv applied  target=%lux%lu enum=%lu divisor=%08lx "
            "res2=%d text=%d bar=%d size=%d dist=%d frusp=%d uiscl=%d ranch=%d "
-           "needle=%d strike=%d menu=%d load=%d btn=%d timer=%d sprsz=%d",
+           "needle=%d strike=%d menu=%d load=%d btn=%d timer=%d sprsz=%d flare=%d",
            (unsigned long)g_targetW, (unsigned long)g_targetH,
            (unsigned long)g_targetRes, (unsigned long)g_drvDivisor,
            res2, text, bar, size, dist, frusp, uiscl, ranch, needle, strike,
-           menu, load, btn, timer, sprsz);
+           menu, load, btn, timer, sprsz, flare);
 
     g_drvActive     = TRUE;
     g_drvPrevFilter = SetUnhandledExceptionFilter(DrvCrashFilter);
