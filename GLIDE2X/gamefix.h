@@ -51,6 +51,10 @@ void GameFix_Tick(void);
 /* TEMPORARY -- called from the wrapper's grBufferClear, after it forwards. */
 void GameFix_AfterClear(void);
 
+/* TEMPORARY -- called from grBufferSwap BEFORE the swap, so MDK's letterbox
+   bars are painted over anything the frame drew outside the picture. */
+void GameFix_PreSwap(void);
+
 #ifdef __cplusplus
 }
 #endif

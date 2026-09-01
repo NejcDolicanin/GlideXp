@@ -3820,6 +3820,12 @@ static unsigned int        g_mdkNumRet    = 0;
 // into the stub below, so nothing in this translation unit calls it and it must
 // keep a plain cdecl frame.
 //
+/* The picture's horizontal extent: the whole screen with backdrop=0/1, the
+   letterboxed box with backdrop=2.  Set once in MdkApply, read by the HUD
+   anchoring below so it lands inside the picture rather than on a bar. */
+static int g_mdkBoxX0 = 0;
+static int g_mdkBoxW  = 0;
+
 extern "C" void __attribute__((cdecl, used, noinline))
 MdkLfbBaseView(unsigned int *out, unsigned int caller, unsigned int callerEbx,
                unsigned int callerEbp)
@@ -3876,10 +3882,17 @@ MdkLfbBaseView(unsigned int *out, unsigned int caller, unsigned int callerEbx,
                drawn in real screen pixels elsewhere.  So position alone is
                enough here, and the call-site test that sent the counter to the
                right is gone. */
+            /* Anchored to the edges of the PICTURE, not of the screen.
+             *
+             * With backdrop=2 those differ: the picture is a letterboxed
+             * 1333x800 inside 1920x800, and the bars are painted last -- so a
+             * HUD anchored to the screen corners was being drawn correctly and
+             * then blacked out.  g_mdkBoxX0/W are the whole screen in the other
+             * modes, which reproduces the previous behaviour exactly. */
             if (p[0] < MDK_HUD_LEFT_X) {
-                cx = 0;                 /* the ammo counter, far left */
+                cx = g_mdkBoxX0;                    /* ammo counter, far left */
             } else {
-                cx = cx * 2;            /* MDK's own right-hand cluster */
+                cx = g_mdkBoxX0 + g_mdkBoxW - MDK_VIEW_W;   /* right cluster  */
             }
             cy = cy * 2;                /* all of it belongs at the bottom */
 
@@ -4115,8 +4128,22 @@ MdkFixPlayer(int *d)
 
     d[0] = (d[0] - MDK_VCENTRE_X) * k / n + (int)g_targetW / 2;
     d[1] = (d[1] - MDK_VCENTRE_Y) * k / n + (int)g_targetH / 2;
-    d[4] = d[4] * k / n;
-    d[5] = d[5] * k / n;
+
+    /* Enlarge via the DRAWN SIZE fields, never via d[4]/d[5].
+     *
+     * This used to scale d[4] and d[5], which looked equivalent because
+     * `destW = (d[4]*d[2])>>8` -- moving the factor between the two gives the
+     * same destination size either way.  It is not equivalent: d[4] also feeds
+     * the SOURCE ROW ADVANCE at 0x40473a, so scaling it walks the source
+     * bitmap with the wrong stride and the sprite comes out as horizontal
+     * streaks.  That is the scrambled crawler in the intro gameplay, and it is
+     * the same fault that scrambled the Earth in 0121/0122.
+     *
+     * d[2]/d[3] carry the factor instead: identical drawn size, correct
+     * source addressing.  Verified against the log -- d[4] read 142 after this
+     * hook, i.e. its stock 64 times H/360. */
+    d[2] = d[2] * k / n;
+    d[3] = d[3] * k / n;
 }
 
 static const unsigned char mdk_player_stub[] = {
@@ -4195,6 +4222,12 @@ static const unsigned char mdk_blitend_sig[] =   /* 0x00415d80 */
 /* Source-to-destination scale, 16.16.  1.0 means "do nothing". */
 static unsigned int g_mdkSpriteScale = 0x10000u;
 
+/* Set for the next sprite only, by the hotspot hook, when that sprite must
+   be drawn 1:1 rather than magnified.  The helper at 0x40aacc calls the
+   blitter directly, so a flag set at its entry is still current when the
+   blit runs, and nothing can come between them. */
+static int g_mdkNoScale = 0;
+
 static void MdkFillRect(unsigned char *lfb, int stride,
                         int x0, int y0, int x1, int y1, unsigned short col)
 {
@@ -4220,7 +4253,7 @@ MdkBlitScaled(unsigned int *f)
     const char           *fp;
     unsigned char        *lfb;
     const int            *size;
-    unsigned int          s = g_mdkSpriteScale;
+    unsigned int          s = g_mdkNoScale ? 0x10000u : g_mdkSpriteScale;
     int   x, y, w, h, stride, sx = 0, sy = 0, guard;
 
     if (!f) return;
@@ -4297,6 +4330,21 @@ static const unsigned char mdk_cursor_sig[] =    /* 0x00423430 */
 
 static unsigned int g_mdkCursorRet = 0;
 
+/* K25.  The ammo ICON.  It reaches the shared sprite helper from 0x46bd57,
+   and the log named it: `sprhdr caller=0046bd5c w=48 h=48 hot=24,24 at
+   32,328` -- a 48x48 sprite whose hotspot is dead centre, at the bottom
+   left of the 600x360 layout, right beside the ammo COUNTER at 20,316.
+
+   The counter is drawn by the HUD drawer and so gets K15's anchoring; the
+   icon goes through this helper, whose lock K5 leaves uncentred, so it was
+   left at raw layout coordinates in the top-left corner.  Same split as
+   the mouse cursor. */
+static const unsigned char mdk_ammo_sig[] =      /* 0x0046bd4c */
+    "‹EèÛ]äÓ‹Uäè";
+#define MDK_AMMO_RET   (sizeof(mdk_ammo_sig) - 1 + 4)   /* past the call */
+
+static unsigned int g_mdkAmmoRet = 0;
+
 //
 // Anchor correction, at the shared helper's entry.  The helper is about to do
 // `x -= hotX` / `y -= hotY`, so the incoming position is pre-adjusted and popad
@@ -4329,6 +4377,8 @@ MdkFixHotspot(unsigned int *f)
 
     if (!f) return;
 
+    g_mdkNoScale = 0;                            /* per-sprite, not sticky */
+
     /* K22.  The mouse cursor.
      *
      * The cursor is drawn through this same helper, so it lands in RAW screen
@@ -4357,6 +4407,27 @@ MdkFixHotspot(unsigned int *f)
         f[7] += (unsigned int)g_mdkHudCx;        /* eax -- x */
         f[5] += (unsigned int)g_mdkHudCy;        /* edx -- y */
         return;
+    }
+
+    /* K25.  The ammo icon: anchored like the ammo counter beside it -- the
+       left edge of the PICTURE, and the bottom.  Those are exactly the numbers
+       K15 gives a left-band HUD element, so the two stay together by
+       construction rather than by two tuned offsets.
+
+       Its hotspot is the sprite's centre (24,24 of 48x48), so both axes pivot
+       on the hotspot: that keeps the icon's middle where the maths puts it.
+       The character's bottom-edge pivot below would be wrong here for the same
+       reason it is wrong for the cursor -- it is not standing on anything. */
+    if (g_mdkAmmoRet && f[8] == g_mdkAmmoRet) {
+        /* Drawn 1:1, because the rest of the HUD is.  Measured off hardware:
+           the health gauge comes out 79x59 -- exactly its size at 640x480, so
+           the HUD drawer does not scale at all -- while this icon was being
+           magnified by H/360 and looked far too big beside it.  Matching the
+           HUD it belongs to matters more than matching the screen. */
+        g_mdkNoScale = 1;
+        f[7] += (unsigned int)g_mdkBoxX0;
+        f[5] += (unsigned int)(g_mdkHudCy * 2);
+        return;                                  /* 1:1, so no anchor to fix */
     }
 
     if (s == 0x10000u) return;
@@ -5127,8 +5198,13 @@ static void InstallMdkSpriteScale(unsigned char *code, unsigned int codeSize)
            been, which is the state this build inherits rather than a broken
            one.  Zero here disables the offset by itself. */
         g_mdkCursorRet = cur ? (unsigned int)(cur + MDK_CURSOR_RET) : 0;
-        MdkDiag("cursor ret=%08lx  offset=%ld,%ld",
-                (long)g_mdkCursorRet, (long)g_mdkHudCx, (long)g_mdkHudCy);
+
+        cur = FindUnique(code, codeSize, mdk_ammo_sig,
+                         sizeof(mdk_ammo_sig) - 1);
+        g_mdkAmmoRet = cur ? (unsigned int)(cur + MDK_AMMO_RET) : 0;
+        MdkDiag("cursor ret=%08lx  ammo ret=%08lx  offset=%ld,%ld  box=%ld",
+                (long)g_mdkCursorRet, (long)g_mdkAmmoRet,
+                (long)g_mdkHudCx, (long)g_mdkHudCy, (long)g_mdkBoxX0);
     }
 
     /* --- the anchor correction ------------------------------------------- */
@@ -5587,6 +5663,12 @@ static void InstallMdkArtCentre(unsigned char *code, unsigned int codeSize)
     if (!WriteCode(at, patch, 5)) VirtualFree(stub, 0, MEM_RELEASE);
 }
 
+/* The width of the box the backdrop occupies -- the whole screen with
+   backdrop=1, the letterboxed picture with backdrop=2.  Defined with the
+   backdrop code below; declared here because the Earth must size itself
+   against the same box or it draws across the bars. */
+static int MdkBoxWidth(void);
+
 //
 // K16g.  Make the Earth reach the bottom of the screen, exactly.
 //
@@ -5626,25 +5708,75 @@ static const unsigned char mdk_earth_sig[] =     /* 0x00410453 */
 extern "C" void __attribute__((cdecl, used, noinline))
 MdkEarthCover(int *d)
 {
-    int destH, need, want;
+    int srcW, srcH, posY, kw, kh, k, boxW;
 
-    /* d: posX, posY, srcW, srcH, scaleX, scaleY, pixels */
+    /* d: posX, posY, srcW, srcH, scaleX, scaleY, pixels
+     *
+     * srcW and srcH are not source dimensions -- they set the DRAWN size.
+     * `destW = (d[4]*srcW)>>8` while the source traversal is fixed by d[4], so
+     * srcW:srcH IS the drawn aspect.  Stock is 428:142 = 3.01 at the end of
+     * the travel; an earlier build pushed srcW alone to W/2, making it 7.66,
+     * which is the horizontal stretch that came back from hardware.
+     *
+     * So scale BOTH by one factor.  The shape is then stock's by construction,
+     * and the factor is whatever makes the Earth both span the screen and
+     * reach the bottom:
+     *
+     *      kw = W / (2*srcW)                 fill the width
+     *      kh = (H - posY) / srcH            reach the bottom  (posY is the
+     *                                        sprite's CENTRE, so half the
+     *                                        drawn height is srcH)
+     *      k  = max(kw, kh)
+     *
+     * d[4] is never touched: it feeds the source ROW ADVANCE at 0x40473a, and
+     * changing it walks the bitmap with the wrong stride -- the scrambling in
+     * 0121 and 0122.  d[5] is left alone too, so the 2x magnification and
+     * therefore the sampling stay exactly as the game intended. */
     if (!d || IsBadWritePtr(d, 7 * sizeof(int))) return;
-    if (d[5] <= 0 || d[3] <= 0) return;
+    if (!g_targetW || !g_targetH) return;
 
-    need = (int)g_targetH - d[1];               /* posY .. bottom of screen  */
-    if (need <= 0) return;                      /* already below the screen  */
+    srcW = d[2];
+    srcH = d[3];
+    posY = d[1];
+    if (srcW <= 0 || srcH <= 0) return;
 
-    destH = (d[5] * d[3]) >> 8;
-    if (destH >= need) return;                  /* already covers            */
+    /* The Earth belongs inside whatever box the BACKDROP occupies.  With
+       backdrop=2 that is a letterboxed 1333x800 at 1920x800, not the whole
+       screen -- and sizing the Earth against the screen is what made it spill
+       across the black bars.  Ask the same helper the backdrop uses, so the
+       two cannot disagree. */
+    boxW = MdkBoxWidth();
 
-    want = ((need << 8) + d[5] - 1) / d[5];     /* ceil, in source rows      */
+    kw = (int)(((unsigned int)boxW << 16) / (unsigned int)(2 * srcW));
+    kh = (posY >= (int)g_targetH)
+       ? 0
+       : (int)(((unsigned int)((int)g_targetH - posY) << 16) /
+               (unsigned int)srcH);
 
-    if (MdkDiagFresh(0x3e000000u ^ ((unsigned int)d[1] & 0x7ff)))
-        MdkDiag("earth cover: posY=%ld srcH=%ld destH=%ld need=%ld -> srcH=%ld",
-                (long)d[1], (long)d[3], (long)destH, (long)need, (long)want);
+    k = kw > kh ? kw : kh;
 
-    d[3] = want;
+    /* Deliberately NOT capped to the box.  Capping it keeps the whole planet
+       inside the letterbox, but then the drawn height is capped too, and to go
+       on covering the bottom the Earth has to stop rising -- a frozen
+       animation, which is worse than the thing it fixes.  Instead it is sized
+       freely and the BARS are painted last (GameFix_PreSwap), so anything
+       outside the picture is cut off the way a letterbox actually works. */
+
+    if (k <= (1 << 16)) return;                 /* already big enough */
+
+    if (MdkDiagFresh(0x3e000000u))
+        MdkDiag("earth: posY(centre)=%ld k=%ld/65536 srcW %ld->%ld"
+                " srcH %ld->%ld ratio %ld/100 screen=%lux%lu",
+                (long)posY, (long)k, (long)srcW,
+                (long)(((long)srcW * k) >> 16), (long)srcH,
+                (long)(((long)srcH * k) >> 16),
+                (long)(100 * srcW / srcH),
+                (unsigned long)boxW, (unsigned long)g_targetH);
+
+    /* 32-bit is sufficient and avoids libgcc's 64-bit helpers: the largest
+       product here is about 660 million (srcW 2228 * k 4.53<<16). */
+    d[2] = (int)(((unsigned int)srcW * (unsigned int)k) >> 16);
+    d[3] = (int)(((unsigned int)srcH * (unsigned int)k) >> 16);
 }
 
 static const unsigned char mdk_earth_stub[] = {
@@ -5775,7 +5907,14 @@ static void InstallMdkSpritePos(unsigned char *code, unsigned int codeSize)
                 (long)(sPos * 1000.0));
     }
 
-    MdkPutFloat (0x0048bc20u, (float)( 64.0 * s),  64.0f);          /* a size */
+    /* The moon's base SIZE.  It scales with intro_scale, exactly like its
+       growth rate at 0x48bc1c -- these two are srcW/srcH offsets and so
+       set the DRAWN size, and moving them together is what keeps the moon
+       round.  It used to scale by H/360 while the other used intro_scale,
+       so the knob only changed how fast the moon grew, not how big it
+       started. */
+    MdkPutFloat (0x0048bc20u,
+                 (float)(64.0 * g_mdkIntroScale / 100.0), 64.0f);
 
     MdkPutDouble(0x0048bc24u, -0.1 * s, -0.1);
     MdkPutDouble(0x0048bc2cu,  0.8 * s,  0.8);
@@ -5792,13 +5931,20 @@ static void InstallMdkSpritePos(unsigned char *code, unsigned int codeSize)
         WriteCode(at + 7, imm, 4);
     }
 
-    /* There are TWO of these drawers -- 0x410308 and 0x4103B0 -- each with its
-       own copy of the constants.  The first attempt anchored on a constant
-       belonging to the first, so only that one was corrected and the intro
-       background, drawn by the second, kept the old centre: the log shows it
-       reaching the blitter with x=300 exactly, frame after frame, which is the
-       untouched `mov edx,300` default. */
-    MdkPutFloat(0x0048bc48u, (float)centre, 300.0f);
+    /* 0x48bc48 is DELIBERATELY left at its stock 300.
+     *
+     * It was rewritten to `centre` here for a long time, on the reading that it
+     * was the Earth's horizontal position.  It is not -- it is the offset of
+     * the Earth's srcW, and srcW is what sets the DRAWN WIDTH.  Pushing it from
+     * 300 to W/2 therefore widened the Earth without touching its height:
+     * stock's srcW:srcH of 428:142 (3.01) became 1088:142 (7.66), which is a
+     * 2.5x horizontal stretch and exactly the "it is horizontally stretched"
+     * that came back from hardware.
+     *
+     * The width is now handled in MdkEarthCover, which scales srcW and srcH
+     * TOGETHER so the ratio -- and therefore the planet's shape -- is stock's
+     * at every point of the animation.  Leaving this at 300 is what lets that
+     * start from the correct ratio. */
 
     at = FindUnique(code, codeSize, sig2, sizeof(sig2) - 1);
     if (at) {
@@ -5919,12 +6065,99 @@ static void InstallMdkLfbLinear(unsigned char *code, unsigned int codeSize)
    screen has to look like when the source is 1.67:1.  Stretching was confirmed
    correct in the same run, so per the project's own rule the losing option is
    deleted rather than left in the ini as a choice nobody would make. */
-static int g_mdkBackdrop = 1;
+static int g_mdkBackdrop = 1;   /* 0 off, 1 stretch, 2 original aspect + bars */
 
 /* One scaled row, in system memory, reused every row and every frame.  Never
    freed -- it lives as long as the hook that uses it.  Same reason K14 has one:
    the framebuffer must only ever be written, never read back. */
 static unsigned short *g_mdkBdRow = NULL;
+
+/* Work out where a srcW x srcH picture goes on a W x H screen, and the 16.16
+   source steps to get it there.
+
+   mode 1 STRETCH  fills the screen exactly; a 600x360 source on 2.4:1 comes
+                   out 44% too wide.
+   mode 2 FIT      one magnification for both axes, so the picture keeps its
+                   original shape, centred, with bars on the surplus.  At
+                   1920x800 that is 1333x800 with 293 px of bar each side.
+
+   Returns the destination rectangle; the caller fills anything outside it. */
+static void MdkFitRect(int srcW, int srcH, int W, int H, int fit,
+                       int *dx0, int *dy0, int *dw, int *dh,
+                       unsigned int *sxStep, unsigned int *syStep)
+{
+    int w = W, h = H;
+
+    if (fit) {
+        /* Largest whole-pixel box of the source's shape that fits.  Compared
+           as a cross-product so there is no divide and no rounding drift. */
+        if (srcW * H > srcH * W) h = (W * srcH) / srcW;   /* wider: bars top/bottom */
+        else                     w = (H * srcW) / srcH;   /* taller: bars each side */
+        if (w < 1) w = 1;
+        if (h < 1) h = 1;
+    }
+
+    *dw  = w;
+    *dh  = h;
+    *dx0 = (W - w) / 2;
+    *dy0 = (H - h) / 2;
+    *sxStep = ((unsigned int)srcW << 16) / (unsigned int)w;
+    *syStep = ((unsigned int)srcH << 16) / (unsigned int)h;
+}
+
+/* Set by either backdrop when it draws, cleared once the bars are painted.
+   Without it the bars would also appear during in-level play, where the 3D
+   legitimately owns the whole screen and there is no letterbox. */
+static int g_mdkBoxDrew = 0;
+
+/* Paint everything outside the picture black, as the last thing in the frame.
+   Doing it here rather than up front is what makes the letterbox real: sprites
+   drawn after the backdrop -- the Earth especially -- would otherwise run
+   across the bars. */
+static void MdkPaintBars(void)
+{
+    unsigned short *base;
+    int             W, H, strideP, dx0, dy0, dw, dh, y;
+    unsigned int    sx, sy;
+
+    if (!g_mdkBoxDrew) return;
+    g_mdkBoxDrew = 0;
+
+    if (g_mdkBackdrop != 2) return;             /* only mode 2 has bars */
+    if (!g_mdkLfbPtr || !*g_mdkLfbPtr || !g_mdkStride) return;
+
+    W = (int)g_targetW;
+    H = (int)g_targetH;
+    strideP = (int)(*g_mdkStride / 2);
+    if (W <= 0 || H <= 0 || strideP <= 0) return;
+    if (W > strideP) W = strideP;
+
+    MdkFitRect(MDK_BD_W, MDK_BD_H, W, H, 1, &dx0, &dy0, &dw, &dh, &sx, &sy);
+
+    base = (unsigned short *)*g_mdkLfbPtr;
+    for (y = 0; y < H; y++) {
+        unsigned short *dst = base + (unsigned int)y * (unsigned int)strideP;
+
+        if (y < dy0 || y >= dy0 + dh) {
+            memset(dst, 0, (unsigned int)W * 2);
+        } else {
+            if (dx0 > 0)      memset(dst, 0, (unsigned int)dx0 * 2);
+            if (dx0 + dw < W) memset(dst + dx0 + dw, 0,
+                                     (unsigned int)(W - dx0 - dw) * 2);
+        }
+    }
+}
+
+static int MdkBoxWidth(void)
+{
+    int dx0, dy0, dw, dh;
+    unsigned int sx, sy;
+
+    if (!g_targetW || !g_targetH) return (int)g_targetW;
+    MdkFitRect(MDK_BD_W, MDK_BD_H, (int)g_targetW, (int)g_targetH,
+               g_mdkBackdrop == 2, &dx0, &dy0, &dw, &dh, &sx, &sy);
+    return dw;
+}
 
 extern "C" void __attribute__((cdecl, used, noinline))
 MdkBackdrop(unsigned int *f)
@@ -5934,7 +6167,8 @@ MdkBackdrop(unsigned int *f)
     unsigned short       *base, *dst, *row;
     unsigned int          ebp;
     int                   strideB, strideP, W, H, x, y, lastRow = -1;
-    unsigned int          sxStep, syStep, sx0, sy0, sy;
+    int                   dx0, dy0, dw, dh;
+    unsigned int          sxStep, syStep, sy;
 
     if (!f) return;
     src = (const unsigned char *)f[1];          /* esi -- the source image  */
@@ -5973,12 +6207,8 @@ MdkBackdrop(unsigned int *f)
 
     /* 16.16 throughout: at 1920x800 the vertical factor is 2.22, and whole
        pixel steps would be 10% wrong. */
-    sxStep = ((unsigned int)MDK_BD_W << 16) / (unsigned int)W;
-    syStep = ((unsigned int)MDK_BD_H << 16) / (unsigned int)H;
-
-    /* Centre whatever is left over, so a crop takes equally from both sides. */
-    sx0 = (((unsigned int)MDK_BD_W << 16) - sxStep * (unsigned int)W) / 2;
-    sy0 = (((unsigned int)MDK_BD_H << 16) - syStep * (unsigned int)H) / 2;
+    MdkFitRect(MDK_BD_W, MDK_BD_H, W, H, g_mdkBackdrop == 2,
+               &dx0, &dy0, &dw, &dh, &sxStep, &syStep);
 
     /* Everything is built in a system-memory row and then copied out.
      *
@@ -5988,29 +6218,43 @@ MdkBackdrop(unsigned int *f)
      * PCI are orders of magnitude slower than writes, and ~1.7 MB of them a
      * frame took the game to about 1 fps.  Nothing here touches the LFB except
      * to write to it, sequentially, once per output row. */
-    sy = sy0;
-    for (y = 0; y < H; y++, sy += syStep) {
-        int srcRow = (int)(sy >> 16);
+    g_mdkBoxDrew = 1;
 
-        if (srcRow < 0) srcRow = 0;
+    sy = 0;
+    for (y = 0; y < H; y++) {
+        int srcRow;
+
+        dst = base + (unsigned int)y * (unsigned int)strideP;
+
+        /* Outside the picture: a bar.  Written rather than left alone, so a
+           letterbox cannot show whatever the last frame put there. */
+        if (y < dy0 || y >= dy0 + dh) {
+            memset(dst, 0, (unsigned int)W * 2);
+            continue;
+        }
+
+        srcRow = (int)(sy >> 16);
+        sy += syStep;
         if (srcRow >= MDK_BD_H) srcRow = MDK_BD_H - 1;
 
         /* Vertical magnification is 2.22x at 1920x800, so most output rows
-           repeat the previous source row and cost only the copy out. */
+           repeat the previous source row and cost only the copy out.  The
+           bars are built into the row, so they cost nothing extra. */
         if (srcRow != lastRow) {
             const unsigned char *s = src + (unsigned int)srcRow * MDK_BD_W;
-            unsigned int         sx = sx0;
+            unsigned int         sx = 0;
 
-            for (x = 0; x < W; x++, sx += sxStep) {
+            for (x = 0; x < dx0; x++) row[x] = 0;
+            for (; x < dx0 + dw; x++, sx += sxStep) {
                 unsigned int col = sx >> 16;
 
                 if (col >= MDK_BD_W) col = MDK_BD_W - 1;
                 row[x] = pal[s[col]];
             }
+            for (; x < W; x++) row[x] = 0;
             lastRow = srcRow;
         }
 
-        dst = base + (unsigned int)y * (unsigned int)strideP;
         memcpy(dst, row, (unsigned int)W * 2);
     }
 }
@@ -6030,6 +6274,366 @@ static const unsigned char mdk_bd_stub[] = {
 };
 #define MDK_BD_CALL_AT    3
 #define MDK_BD_JMP_AT    12
+
+//
+// K23.  The intro GAMEPLAY backdrop -- K20's twin, with horizontal scrolling.
+//
+// K20 fixed the menu and the intro sequence's starfield.  The dive still drew
+// 1:1, because it is a DIFFERENT routine: 0x4101cc, in the intro module right
+// beside the moon (0x410308) and Earth (0x4103b0) drawers, gated on the same
+// 0x53970c flag they are, and using the same 8bpp palette at 0x546848.  Same
+// 600x360, but scrolled horizontally with a wrap:
+//
+//     lock view LFB   -> base, strideBytes ; stride /= 2
+//     for (row = 0; row < 0x168; row++) {
+//         0x46e884(dst, src + 600-scroll, scroll)      ; the wrapped part
+//         0x46e884(dst + 2*scroll, src, 600-scroll)    ; the rest
+//         src += 600 ; dst += stride
+//     }
+//
+// It has TWO of those loops -- one per sign of the scroll -- so both are
+// hooked, sharing one body.  The two branches' formulas reduce to the same
+// thing, which is what makes that possible:
+//
+//     scroll >= 0 :  shown[i] = src[(600 - scroll + i) mod 600]
+//     scroll <  0 :  shown[i] = src[(i - scroll) mod 600]
+//     and (600 - scroll + i) mod 600 == (i - scroll) mod 600
+//
+// Entered after the lock and rejoined at each branch's unlock (section 5c), so
+// the lock, the pointer and the teardown all stay with the game.  As in K20 the
+// origin is taken from the framebuffer global rather than the value the lock
+// returned, because K5 has already offset that one by the 2D centring -- using
+// it here is what turned K20's first build into a diagonal.
+//
+#define MDK_IBG_SRC     0x004e5cecu       /* pointer to the 600x360 source   */
+#define MDK_IBG_SCROLL  0x00492510u       /* the horizontal scroll, signed   */
+
+extern "C" void __attribute__((cdecl, used, noinline))
+MdkIntroBg(unsigned short *base, int strideP)
+{
+    const unsigned char  *src;
+    const unsigned short *pal = (const unsigned short *)MDK_BD_PAL;
+    unsigned short       *row = g_mdkBdRow, *dst;
+    int                   scroll, W, H, x, y, lastRow = -1;
+    unsigned int          sxStep, syStep, sy, col0;
+
+    (void)base;
+
+    src    = *(const unsigned char * const *)MDK_IBG_SRC;
+    scroll = *(const int *)MDK_IBG_SCROLL;
+
+    /* Log the FIRST call whatever happens, including every early-out.
+     *
+     * 0119 hooked both branches of this routine -- the header proved that --
+     * and the dive background did not change.  "Hooked but never runs" and
+     * "runs and declines" are then indistinguishable, which is precisely the
+     * failure GAME-PATCHING section 6 warns about: a guarded hook that logs
+     * nothing is still saying something, so say it. */
+    if (MdkDiagFresh(0x1b000000u))
+        MdkDiag("introbg RUN stride=%ld src=%08lx scroll=%ld row=%08lx lfb=%08lx",
+                (long)strideP, (long)(unsigned int)src, (long)scroll,
+                (long)(unsigned int)row,
+                (long)(g_mdkLfbPtr ? *g_mdkLfbPtr : 0));
+
+    if (!row || !g_mdkLfbPtr || !*g_mdkLfbPtr || strideP <= 0) return;
+    if (!src) return;
+
+    W = (int)g_targetW;
+    H = (int)g_targetH;
+    if (W <= 0 || H <= 0) return;
+    if (W > strideP) W = strideP;              /* never run off the row */
+
+    sxStep = ((unsigned int)MDK_BD_W << 16) / (unsigned int)W;
+    syStep = ((unsigned int)MDK_BD_H << 16) / (unsigned int)H;
+
+    /* Start column, wrapped into 0..599, in 16.16.  Kept as a running value so
+       the inner loop needs no modulo -- one subtract when it passes the end. */
+    scroll %= MDK_BD_W;
+    if (scroll < 0) scroll += MDK_BD_W;
+    col0 = (unsigned int)((MDK_BD_W - scroll) % MDK_BD_W) << 16;
+
+    base = (unsigned short *)*g_mdkLfbPtr;
+
+    sy = 0;
+    for (y = 0; y < H; y++, sy += syStep) {
+        int srcRow = (int)(sy >> 16);
+
+        if (srcRow >= MDK_BD_H) srcRow = MDK_BD_H - 1;
+
+        if (srcRow != lastRow) {
+            const unsigned char *s = src + (unsigned int)srcRow * MDK_BD_W;
+            unsigned int         sx = col0;
+
+            for (x = 0; x < W; x++) {
+                row[x] = pal[s[sx >> 16]];
+                sx += sxStep;
+                if (sx >= ((unsigned int)MDK_BD_W << 16))
+                    sx -= (unsigned int)MDK_BD_W << 16;
+            }
+            lastRow = srcRow;
+        }
+
+        dst = base + (unsigned int)y * (unsigned int)strideP;
+        memcpy(dst, row, (unsigned int)W * 2);
+    }
+}
+
+/* Two sites, identical shape, different frame slots and rejoin.  `base` and
+   `stride` are pushed by the stub from the routine's own locals, which is why
+   each site needs its own displacements. */
+struct MdkIbgSite {
+    const unsigned char *sig;
+    unsigned char        baseDisp;    /* push -X(%ebp) -> the LFB base   */
+    unsigned char        strideDisp;  /* push -X(%ebp) -> stride, PIXELS */
+    unsigned int         rejoin;      /* the branch's unlock call        */
+};
+
+static const unsigned char mdk_ibgA_sig[] = "\x8b\x75\xe8\x31\xff";   /* 0x410213 */
+static const unsigned char mdk_ibgB_sig[] = "\x8d\x04\x3f\x31\xf6";   /* 0x410296 */
+
+static const MdkIbgSite mdk_ibg[] = {
+    { mdk_ibgA_sig, 0xdc, 0xe0, 0x00410262u },   /* base [-0x24] stride [-0x20] */
+    { mdk_ibgB_sig, 0xd4, 0xd8, 0x004102e4u }    /* base [-0x2c] stride [-0x28] */
+};
+#define MDK_IBG_SITES (sizeof(mdk_ibg) / sizeof(mdk_ibg[0]))
+
+static const unsigned char mdk_ibg_stub[] = {
+    0x60,                       // pushad
+    0xff, 0x75, 0x00,           // push  -X(%ebp)   stride        <- disp @3
+    0xff, 0x75, 0x00,           // push  -X(%ebp)   base          <- disp @6
+    0xe8, 0, 0, 0, 0,           // call  MdkIntroBg        rel32  <- @8
+    0x83, 0xc4, 0x08,           // add   $0x8,%esp
+    0x61,                       // popad
+    0xe9, 0, 0, 0, 0            // jmp   the unlock        rel32  <- @17
+};
+#define MDK_IBG_STRIDE_AT   3
+#define MDK_IBG_BASE_AT     6
+#define MDK_IBG_CALL_AT     8
+#define MDK_IBG_JMP_AT     17
+
+//
+// K24.  The intro-GAMEPLAY (dive) background -- the perspective floor.
+//
+// This is NOT a blit, which is why K23 was aimed at the wrong thing.  0x412978
+// locks the framebuffer and calls a span renderer at 0x46f6a0 whose control
+// data is SIXTEEN PRECOMPUTED TABLES at 0x4e5d74[frame] -- span lengths plus a
+// per-pixel shading byte, generated for a 600-column view.  Regenerating those
+// for W columns, with the perspective and the shading still right, is a large
+// and risky job.
+//
+// So instead: let it render at its native 600x360 into a buffer of ours, and
+// scale that out.  Exactly K20's mechanism, which is confirmed working and
+// fast, and it needs to understand nothing about the span format.
+//
+// The renderer takes one parameter block in eax:
+//
+//      +0x28  destination row advance   (the game sets stride - 1200,
+//                                        i.e. "next row after 600 pixels")
+//      +0x2c  destination pointer       (written by the framebuffer lock)
+//
+// Pointing +0x2c at a 600-pixel-wide buffer and setting +0x28 to zero is the
+// whole redirection: the renderer already advances 2 bytes per pixel across
+// 600 pixels, so a zero row advance lands exactly on the next row.
+//
+// Hooked at the CALL (section 5b) so the lock, the unlock and everything else
+// stay with the game, and the renderer target is read out of the displaced
+// instruction rather than hardcoded -- the mistake that crashed 0116.
+//
+#define MDK_DIVE_W   600
+#define MDK_DIVE_H   360
+
+static unsigned short *g_mdkDiveBuf  = NULL;
+static unsigned int    g_mdkDiveDest = 0;
+static unsigned int    g_mdkDiveAdv  = 0;
+
+extern "C" void __attribute__((cdecl, used, noinline))
+MdkDiveBefore(unsigned int *p)
+{
+    if (!p || !g_mdkDiveBuf || IsBadWritePtr(p, 0x40)) return;
+
+    g_mdkDiveDest = p[0x2c / 4];
+    g_mdkDiveAdv  = p[0x28 / 4];
+    p[0x2c / 4]   = (unsigned int)g_mdkDiveBuf;
+    p[0x28 / 4]   = 0;                          /* rows are exactly 600 wide */
+}
+
+extern "C" void __attribute__((cdecl, used, noinline))
+MdkDiveAfter(unsigned int *p)
+{
+    const unsigned short *src = g_mdkDiveBuf;
+    unsigned short       *row = g_mdkBdRow, *dst, *base;
+    int                   W, H, x, y, strideP, lastRow = -1;
+    int                   dx0, dy0, dw, dh;
+    unsigned int          sxStep, syStep, sy;
+
+    if (!p || !g_mdkDiveBuf || IsBadWritePtr(p, 0x40)) return;
+
+    /* Put the game's own values back before anything can go wrong below. */
+    p[0x2c / 4] = g_mdkDiveDest;
+    p[0x28 / 4] = g_mdkDiveAdv;
+
+    if (!row || !g_mdkLfbPtr || !*g_mdkLfbPtr || !g_mdkStride) return;
+
+    strideP = (int)(*g_mdkStride / 2);
+    W = (int)g_targetW;
+    H = (int)g_targetH;
+    if (W <= 0 || H <= 0 || strideP <= 0) return;
+    if (W > strideP) W = strideP;
+
+    /* The true framebuffer origin, not the centred one the lock handed back --
+       K5 has already offset that, and using it is what made K20's first build
+       a diagonal. */
+    base = (unsigned short *)*g_mdkLfbPtr;
+    MdkFitRect(MDK_DIVE_W, MDK_DIVE_H, W, H, g_mdkBackdrop == 2,
+               &dx0, &dy0, &dw, &dh, &sxStep, &syStep);
+
+    g_mdkBoxDrew = 1;
+
+    sy = 0;
+    for (y = 0; y < H; y++) {
+        int srcRow;
+
+        dst = base + (unsigned int)y * (unsigned int)strideP;
+
+        if (y < dy0 || y >= dy0 + dh) {         /* a bar */
+            memset(dst, 0, (unsigned int)W * 2);
+            continue;
+        }
+
+        srcRow = (int)(sy >> 16);
+        sy += syStep;
+        if (srcRow >= MDK_DIVE_H) srcRow = MDK_DIVE_H - 1;
+
+        if (srcRow != lastRow) {
+            const unsigned short *s = src + (unsigned int)srcRow * MDK_DIVE_W;
+            unsigned int          sx = 0;
+
+            for (x = 0; x < dx0; x++) row[x] = 0;
+            for (; x < dx0 + dw; x++, sx += sxStep) {
+                unsigned int col = sx >> 16;
+
+                if (col >= MDK_DIVE_W) col = MDK_DIVE_W - 1;
+                row[x] = s[col];
+            }
+            for (; x < W; x++) row[x] = 0;
+            lastRow = srcRow;
+        }
+
+        memcpy(dst, row, (unsigned int)W * 2);
+    }
+}
+
+static const unsigned char mdk_dive_sig[] =      /* 0x00412d21 */
+    "\xe8\x7a\xc9\x05\x00\xe8";
+#define MDK_DIVE_CALL_AT   0                     /* the call we replace */
+
+static const unsigned char mdk_dive_stub[] = {
+    0x60,                       // pushad
+    0x50,                       // push  %eax   -> the parameter block
+    0xe8, 0, 0, 0, 0,           // call  MdkDiveBefore        rel32 <- @3
+    0x83, 0xc4, 0x04,           // add   $0x4,%esp
+    0x61,                       // popad
+    0xe8, 0, 0, 0, 0,           // call  the real renderer    rel32 <- @12
+    0x60,                       // pushad
+    0x50,                       // push  %eax
+    0xe8, 0, 0, 0, 0,           // call  MdkDiveAfter         rel32 <- @19
+    0x83, 0xc4, 0x04,           // add   $0x4,%esp
+    0x61,                       // popad
+    0xc3                        // ret   (back to the game)
+};
+#define MDK_DIVE_B_AT    3
+#define MDK_DIVE_R_AT   12
+#define MDK_DIVE_A_AT   19
+
+static void InstallMdkDive(unsigned char *code, unsigned int codeSize)
+{
+    unsigned char *at, *stub, *target, patch[5];
+    int            rel;
+
+    if (!g_mdkBackdrop) return;                  /* shares K20's switch */
+
+    at = FindUnique(code, codeSize, mdk_dive_sig, sizeof(mdk_dive_sig) - 1);
+    if (!at) return;
+
+    /* Read the renderer out of the call being displaced (GAME-PATCHING 5b). */
+    target = (at + 5) + (int)ReadU32(at + 1);
+
+    if (!g_mdkBdRow)
+        g_mdkBdRow = (unsigned short *)VirtualAlloc(NULL, (g_targetW + 8) * 2,
+                                                    MEM_COMMIT, PAGE_READWRITE);
+    if (!g_mdkDiveBuf)
+        g_mdkDiveBuf = (unsigned short *)VirtualAlloc(
+                           NULL, MDK_DIVE_W * MDK_DIVE_H * 2,
+                           MEM_COMMIT, PAGE_READWRITE);
+    if (!g_mdkBdRow || !g_mdkDiveBuf) return;
+
+    stub = (unsigned char *)VirtualAlloc(NULL, sizeof(mdk_dive_stub),
+                                         MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+    if (!stub) return;
+
+    memcpy(stub, mdk_dive_stub, sizeof(mdk_dive_stub));
+    rel = (int)((unsigned char *)&MdkDiveBefore - (stub + MDK_DIVE_B_AT + 4));
+    PutU32(stub + MDK_DIVE_B_AT, (unsigned int)rel);
+    rel = (int)(target - (stub + MDK_DIVE_R_AT + 4));
+    PutU32(stub + MDK_DIVE_R_AT, (unsigned int)rel);
+    rel = (int)((unsigned char *)&MdkDiveAfter - (stub + MDK_DIVE_A_AT + 4));
+    PutU32(stub + MDK_DIVE_A_AT, (unsigned int)rel);
+
+    patch[0] = 0xe8;                             /* call rel32 -> stub */
+    PutU32(patch + 1, (unsigned int)(int)(stub - (at + 5)));
+    if (!WriteCode(at, patch, 5)) {
+        VirtualFree(stub, 0, MEM_RELEASE);
+        return;
+    }
+    MdkDiag("dive: site=%08lx renderer=%08lx stub=%08lx buf=%08lx",
+            (long)(unsigned int)at, (long)(unsigned int)target,
+            (long)(unsigned int)stub, (long)(unsigned int)g_mdkDiveBuf);
+}
+
+static void InstallMdkIntroBg(unsigned char *code, unsigned int codeSize)
+{
+    unsigned int i;
+
+    if (!g_mdkBackdrop) return;                 /* shares K20's switch */
+
+    /* K20 normally owns the scratch row, but it allocates only after its own
+       signature matches -- so do not depend on that having happened. */
+    if (!g_mdkBdRow)
+        g_mdkBdRow = (unsigned short *)VirtualAlloc(NULL, (g_targetW + 8) * 2,
+                                                    MEM_COMMIT, PAGE_READWRITE);
+    if (!g_mdkBdRow) return;
+
+    for (i = 0; i < MDK_IBG_SITES; i++) {
+        const MdkIbgSite *s = &mdk_ibg[i];
+        unsigned char    *at, *stub, patch[5];
+        int               rel;
+
+        at = FindUnique(code, codeSize, s->sig, 5);
+        if (!at) continue;
+
+        stub = (unsigned char *)VirtualAlloc(NULL, sizeof(mdk_ibg_stub),
+                                             MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+        if (!stub) return;
+
+        memcpy(stub, mdk_ibg_stub, sizeof(mdk_ibg_stub));
+        stub[MDK_IBG_STRIDE_AT] = s->strideDisp;
+        stub[MDK_IBG_BASE_AT]   = s->baseDisp;
+        rel = (int)((unsigned char *)&MdkIntroBg - (stub + MDK_IBG_CALL_AT + 4));
+        PutU32(stub + MDK_IBG_CALL_AT, (unsigned int)rel);
+        rel = (int)((unsigned char *)s->rejoin - (stub + MDK_IBG_JMP_AT + 4));
+        PutU32(stub + MDK_IBG_JMP_AT, (unsigned int)rel);
+
+        patch[0] = 0xe9;                        /* jmp rel32 -> stub */
+        PutU32(patch + 1, (unsigned int)(int)(stub - (at + 5)));
+        if (!WriteCode(at, patch, 5)) {
+            VirtualFree(stub, 0, MEM_RELEASE);
+            continue;
+        }
+        MdkDiag("introbg %lu: site=%08lx stub=%08lx rejoin=%08lx",
+                (unsigned long)i, (long)(unsigned int)at,
+                (long)(unsigned int)stub, (long)s->rejoin);
+    }
+}
 
 static void InstallMdkBackdrop(unsigned char *code, unsigned int codeSize)
 {
@@ -6966,6 +7570,13 @@ void GameFix_AfterClear(void)
    happens to sit above it.  TEMPORARY, and leaves with that diagnostic. */
 static void DrvTick(void);
 
+/* TEMPORARY -- called from the wrapper's grBufferSwap BEFORE it forwards, so
+   the letterbox bars are the last thing written to the frame. */
+void GameFix_PreSwap(void)
+{
+    MdkPaintBars();
+}
+
 void GameFix_Tick(void)
 {
     /* V6's viewing-distance ceiling.  Inert for every other game, and inert
@@ -7098,10 +7709,25 @@ static void MdkApply(const char *exePath, const char *ini, BOOL haveIni)
         g_mdkIntroScale = GetPrivateProfileIntA("MDK", "intro_scale", 267, ini);
         if (g_mdkIntroScale < 50)   g_mdkIntroScale = 50;
         if (g_mdkIntroScale > 1000) g_mdkIntroScale = 1000;
-        /* K20: 0 off, 1 stretch to fill. */
-        g_mdkBackdrop = GetPrivateProfileIntA("MDK", "backdrop", 1, ini) ? 1 : 0;
+        /* K20/K24: 0 off, 1 stretch to fill, 2 original aspect with bars.
+           1 is the default -- confirmed on hardware as the better of the two;
+           2 keeps the shape but gives up a third of the screen to bars. */
+        g_mdkBackdrop = GetPrivateProfileIntA("MDK", "backdrop", 1, ini);
+        if (g_mdkBackdrop < 0 || g_mdkBackdrop > 2) g_mdkBackdrop = 1;
         /* K21: 0 keeps the pixel-pipeline LFB, 1 asks for the linear one. */
         g_mdkLfbLinear = GetPrivateProfileIntA("MDK", "lfb_linear", 1, ini) ? 1 : 0;
+    }
+
+    /* The picture's horizontal extent, for the HUD to anchor against.
+       Computed with the same helper the backdrops use, so the HUD and the
+       bars cannot disagree about where the picture ends. */
+    {
+        int dy0, dh;
+        unsigned int sx, sy;
+
+        MdkFitRect(MDK_BD_W, MDK_BD_H, (int)g_targetW, (int)g_targetH,
+                   g_mdkBackdrop == 2,
+                   &g_mdkBoxX0, &dy0, &g_mdkBoxW, &dh, &sx, &sy);
     }
 
     /* TEMPORARY diagnostic -- armed before anything is patched. */
@@ -7143,12 +7769,15 @@ static void MdkApply(const char *exePath, const char *ini, BOOL haveIni)
     if (mask & MDK_P_SKY)      InstallMdkTexReserve(code, codeSize);
     if (mask & MDK_P_SKY)      InstallMdkSky(code, codeSize);
     if (mask & MDK_P_BACKDR)   InstallMdkBackdrop(code, codeSize);
+    if (mask & MDK_P_BACKDR)   InstallMdkIntroBg(code, codeSize);
+    if (mask & MDK_P_BACKDR)   InstallMdkDive(code, codeSize);
 
     MdkDiag("entity spriteRet=%08lx entityRet=%08lx",
             (long)g_mdkSpriteRet, (long)g_mdkEntityRet);
 
-    MdkDiag("hud cx=%ld cy=%ld spriteRet=%08lx",
-            (long)g_mdkHudCx, (long)g_mdkHudCy, (long)g_mdkSpriteRet);
+    MdkDiag("hud cx=%ld cy=%ld spriteRet=%08lx  box=%ld+%ld",
+            (long)g_mdkHudCx, (long)g_mdkHudCy, (long)g_mdkSpriteRet,
+            (long)g_mdkBoxX0, (long)g_mdkBoxW);
     InstallMdkDiag(code, codeSize);
 
     /* Everything above is the header: it survives every capture, and is the

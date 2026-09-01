@@ -109,6 +109,10 @@ NAKED_CALL void FX_CALL grBufferSwap( int swap_interval )
 #define FN_NAME "grBufferSwap"
     GDBG_INFO(80, "%s\n", FN_NAME);
 
+	/* Last chance to touch the frame that is about to be shown: MDK paints
+	   its letterbox bars here, over anything drawn outside the picture. */
+	GameFix_PreSwap();
+
 	using Glide3::grBufferSwap;
 	VOID_ASM_JMP(grBufferSwap, (swap_interval));
 
