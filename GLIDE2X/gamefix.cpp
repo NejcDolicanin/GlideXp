@@ -132,6 +132,15 @@ static const GlideRes g_glideRes[] = {
     { 0x24, 2096,  900 },
     { 0x25, 2304,  960 },
     { 0x26, 2560, 1080 },
+    // Appended 2026-08, and appended in the driver's enum too -- see the note
+    // in sst1vid.h.  600-line widescreen modes, for games whose UI is fixed to
+    // a stock height; none of this wrapper's games uses one, but the dropdown
+    // offers them, so a miss here would be a silent no-patch.
+    { 0x27,  768,  480 },
+    { 0x28,  960,  600 },
+    { 0x29, 1064,  600 },
+    { 0x2a, 1144,  480 },
+    { 0x2b, 1400,  600 },
 };
 
 
@@ -7371,10 +7380,38 @@ static const unsigned char drv_mapr2_sig[] = {
     0xd9,0x05,0x14,0x8b,0x54,0x00        /* fld  ds:0x548b14  (0.14219) */
 };
 
+/* V32.  The radar BLIP scale -- what positions the police cars on the minimap.
+ *
+ *      0x5044a6   [0xbb1c30] = 0.00222168 * W * uiZoom      <- width-derived
+ *      0x5044c4   [0x5762d0] = (W/640) * 540                <- centre X, correct
+ *      0x5044e2   [0x5762d4] = (H/480) * 380                <- centre Y, correct
+ *
+ * The radar's CENTRE is placed correctly, and V10 already made the radar's
+ * FRAME height-derived -- but the scale the blips are plotted with was left on
+ * the width.  So a blip is drawn `1/AR` = 1.8x too far from the centre at
+ * 1920x800, in both axes: exact at the middle, worsening outward.  That is the
+ * reported symptom precisely ("correct near the player, driving off the roads
+ * further out").
+ *
+ * The blip math itself is isotropic and needs nothing else -- 0x508f85 is
+ * `x = delta*scale + centreX` with the SAME scale on both axes -- so correcting
+ * this one constant corrects the whole radar overlay.
+ *
+ * `0xbb1c30` has exactly one writer and eight readers, all blip-position sites,
+ * so nothing else can be disturbed.  Cross-check that it belongs with the two
+ * map-radius entries above: 0.00222168 * 640 = 1.42188, exactly ten times the
+ * 0.142187 they already correct. */
+static const unsigned char drv_radar_sig[] = {
+    0xdb,0x05,0x08,0xff,0x2e,0x01,       /* fild ds:W                     */
+    0xd9,0x5d,0xfc,                      /* fstp [ebp-0x4]                */
+    0xd9,0x05,0x04,0x8b,0x54,0x00        /* fld  ds:0x548b04  (0.0022217) */
+};
+
 static const DrvSizeSite drv_size_sites[] = {
     { drv_mirrorw_sig, sizeof(drv_mirrorw_sig), 14, 0.363636374f, "mirror" },
     { drv_mapr_sig,    sizeof(drv_mapr_sig),    14, 0.100000001f, "map r"  },
-    { drv_mapr2_sig,   sizeof(drv_mapr2_sig),   14, 0.142187506f, "map r2" }
+    { drv_mapr2_sig,   sizeof(drv_mapr2_sig),   14, 0.142187506f, "map r2" },
+    { drv_radar_sig,   sizeof(drv_radar_sig),   11, 0.00222167978f, "radar" }
 };
 
 //
