@@ -55,6 +55,11 @@ void GameFix_AfterClear(void);
    bars are painted over anything the frame drew outside the picture. */
 void GameFix_PreSwap(void);
 
+/* TEMPORARY -- the Glide-geometry probe for the barrel props. */
+extern int GameFix_TriHot;      /* nonzero only while MDK is in snipe mode */
+void GameFix_Tri(const void *a, const void *b, const void *c,
+                 unsigned int caller);
+
 #ifdef __cplusplus
 }
 #endif

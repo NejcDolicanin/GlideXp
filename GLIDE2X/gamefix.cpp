@@ -3798,126 +3798,136 @@ static const unsigned char mdk_hudlock_sig[] =    /* 0x0041940b */
     "\x8d\x55\xe8\x8d\x45\xec\xe8\x62";
 #define MDK_HUDLOCK_RET  11                       /* the call ends here */
 
+/* --- restored -------------------------------------------------------------
+   These declarations were deleted by a bad splice while repairing the two
+   corrupted signatures below.  Recovered from the binary and from their use
+   sites; every byte pattern here was re-read from MDK3DFX.EXE rather than
+   retyped from memory. */
+
+/* The letterboxed picture the backdrop is drawn into.  K15 anchors the HUD to
+   the edges of this rather than of the screen. */
+static int g_mdkBoxX0 = 0;
+static int g_mdkBoxW  = 0;
+
+/* The scope box, and the space everything inside the scope is laid out in. */
+static int g_mdkSnipeX0 = 0, g_mdkSnipeY0 = 0;
+static int g_mdkSnipeW  = 0, g_mdkSnipeH  = 0;
+#define MDK_SCOPE_W    600
+#define MDK_SCOPE_H    360
+
+/* Set when the scope art draws, cleared at the swap: true for exactly the rest
+   of that frame, which is what the HUD needs.  The SKY is drawn from the
+   after-clear hook at the START of a frame, when this has just been cleared,
+   so it gets its own countdown instead. */
+static int g_mdkScopeHold = 0;
+
+/* Read by the wrapper's grDrawTriangle to decide whether to call in at all.
+   Every other game then pays one load and a not-taken branch per triangle
+   rather than a call, and MDK pays it only while the scope is up. */
+int GameFix_TriHot = 0;
+
+/* TEMPORARY.  0x470074 is MDK's shared triangle emitter -- ELEVEN callers --
+   so the return address the probe sees (0x4701cb, its grDrawTriangle call)
+   names the emitter and never the producer.  That is what stalled the barrel
+   props, and it is stalling the red overlay now: the overlay and a pile of
+   world geometry occupy the same screen region and cannot be told apart by
+   shape alone.
+
+   A five-byte hook on the emitter's ENTRY records its caller, which is the
+   producer.  Written so nothing is disturbed: mov touches no flags, and eax
+   is saved because it is one of the arguments. */
+static unsigned int g_mdkEmitFrom = 0;
+
+/* The bare prologue `55 89 e5 56 57` is one of the commonest byte sequences
+   in the image, so the first version of this matched everywhere and declined.
+   Extended through the frame size, which is distinctive; only the first FIVE
+   bytes are replaced. */
+static const unsigned char mdk_emit_sig[] =      /* 0x00470074 */
+    { 0x55, 0x89, 0xe5, 0x56, 0x57, 0x81, 0xec, 0xc8, 0x00, 0x00, 0x00,
+      0x89, 0xde };
+
+static const unsigned char mdk_emit_stub[] = {
+    0x50,                             // push %eax
+    0x8b, 0x44, 0x24, 0x04,           // mov  0x4(%esp),%eax  the return addr
+    0xa3, 0, 0, 0, 0,                 // mov  %eax,g_mdkEmitFrom     <- @6
+    0x58,                             // pop  %eax
+    0x55, 0x89, 0xe5, 0x56, 0x57,     // the displaced five
+    0xe9, 0, 0, 0, 0                  // jmp  back                   <- @17
+};
+#define MDK_EMIT_VAR_AT   6
+#define MDK_EMIT_JMP_AT  17
+
+static void InstallMdkEmitProbe(unsigned char *code, unsigned int codeSize)
+{
+    unsigned char *at, *stub;
+    unsigned char  patch[5];
+
+    at = FindUnique(code, codeSize, mdk_emit_sig, sizeof(mdk_emit_sig));
+    if (!at) { MdkDiag("emit probe: signature not unique"); return; }
+
+    stub = (unsigned char *)VirtualAlloc(NULL, sizeof(mdk_emit_stub),
+                                         MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+    if (!stub) return;
+
+    memcpy(stub, mdk_emit_stub, sizeof(mdk_emit_stub));
+    PutU32(stub + MDK_EMIT_VAR_AT, (unsigned int)&g_mdkEmitFrom);
+    PutU32(stub + MDK_EMIT_JMP_AT,
+           (unsigned int)(int)((at + 5) - (stub + MDK_EMIT_JMP_AT + 4)));
+
+    MdkDiag("emit probe site=%08lx stub=%08lx", (long)(unsigned int)at,
+            (long)(unsigned int)stub);
+
+    patch[0] = 0xe9;
+    PutU32(patch + 1, (unsigned int)(int)(stub - (at + 5)));
+    if (!WriteCode(at, patch, 5))
+        VirtualFree(stub, 0, MEM_RELEASE);
+}
+
+/* K26.  The item frame: the general rect drawer 0x416d30, keyed to the one
+   caller that draws the ammo icon frame, so its other 21 callers are left
+   alone. */
+static const unsigned char mdk_rectlock_sig[] =  /* 0x00416d3b */
+    { 0x89, 0xd7, 0x89, 0x4d, 0xec, 0x8d, 0x55, 0xe4,
+      0x8d, 0x45, 0xe8, 0xe8, 0x2d, 0xa2, 0x05, 0x00 };
+/* The signature ENDS on the return address -- it runs through the call
+   itself -- so no +1.  Getting that wrong by one byte is what misplaced
+   the item frame after the restore: the key never matched. */
+#define MDK_RECT_RET   (sizeof(mdk_rectlock_sig))       /* 0x00416d4b */
+
+static const unsigned char mdk_itemrect_sig[] =  /* 0x0046be30 */
+    { 0x8d, 0x4e, 0x37, 0x89, 0xfa, 0xe8, 0xf6, 0xae, 0xfa, 0xff };
+#define MDK_ITEM_RET   (sizeof(mdk_itemrect_sig))       /* 0x0046be3a */
+
+static unsigned int g_mdkRectRet  = 0;
+static unsigned int g_mdkItemFrom = 0;
+
+/* The enemy health bar's FRAME.  Same rect drawer as the item frame, a
+   different caller, and a different anchor: the top-left of the picture.
+   Its fill (K32) is offset to match, so the two stay together. */
+static const unsigned char mdk_hpframe_sig[] =   /* 0x004388b8 */
+    { 0x6a, 0x0a, 0x8b, 0x4d, 0xdc, 0xbb, 0x04, 0x00, 0x00, 0x00,
+      0x31, 0xd2, 0x89, 0xd8 };
+#define MDK_HPFRAME_RET  (sizeof(mdk_hpframe_sig) + 5)   /* 0x004388cb */
+
+static unsigned int g_mdkHpFrom = 0;
+
 /* The call site inside the HUD code that draws numbers and the weapon icon.
    The health widget comes through other call sites, and that is the only thing
    that separates them -- they share the same narrow band of x. */
 static const unsigned char mdk_numdraw_sig[] =    /* 0x0041904a */
-    "��6T ȍM�"
-    "�  ";
+    { 0xba, 0xb8, 0x36, 0x54, 0x00, 0x01, 0xc8, 0x8d, 0x4d, 0xe4,
+      0xe8, 0xa3, 0x03, 0x00, 0x00 };     /* ...call 0x4193fc */
+#define MDK_NUMDRAW_RET  (sizeof(mdk_numdraw_sig))   /* 0x00419059 */
 
-/* The HUD drawer's entry, hooked purely to record which call site is drawing.
-   Reading it by walking back through the lock's frame was too clever by half
-   and did not work; here the return address is simply on the stack. */
+/* The HUD drawer entry, hooked purely to record which call site is
+   drawing.
+
+   BOTH of these were destroyed by a UTF-8 round trip -- every byte >= 0x80
+   became EF BF BD -- so they matched nothing and these two hooks have
+   never installed.  GCC warned about it on every single build.  Recovered
+   from the binary and written as ARRAYS, which cannot suffer it again. */
 static const unsigned char mdk_huddraw_sig[] =    /* 0x004193fc */
-    "U��VW����";
-
-static unsigned int        g_mdkHudFrom   = 0;
-static unsigned int        g_mdkHudRet    = 0;
-static unsigned int        g_mdkNumRet    = 0;
-
-//
-// Not static, and marked used/noinline: its only reference is the rel32 written
-// into the stub below, so nothing in this translation unit calls it and it must
-// keep a plain cdecl frame.
-//
-/* The picture's horizontal extent: the whole screen with backdrop=0/1, the
-   letterboxed box with backdrop=2.  Set once in MdkApply, read by the HUD
-   anchoring below so it lands inside the picture rather than on a bar. */
-static int g_mdkBoxX0 = 0;
-static int g_mdkBoxW  = 0;
-
-extern "C" void __attribute__((cdecl, used, noinline))
-MdkLfbBaseView(unsigned int *out, unsigned int caller, unsigned int callerEbx,
-               unsigned int callerEbp)
-{
-    int cx = g_mdkHudCx;
-    int cy = g_mdkHudCy;
-
-    if (!out || !g_mdkLfbPtr) return;
-
-    // TEMPORARY: which of the eighteen callers actually run, and when.
-    if (MdkDiagFresh(0x2d000000u ^ (caller << 4)))
-        MdkDiag("viewlock caller=%08lx", (long)caller);
-
-    // Two callers work in real screen pixels rather than the 600x360 layout,
-    // and must not be offset again: the sprite blitter and the entity drawer.
-    if (caller == g_mdkSpriteRet || (g_mdkEntityRet && caller == g_mdkEntityRet)) {
-        cx = 0;
-        cy = 0;
-    }
-
-    /* K15.  The HUD, anchored to the real screen corners.
-     *
-     * The 2D layer is drawn 1:1 at 600x360 and merely centred, so the HUD sat
-     * in the middle of the screen with 852 pixels of empty picture either side
-     * of it.  0x4193FC is the one HUD drawer, and it takes the element's
-     * position through ebx as {x, y} in that 600x360 layout -- which is still
-     * live in the caller's saved ebx here, at [ebp-4] of the lock's frame.
-     *
-     * So each element is anchored by its own position rather than the whole
-     * layer being shifted as one: doubling the offset puts a right-hand
-     * element against the right edge, dropping it puts a left-hand one against
-     * the left.  It is scoped to this one caller precisely because a
-     * positional rule applied to text would tear a centred message in half --
-     * which is exactly how it failed on Turok.  The drawer does no clipping of
-     * its own, so nothing needs its bounds raised. */
-    else if (g_mdkHudRet && caller == g_mdkHudRet && callerEbx) {
-        const int *p = (const int *)callerEbx;
-
-        if (!IsBadReadPtr(p, 8)) {
-            /* The health widget and the ammo counter are both anchored in
-               the same narrow band -- 0..12 and 20..36 -- so position alone
-               cannot tell them apart, and banding by x moved them together.
-               The widget is a wide image whose visible dial sits well to the
-               right of its anchor, which is why its rendered position never
-               matched any anchor in the census and I read it as coming from
-               somewhere else.  The drawer's own caller does separate them. */
-            unsigned int from = g_mdkHudFrom;
-
-            (void)from;
-
-            /* Measured against a marked screenshot: of everything this drawer
-               handles, only the ammo counter is in the left band -- the health
-               dial and the weapon icon are not its elements at all and are
-               drawn in real screen pixels elsewhere.  So position alone is
-               enough here, and the call-site test that sent the counter to the
-               right is gone. */
-            /* Anchored to the edges of the PICTURE, not of the screen.
-             *
-             * With backdrop=2 those differ: the picture is a letterboxed
-             * 1333x800 inside 1920x800, and the bars are painted last -- so a
-             * HUD anchored to the screen corners was being drawn correctly and
-             * then blacked out.  g_mdkBoxX0/W are the whole screen in the other
-             * modes, which reproduces the previous behaviour exactly. */
-            if (p[0] < MDK_HUD_LEFT_X) {
-                cx = g_mdkBoxX0;                    /* ammo counter, far left */
-            } else {
-                cx = g_mdkBoxX0 + g_mdkBoxW - MDK_VIEW_W;   /* right cluster  */
-            }
-            cy = cy * 2;                /* all of it belongs at the bottom */
-
-            /* TEMPORARY -- layout position against the screen position it is
-               actually given, so an element can be matched to a screenshot
-               without inferring which band it fell in. */
-            if (MdkDiagFresh(0x6d000000u
-                             ^ ((unsigned int)p[0] & 0x3ff)
-                             ^ (((unsigned int)p[1] & 0x3ff) << 10)))
-                MdkDiag("hudpos %ld,%ld -> screen %ld,%ld  (caller %08lx)",
-                        (long)p[0], (long)p[1],
-                        (long)(p[0] + cx), (long)(p[1] + cy), (long)caller);
-        }
-    }
-
-    *out = *g_mdkLfbPtr
-         + (unsigned int)((*g_mdkOrgY + cy) * (int)*g_mdkStride)
-         + (unsigned int)(2 * (*g_mdkOrgX + cx));
-}
-
-extern "C" void __attribute__((cdecl, used, noinline))
-MdkHudCaller(unsigned int ret)
-{
-    g_mdkHudFrom = ret;
-}
+    { 0x55, 0x89, 0xe5, 0x56, 0x57, 0x83, 0xec, 0x10, 0x89, 0xc6 };
 
 static const unsigned char mdk_huddraw_stub[] = {
     0x60,                       // pushad
@@ -3931,6 +3941,55 @@ static const unsigned char mdk_huddraw_stub[] = {
 #define MDK_HUDDRAW_CALL_AT   6
 #define MDK_HUDDRAW_DISP_AT  14
 #define MDK_HUDDRAW_JMP_AT   20
+
+/* K5/K15/K26/K29.  The 2D layer is centred by adjusting the base the view
+ * lock hands back, and individual elements are anchored by keying on the
+ * CALLER.
+ *
+ * RESTORED after a bad splice deleted this block.  Recovered from the last
+ * good object file rather than from memory: every branch, constant and
+ * comparison below was read out of the compiled MdkLfbBaseView, and the
+ * signature bytes were re-read from MDK3DFX.EXE.  Checked against known-good
+ * output from the hardware log:
+ *
+ *     hudpos  20,316 -> screen  313,756     normal play, left band
+ *     hudpos 500,287 -> screen 1403,637     snipe, the scope box
+ *
+ * The site is the tail of the lock helper 0x470f78, 32 bytes ending in
+ * `mov %eax,(%ebx)`, which is where it publishes the adjusted base:
+ *
+ *     470f9d  mov   0x546a58,%eax          stride   <- disp at +1
+ *     470fa2  imul  0x492be4,%eax          originY  <- disp at +8
+ *     470fa9  mov   0x546a54,%edx          lfbPtr   <- disp at +14
+ *     470fb1  mov   0x492be0,%edx          originX  <- disp at +22
+ *     470fbb  mov   %eax,(%ebx)
+ *
+ * Reading the four globals out of the signature's own displacements is what
+ * makes a matched signature simultaneously proof that they are the right
+ * addresses.
+ */
+static unsigned int g_mdkHudRet = 0;    /* the HUD drawer's own lock      */
+static unsigned int g_mdkNumRet = 0;    /* its number/icon call site      */
+
+/* True for exactly the frame the scope art drew in -- the HUD needs it to
+   mean "this frame", or it keeps the scope layout for a few frames after you
+   leave snipe mode.  The sky uses g_mdkScopeHold instead, because it draws at
+   the START of a frame when this has just been cleared. */
+static int g_mdkInScope = 0;
+
+/* Hooked at the HUD drawer's entry purely to record which call site is
+   drawing.  Empty in the shipped build -- the caller is recorded from the
+   lock instead -- and the compiler agreed: it emitted a bare `ret`. */
+extern "C" void __attribute__((cdecl, used, noinline))
+MdkHudCaller(unsigned int caller)
+{
+    (void)caller;
+}
+
+/* Defined after g_diagGate, which it reads; declared here because the
+   installer below takes its address. */
+extern "C" void __attribute__((cdecl)) MdkLfbBaseView(unsigned int *,
+        unsigned int, unsigned int, unsigned int);
 
 static const unsigned char mdk_lfb_stub[] = {
     0x60,                       // pushad
@@ -4345,6 +4404,150 @@ static const unsigned char mdk_ammo_sig[] =      /* 0x0046bd4c */
 
 static unsigned int g_mdkAmmoRet = 0;
 
+/* The sniper crosshair.  A 52x68 sprite drawn at a HARDCODED layout position:
+
+       437962  mov  $0xdb,%edx        ; y = 219
+       437969  mov  $0x12b,%eax       ; x = 299
+       43796e  call 0x40aacc
+
+   (299,219) is the centre of the mode-1 viewport, so it is a fixed reticle
+   rather than anything that tracks aim.  It goes through the shared sprite
+   helper, whose lock K5 leaves uncentred, so it lands at raw layout
+   coordinates -- fine while the scope was 1:1, invisible once the overlay
+   filled the screen and painted over it.
+
+   It takes the same box transform as everything else inside the scope, and
+   its hotspot is pinned on BOTH axes: (26,42) of 52x68 is the aim point, not
+   a ground contact, so the bottom-edge pivot below would be wrong here for
+   the same reason it is wrong for the cursor. */
+static const unsigned char mdk_cross_sig[] =     /* 0x00437962 */
+    { 0xba, 0xdb, 0x00, 0x00, 0x00, 0x01, 0xc3,
+      0xb8, 0x2b, 0x01, 0x00, 0x00 };
+#define MDK_CROSS_RET   (sizeof(mdk_cross_sig) + 5)   /* past the call */
+
+static unsigned int g_mdkCrossRet = 0;
+
+/* The three bullet cams draw a 140x72 overlay sprite into each oval, hotspot
+   dead centre, at the viewport centres (141,44) (297,34) (453,44).  THAT is
+   the black cover that shows while no shot is in flight, and the brown one
+   that fades after a hit -- same sprite, different image.
+
+   It reaches the shared sprite helper, which K5 leaves uncentred, so it was
+   being drawn at raw layout coordinates in the top-left and the ovals were
+   left showing whatever was behind them.  Box-transformed it lands on each
+   viewport centre to within two pixels, and the helper already magnifies it
+   by H/360, which takes 140x72 to 311x160 against a 311x155 viewport.
+
+   Blanking those rectangles from the overlay was the WRONG fix and is
+   reverted: the cams draw BEFORE the art, so it blacked them permanently.
+   The ordering I read it from was first-OCCURRENCE order in a deduplicated
+   log, which is not frame order at all -- the cams simply appeared late
+   because they only start once you fire. */
+static const unsigned char mdk_cam_sig[] =       /* 0x00460c3b */
+    { 0x8b, 0x1d, 0xfc, 0x4e, 0x54, 0x00, 0x8b, 0x55, 0x18,
+      0x8b, 0x7c, 0x83, 0x04, 0x89, 0xc8, 0x01, 0xfb };
+#define MDK_CAM_RET   (sizeof(mdk_cam_sig) + 5)   /* past the call */
+
+static unsigned int g_mdkCamRet = 0;
+
+/* K35.  The bombing run -- a third composed screen, and the whole of it is
+ * one routine.
+ *
+ * 0x46ae78 is called once a frame while the bomb sight is up (from 0x438812,
+ * its only caller) and draws exactly three things, all in the game's 600x360
+ * layout space:
+ *
+ *     46aeab  BOMBTARG at layout (300,180)         the fixed target ring
+ *     46aedc  CROSS    at ([0x538f0c],[0x538f10])  the movable cursor
+ *     46af12  the bomb count, right-aligned at layout (472,56)
+ *
+ * The two sprites go through the shared RLE helper, whose lock K5 deliberately
+ * leaves uncentred, so they were drawn at raw layout coordinates in the
+ * top-left; the counter goes through the font renderer and so took the default
+ * 2D centring, which is the menu's, not the picture's.
+ *
+ * The assets name themselves -- 0x435d78 and 0x435d87 load "BOMBTARG" and
+ * "CROSS" into 0x4926e8 and 0x4926e4 -- and the arithmetic confirms the
+ * reading rather than merely fitting it: the counter's right edge is predicted
+ * at 660 + 472 = 1132 and measures 1130 on the screenshot.
+ *
+ * All three take the layout -> screen box map, exactly as the scope's own
+ * elements do (K29): x = boxX0 + L*boxW/600, y = L*boxH/360.  That is the same
+ * map the WORLD uses -- K10's cancellation makes layout 300 land on W/2 and
+ * layout 0 on the box's left edge -- so the ring lands on screen centre by
+ * construction and the cursor sweeps exactly the region the old view covered.
+ *
+ * Both hotspots are pinned on BOTH axes.  A target ring and a cursor are aim
+ * points, not things standing on a floor, so K12's bottom-edge pivot is wrong
+ * for them for the same reason it is wrong for the mouse cursor.
+ *
+ * The cursor's own globals are NOT touched: 0x538f0c has 68 readers and
+ * 0x538f10 has 37, all of them the game's aiming maths.  Only the DRAWN
+ * position moves, so cursor and aim point stay consistent by construction --
+ * the same argument K22 makes for the menu pointer.  The consequence is that
+ * the extra world Hor+ reveals outside the old 600-unit view cannot be
+ * targeted; that is a limit of the game's own coordinate space, not of this.
+ */
+static const unsigned char mdk_bomb_sig[] =      /* 0x0046ae97 */
+    { 0xa1, 0xe8, 0x26, 0x49, 0x00,              /* mov  0x4926e8,%eax  BOMBTARG */
+      0x8b, 0x58, 0x04,                          /* mov  0x4(%eax),%ebx */
+      0xba, 0xb4, 0x00, 0x00, 0x00,              /* mov  $180,%edx      y */
+      0x01, 0xc3,                                /* add  %eax,%ebx      */
+      0xb8, 0x2c, 0x01, 0x00, 0x00 };            /* mov  $300,%eax      x */
+#define MDK_BOMB_TARG_AT    20                   /* call the sprite helper */
+#define MDK_BOMB_CROSS_AT   69                   /* call the sprite helper */
+#define MDK_BOMB_TEXT_AT   123                   /* call the font renderer */
+
+/* The font renderer's own lock, so the counter can be told apart from every
+   other string in the game by the caller it was invoked from. */
+static const unsigned char mdk_font_sig[] =      /* 0x00414fc4 */
+    { 0x8d, 0x55, 0xdc, 0x8d, 0x45, 0xe0, 0xe8 };
+#define MDK_FONT_RET  (sizeof(mdk_font_sig) + 4)  /* past the call */
+
+static unsigned int g_mdkBombTargRet  = 0;   /* 0x0046aeb0 */
+static unsigned int g_mdkBombCrossRet = 0;   /* 0x0046aee1 */
+static unsigned int g_mdkBombTextFrom = 0;   /* 0x0046af17 */
+static unsigned int g_mdkFontRet      = 0;   /* 0x00414fcf */
+
+/* K27.  The muzzle flash, and every other ATTACHMENT drawn on a sprite.
+
+   0x40aa84 draws a sprite that may carry an attached one.  Read the two
+   paths together and the whole bug is on the page:
+
+       40aa90  mov  %ebx,-0xc(%ebp)      ; remember the PARENT's sprite
+       40aa93  call 0x470f60             ; any attachment?
+       40aa9a  jne  0x40aab6
+       40aaa3  call 0x40aacc             ; <- 0x40aaa8, the parent
+       ...
+       40aab6  mov  0xc(%ebp),%edx       ; a fixed offset
+       40aabe  add  %esi,%edx            ; parent position + offset
+       40aac0  add  %edi,%eax
+       40aac2  call 0x40aacc             ; <- 0x40aac7, the ATTACHMENT
+       40aac7  jmp  0x40aa9c             ; then fall back and draw the parent
+
+   So the attachment sits at a fixed offset from its parent, in layout units.
+   The anchor correction below pivots each sprite on its OWN bottom edge, so
+   parent and attachment are lifted by different amounts and drift apart by
+
+       (h_parent - h_attach) * (S - 1)
+
+   which at 1920x800 with the jumping frame is (146 - 57) * 1.222 = 109 px --
+   the muzzle flash sitting just under the gun, measured at ~110 on hardware.
+
+   Standing looked right for a reason worth recording: that pose is a single
+   wide 347x294 frame with the flash already drawn into it, so there is no
+   attachment at all and nothing to drift.  "Correct when grounded, wrong when
+   jumping" was never about being airborne -- it was about which frames carry
+   the flash as art and which draw it as a child.
+
+   The fix is to lift the attachment by its PARENT's height, so the offset
+   between them survives the magnification.  Exact no-op at S = 1. */
+static const unsigned char mdk_attach_sig[] =    /* 0x0040aac0 */
+    { 0x01, 0xf8, 0xe8, 0x05, 0x00, 0x00, 0x00 };  /* add %edi,%eax ; call */
+#define MDK_ATTACH_RET   (sizeof(mdk_attach_sig))     /* past the call */
+
+static unsigned int g_mdkAttachRet = 0;
+
 //
 // Anchor correction, at the shared helper's entry.  The helper is about to do
 // `x -= hotX` / `y -= hotY`, so the incoming position is pre-adjusted and popad
@@ -4373,6 +4576,7 @@ extern "C" void __attribute__((cdecl, used, noinline))
 MdkFixHotspot(unsigned int *f)
 {
     const short *hdr;
+    int          hy;
     unsigned int s = g_mdkSpriteScale;
 
     if (!f) return;
@@ -4435,6 +4639,23 @@ MdkFixHotspot(unsigned int *f)
     hdr = (const short *)f[4];                   /* ebx -> sprite header */
     if (!hdr || IsBadReadPtr(hdr, 8)) return;
 
+    /* Through the layout box, hotspot pinned on both axes: the snipe
+       crosshair, the bullet-cam covers (centred in their ovals), and K35's
+       two bombing-run reticles.  Not one of them is standing on anything,
+       so the bottom-edge pivot below is wrong for all four for the same
+       reason it is wrong for the mouse cursor. */
+    if (((g_mdkCrossRet     && f[8] == g_mdkCrossRet)     ||
+         (g_mdkCamRet       && f[8] == g_mdkCamRet)       ||
+         (g_mdkBombTargRet  && f[8] == g_mdkBombTargRet)  ||
+         (g_mdkBombCrossRet && f[8] == g_mdkBombCrossRet)) && g_mdkSnipeW > 0) {
+        int cxp = g_mdkSnipeX0 + ((int)f[7] * g_mdkSnipeW) / MDK_SCOPE_W;
+        int cyp = g_mdkSnipeY0 + ((int)f[5] * g_mdkSnipeH) / MDK_SCOPE_H;
+
+        f[7] = (unsigned int)(cxp - (((int)hdr[2] * (int)s >> 16) - (int)hdr[2]));
+        f[5] = (unsigned int)(cyp - (((int)hdr[3] * (int)s >> 16) - (int)hdr[3]));
+        return;
+    }
+
     // TEMPORARY: the anchor is the one thing here that cannot be derived --
     // whether the header's hotspot is the character's feet, its top-left, or
     // something else is a property of the art, not of the code.  One line of
@@ -4446,11 +4667,63 @@ MdkFixHotspot(unsigned int *f)
                 (long)hdr[2], (long)hdr[3],
                 (long)(int)f[7], (long)(int)f[5]);
 
+    /* K27.  An attachment is lifted by its PARENT's height, not its own, so
+       it keeps its offset from the body it is drawn on.  The parent's header
+       is the one 0x40aa90 stashed at [ebp-0xc], and f[2] is still the
+       caller's ebp -- the stub runs before the displaced `push %ebp`.
+
+       Falls back to the sprite's own height if that cannot be read, which is
+       exactly the behaviour of the build before this one. */
+    hy = (int)hdr[1];
+
+    if (g_mdkAttachRet && f[8] == g_mdkAttachRet && f[2] != 0
+        && !IsBadReadPtr((const void *)(f[2] - 0xc), 4)) {
+        const short *ph = (const short *)
+                          (*(const unsigned int *)(f[2] - 0xc));
+
+        if (ph && !IsBadReadPtr(ph, 8) && ph[1] > 0) {
+            /* Map the attachment through the PARENT's transform, rather than
+               giving it a pivot of its own.  The parent is not merely lifted:
+               it is magnified about its bottom edge, so a point on it moves by
+               an amount that grows with its distance from that edge.  An
+               attachment has to follow the same map or it lands somewhere the
+               body no longer is.
+
+               `esi`/`edi` are the parent's position -- the attachment is built
+               as `parent + offset` two instructions before the call -- and the
+               parent's header is the one 0x40aa90 stashed at [ebp-0xc].  So
+               everything needed is live at the hook, with no need to remember
+               anything across calls (the child is drawn FIRST here, so there
+               would be nothing to remember). */
+            int px = (int)f[0];                  /* edi -- parent x */
+            int py = (int)f[1];                  /* esi -- parent y */
+            int pb = py - (int)ph[3] + (int)ph[1];    /* its pinned bottom */
+            int tx = px + (((int)f[7] - px) * (int)s >> 16);
+            int ty = pb - ((pb - (int)f[5]) * (int)s >> 16);
+
+            if (MdkDiagFresh(0x5b000000u ^ (unsigned int)(ph[1] & 0xffff)))
+                MdkDiag("attach w=%ld h=%ld hot=%ld,%ld at %ld,%ld"
+                        "  parent h=%ld hot=%ld at %ld,%ld  -> %ld,%ld",
+                        (long)hdr[0], (long)hdr[1], (long)hdr[2],
+                        (long)hdr[3], (long)(int)f[7], (long)(int)f[5],
+                        (long)ph[1], (long)ph[3], (long)px, (long)py,
+                        (long)tx, (long)ty);
+
+            /* Undo the helper's own hotspot magnification, so the hotspot
+               itself lands on (tx,ty) rather than the sprite's corner. */
+            f[7] = (unsigned int)(tx - (((int)hdr[2] * (int)s >> 16)
+                                        - (int)hdr[2]));
+            f[5] = (unsigned int)(ty - (((int)hdr[3] * (int)s >> 16)
+                                        - (int)hdr[3]));
+            return;
+        }
+    }
+
     /* x: keep the hotspot fixed. */
     f[7] -= (unsigned int)(((int)hdr[2] * (int)s >> 16) - (int)hdr[2]);
 
     /* y: keep the sprite's bottom edge -- the ground contact -- fixed. */
-    f[5] += (unsigned int)((int)hdr[1] - ((int)hdr[1] * (int)s >> 16));
+    f[5] += (unsigned int)(hy - (hy * (int)s >> 16));
 }
 
 static const unsigned char mdk_hotspot_stub[] = {
@@ -4570,6 +4843,9 @@ static unsigned short *g_mdkSkyRow = NULL;      /* one scaled row, W wide */
 #define MDK_T_ALPHACOMBINE   0x004897c2u   /* grAlphaCombine       */
 #define MDK_T_ALPHABLEND     0x004897bcu   /* grAlphaBlendFunction */
 #define MDK_T_CONSTCOLOR     0x004897b6u   /* grConstantColorValue */
+#define MDK_CACHE_CONST      0x00492c34u   /* MDK's cache of the above    */
+#define MDK_CACHE_ACOMB      0x00492c40u   /* "alpha combine is set" flag */
+#define MDK_CACHE_ABLEND     0x00492c44u   /* "alpha blend is set" flag   */
 
 #define MDK_STATE_RESTORE    0x0046f9d0u   /* MDK re-establishes its own state */
 #define MDK_CACHE_COMBINE    0x00492c3cu   /* ... once these are invalidated,  */
@@ -4650,9 +4926,30 @@ static const unsigned short *g_mdkSkyUploaded = NULL;
 
 /* The last sky the game asked for, captured instead of blitted. */
 static int                   g_skyPend = 0;
+static unsigned int          g_mdkSkyHash = 0;
 static int                   g_skyDx0, g_skyY0, g_skyRows;
 static int                   g_skySrcRow, g_skyScroll, g_skySrcStride;
 static const unsigned short *g_skySrc = NULL;
+
+/* 0x471e80 is not only the sky.  The bullet cams call it too:
+ *
+ *     460ce2  mov  -0x10(%ebp),%eax     ; the cam viewport origin
+ *     460ce5  mov  %ebx,%edx
+ *     460ce7  call 0x471e80             ; <- 0x460cec
+ *
+ * and K14 replaced that routine's blit loops wholesale, taking its SOURCE
+ * from the sky globals rather than from the call.  So a cam frame drew a
+ * fragment of sky into the oval -- the yellow wedge -- and, worse, latched the
+ * cam's own y0/rows/scroll into the sky state and re-armed its countdown,
+ * every frame, from parameters that were never the sky's.
+ *
+ * A hook on a shared routine has to know which caller it is standing in for. */
+static unsigned int g_mdkCamRotRet = 0;
+static int          g_mdkSkyTookOver = 0;   /* stub reads this after popad */
+
+static const unsigned char mdk_camrot_sig[] =    /* 0x00460ce2 */
+    { 0x8b, 0x45, 0xf0, 0x89, 0xda, 0xe8 };
+#define MDK_CAMROT_RET   (sizeof(mdk_camrot_sig) + 4)   /* past the call */
 
 extern "C" void __attribute__((cdecl, used, noinline))
 MdkSkyScaled(unsigned int *f)
@@ -4666,10 +4963,29 @@ MdkSkyScaled(unsigned int *f)
     int  dy, dx, rows, sy, prevSy = -1, W, H;
     unsigned int invS;
 
+    g_mdkSkyTookOver = 1;         /* default: we stand in for the blit */
+
     if (!f || !row) return;
 
     fp   = (const char *)f[2];                    /* ebp */
     if (!fp) return;
+
+    /* Not the sky -- this is a bullet cam asking 0x471e80 for its own overlay,
+       the brown one that fades back to black after a hit.
+
+       0149 declined and drew nothing, which turned it into a BLACK SQUARE:
+       the stub jumped straight to the unlock, so declining meant the game did
+       not get to draw either.  The stub now falls through to the original
+       blit instead, so the cam draws its own overlay exactly as it always
+       did, while we still keep our hands off the sky state -- which was the
+       half that mattered, since these calls were latching the cam's geometry
+       into it every frame. */
+    if (g_mdkCamRotRet
+        && !IsBadReadPtr(fp + 4, 4)
+        && *(const unsigned int *)(fp + 4) == g_mdkCamRotRet) {
+        g_mdkSkyTookOver = 0;
+        return;
+    }
 
     lfb       = *(unsigned char *const *)(fp - 0x48);
     stride    = *(const int *)(fp - 0x44);        /* bytes */
@@ -4702,7 +5018,10 @@ MdkSkyScaled(unsigned int *f)
         /* A countdown rather than a flag: if some path I have not found ever
            skips a frame, the last sky is redrawn rather than the screen going
            black.  Two frames of grace, so it cannot leak into a menu. */
-        g_skyPend      = 3;
+        g_skyPend      = 3;     /* frames of grace -- see the gate below.
+                                   8 was enough to see the sky linger on the
+                                   quit prompt; the game asks every frame, so
+                                   3 is still slack. */
         return;
     }
 
@@ -4743,15 +5062,22 @@ MdkSkyScaled(unsigned int *f)
 }
 
 static const unsigned char mdk_sky_stub[] = {
-    0x60,                       // pushad
-    0x54,                       // push  %esp   -> &frame
-    0xe8, 0, 0, 0, 0,           // call  MdkSkyScaled         rel32 <- @3
-    0x83, 0xc4, 0x04,           // add   $0x4,%esp
-    0x61,                       // popad
-    0xe9, 0, 0, 0, 0            // jmp   the unlock           rel32 <- @12
+    0x60,                             // pushad
+    0x54,                             // push  %esp   -> &frame
+    0xe8, 0, 0, 0, 0,                 // call  MdkSkyScaled       rel32 <- @3
+    0x83, 0xc4, 0x04,                 // add   $0x4,%esp
+    0x61,                             // popad
+    0x83, 0x3d, 0, 0, 0, 0, 0x00,     // cmpl  $0,g_mdkSkyTookOver addr <- @13
+    0x74, 0x05,                       // je    +5   (we declined)
+    0xe9, 0, 0, 0, 0,                 // jmp   the unlock         rel32 <- @21
+    0, 0, 0, 0, 0,                    // the displaced bytes, from the SITE @25
+    0xe9, 0, 0, 0, 0                  // jmp   back               rel32 <- @31
 };
 #define MDK_SKY_CALL_AT   3
-#define MDK_SKY_JMP_AT   12
+#define MDK_SKY_FLAG_AT  13
+#define MDK_SKY_JMP_AT   21
+#define MDK_SKY_DISP_AT  25
+#define MDK_SKY_BACK_AT  31
 
 // --- K14a.  Reserve the texture memory -------------------------------------
 //
@@ -4939,7 +5265,9 @@ static void MdkSkyDrawHW(int force)
                                     unsigned int);
     typedef void (__stdcall *Mode5)(unsigned int, unsigned int, unsigned int,
                                     unsigned int, unsigned int);
+    unsigned int savedConst;
     int   srcRows, sx, sx0, sx1, W, quads = 0;
+    int   skyMinRow = -0x7fffffff;
     float S;
 
     /* The sky is a backdrop: it has to be under every frame, whether or not
@@ -4950,14 +5278,27 @@ static void MdkSkyDrawHW(int force)
        to cross the screen.
        Gated on the panorama stride, which is 0 outside a level, so this
        cannot paint over a menu or a loading screen. */
-    if (force) {
-        if (!g_skySrc || *(const int *)MDK_SKY_STRIDE == 0) return;
-    } else if (g_skyPend > 0) {
-        g_skyPend--;
+    /* CORRECTED.  The gate above was the panorama stride, on the reasoning
+       that it is 0 outside a level so this could not paint over a menu.  The
+       IN-GAME menu is inside a level -- the stride is still set -- so the
+       quit prompt, which should be black, was drawn over a full sky.  The
+       three bullet-cam ovals were the same fault seen from the other side.
+
+       And the countdown never actually stopped anything: the exhausted branch
+       fell through and drew anyway, and `force` skipped it outright, so the
+       sky was redrawn after every clear for as long as a level was loaded.
+       `missed=1533` in the log was that branch, once a frame, saying so.
+
+       Now: the sky is drawn only while the game has recently ASKED for one.
+       The countdown is what makes an unasked frame redraw the last sky rather
+       than flash black, which is what it was for; it just has to expire. */
+    if (g_skyPend > 0) {
+        if (!force) g_skyPend--;        /* aged once a frame, by the tick */
     } else {
         g_mdkSkyMissed++;
-        if (!g_skySrc || *(const int *)MDK_SKY_STRIDE == 0) return;
+        return;
     }
+    if (!g_skySrc || *(const int *)MDK_SKY_STRIDE == 0) return;
 
     if (!g_mdkSkyHW || !g_skySrc || g_skySrcStride <= 0 || g_skyRows <= 0)
         return;
@@ -4965,15 +5306,42 @@ static void MdkSkyDrawHW(int force)
     srcRows = *(const int *)MDK_SKY_ROWS_G;
     if (srcRows <= 0) return;
 
-    if (g_mdkSkyUploaded != g_skySrc) {
-        MdkSkyUpload(g_skySrc, g_skySrcStride, srcRows);
-        g_mdkSkyUploaded = g_skySrc;
-        g_mdkSkyUploads++;
+    /* Keyed on the CONTENT, not just the address.
+     *
+     * Load level 2, quit, load level 1, and level 2's sky was still on screen:
+     * MDK frees and reallocates the panorama, the new one can land at the same
+     * address, and an upload keyed on the pointer alone then decides there is
+     * nothing to do.  A cheap spread hash costs 64 reads a frame and cannot be
+     * fooled that way; the dimensions are folded in for the case where the
+     * content matches but the shape does not. */
+    {
+        unsigned int hash = (unsigned int)g_skySrcStride * 2654435761u
+                          + (unsigned int)srcRows;
+        unsigned int span = (unsigned int)srcRows
+                          * (unsigned int)g_skySrcStride;
+        unsigned int i;
+
+        for (i = 0; i < 64; i++)
+            hash = hash * 131u + g_skySrc[(span / 64u) * i];
+
+        if (g_mdkSkyUploaded != g_skySrc || g_mdkSkyHash != hash) {
+            MdkSkyUpload(g_skySrc, g_skySrcStride, srcRows);
+            g_mdkSkyUploaded = g_skySrc;
+            g_mdkSkyHash     = hash;
+            g_mdkSkyUploads++;
+        }
     }
 
     W = (int)g_targetW;
     S = (float)(int)g_targetH / (float)MDK_VIEW_H;   /* dest px per source px */
     if (S <= 0.0f) return;
+
+    if (g_mdkScopeHold > 0 && g_mdkSnipeH > 0) {
+        int top = g_mdkSnipeY0 + (80 * g_mdkSnipeH) / MDK_SCOPE_H;
+
+        skyMinRow = g_skySrcRow
+                  + (int)(((float)(top - g_skyY0)) / S) + 1;
+    }
 
     /* The source window the screen needs: 2560/3 = 853 of the 1800 available
        at 2560x1080.  One spare column each side covers the rounding. */
@@ -4987,6 +5355,14 @@ static void MdkSkyDrawHW(int force)
        behind is why it wore their colours. */
     ((Mode5)MDK_T_COLORCOMBINE)(3, 8, 1, 1, 0);      /* SCALE_OTHER(TEXTURE) */
     ((Mode5)MDK_T_ALPHACOMBINE)(1, 0, 1, 2, 0);      /* LOCAL(CONSTANT)      */
+    /* MDK CACHES the constant colour at 0x492c34 and skips the call when the
+       cache already matches.  Its state-restore re-issues the colour combine,
+       both texture modes, the chromakey, the alpha combine and the alpha
+       blend -- but NOT this one.  So setting it here and walking away leaves
+       the hardware white while MDK believes its own value is still loaded,
+       and everything it draws afterwards wears our white until it happens to
+       want a different colour.  Saved and put back below. */
+    savedConst = *(const unsigned int *)MDK_CACHE_CONST;
     ((Mode1)MDK_T_CONSTCOLOR)(0xffffffffu);          /* opaque white         */
     ((Mode4)MDK_T_ALPHABLEND)(4, 0, 4, 0);           /* ONE/ZERO -- opaque   */
     ((Mode1)MDK_T_CHROMAKEYMODE)(0);                 /* GR_CHROMAKEY_DISABLE */
@@ -5016,6 +5392,14 @@ static void MdkSkyDrawHW(int force)
             int   bandRows = band ? 128 : 256;
             int   ya = g_skySrcRow;
             int   yb = g_skySrcRow + g_skyRows;
+
+            /* In snipe mode the sky belongs to the sniper view alone.  The
+               three cam ovals sit entirely ABOVE it (they end at the view's
+               top edge), so raising the first source row is enough to keep
+               them black -- and clamping the ROW rather than the destination
+               rectangle keeps the texture coordinates consistent, where
+               clipping the quad would have stretched it. */
+            if (skyMinRow > ya) ya = skyMinRow;
             float dy0, dy1;
 
             if (yb > srcRows) yb = srcRows;
@@ -5041,6 +5425,31 @@ static void MdkSkyDrawHW(int force)
     /* Put MDK's state back.  0x46F9D0 re-issues the filter, clamp, mipmap,
        texcombine and chromakey calls we touched -- exactly this set -- once
        its own caches say they are stale. */
+    /* Put the constant colour back to what MDK's cache says it is, so the two
+       agree again.  Restoring the value rather than invalidating the cache
+       means MDK does not have to re-issue anything. */
+    ((Mode1)MDK_T_CONSTCOLOR)(savedConst);
+
+    /* The alpha pair are guarded by FLAGS, not by value:
+     *
+     *     46fa76  call grAlphaCombine(3,8,1,2,0)
+     *     46fa7b  movl $1,0x492c40          <- "already set"
+     *     46fa92  call grAlphaBlendFunction(4,0,4,0)
+     *     46fa97  movl $1,0x492c44
+     *
+     * and the restore skips each call while its flag reads 1.  We change the
+     * alpha combine to LOCAL(CONSTANT) and left both flags standing, so MDK
+     * went on believing its own SCALE_OTHER was loaded and never re-issued
+     * it.  Everything it drew afterwards took its alpha from the constant
+     * colour instead -- which is why the enemy health fill came out almost
+     * transparent instead of bright green.
+     *
+     * Clearing the flags is the same fix as invalidating the three caches
+     * below, and the same lesson as the constant colour a few builds ago:
+     * a cache we do not own has to be told when we have made it wrong. */
+    *(unsigned int *)MDK_CACHE_ACOMB   = 0;
+    *(unsigned int *)MDK_CACHE_ABLEND  = 0;
+
     *(unsigned int *)MDK_CACHE_COMBINE = 0;
     *(unsigned int *)MDK_CACHE_TEX0    = 0;
     *(unsigned int *)MDK_CACHE_TEX1    = 0xffffffffu;
@@ -5202,8 +5611,15 @@ static void InstallMdkSpriteScale(unsigned char *code, unsigned int codeSize)
         cur = FindUnique(code, codeSize, mdk_ammo_sig,
                          sizeof(mdk_ammo_sig) - 1);
         g_mdkAmmoRet = cur ? (unsigned int)(cur + MDK_AMMO_RET) : 0;
-        MdkDiag("cursor ret=%08lx  ammo ret=%08lx  offset=%ld,%ld  box=%ld",
+
+        cur = FindUnique(code, codeSize, mdk_attach_sig,
+                         sizeof(mdk_attach_sig));
+        g_mdkAttachRet = cur ? (unsigned int)(cur + MDK_ATTACH_RET) : 0;
+
+        MdkDiag("cursor ret=%08lx  ammo ret=%08lx  attach ret=%08lx"
+                "  offset=%ld,%ld  box=%ld",
                 (long)g_mdkCursorRet, (long)g_mdkAmmoRet,
+                (long)g_mdkAttachRet,
                 (long)g_mdkHudCx, (long)g_mdkHudCy, (long)g_mdkBoxX0);
     }
 
@@ -5231,8 +5647,11 @@ static void InstallMdkSpriteScale(unsigned char *code, unsigned int codeSize)
 //
 // K13: scale the sky panorama to the screen.
 //
-/* One hook per blit loop.  Both jump straight to the shared unlock, so the
-   blit is skipped entirely and the displaced bytes are never needed. */
+/* One hook per blit loop.  It jumps to the shared unlock when we drew the sky
+   ourselves, and falls through to the game's own blit when we declined --
+   which is what the bullet cams need, since they call this routine for their
+   own overlay.  The displaced bytes are copied from the SITE, per section 5b,
+   because the two loops do not start with the same instructions. */
 static int MdkHookSkyLoop(unsigned char *at, unsigned char *end)
 {
     unsigned char *stub;
@@ -5244,10 +5663,14 @@ static int MdkHookSkyLoop(unsigned char *at, unsigned char *end)
     if (!stub) return 0;
 
     memcpy(stub, mdk_sky_stub, sizeof(mdk_sky_stub));
+    memcpy(stub + MDK_SKY_DISP_AT, at, 5);      /* from the site, not a table */
     rel = (int)((unsigned char *)&MdkSkyScaled - (stub + MDK_SKY_CALL_AT + 4));
     PutU32(stub + MDK_SKY_CALL_AT, (unsigned int)rel);
+    PutU32(stub + MDK_SKY_FLAG_AT, (unsigned int)&g_mdkSkyTookOver);
     rel = (int)(end - (stub + MDK_SKY_JMP_AT + 4));
     PutU32(stub + MDK_SKY_JMP_AT, (unsigned int)rel);
+    rel = (int)((at + 5) - (stub + MDK_SKY_BACK_AT + 4));
+    PutU32(stub + MDK_SKY_BACK_AT, (unsigned int)rel);
 
     patch[0] = 0xe9;                            /* jmp rel32 -> stub */
     rel = (int)(stub - (at + 5));
@@ -5832,6 +6255,312 @@ static void InstallMdkEarthCover(unsigned char *code, unsigned int codeSize)
         VirtualFree(stub, 0, MEM_RELEASE);
 }
 
+/* K28.  The selectable item's BACKGROUND square.
+ *
+ * The slot box is drawn twice by 0x46bdd3 -- a filled background, then the
+ * white frame K26 already relocates:
+ *
+ *     46bdfb  lea (,%edx,4),%esi ; sub %edx,%esi ; shl $4,%esi   ; slot * 48
+ *     46be07  push $0x15e        ; y1 = 350
+ *     46be0f  mov  $0x131,%ebx   ; y0 = 305
+ *     46be14  lea  0x36(%esi),%ecx                               ; x1
+ *     46be19  lea  0x9(%esi),%edx                                ; x0
+ *     46be1c  call 0x46f920      ; <- the FILL
+ *     46be21  push $0x15f        ; and then the frame, via 0x416d30
+ *
+ * The two go to completely different drawers, which is why K26 moved one and
+ * left the other in the top-left corner.  0x46f920 is not an LFB blitter at
+ * all: it builds Glide QUADS, offsetting them by the viewport origin globals
+ * 0x492be0/0x492be4 -- which K1 forces to (0,0).  So this is a fourth 2D path,
+ * and no amount of work on the lock helpers could ever have reached it.
+ *
+ * Its arguments, read off its own prologue: edx/ecx are x0/x1, ebx and the
+ * pushed dword are y0/y1, eax a mode flag.  The stub adds K26's offsets to all
+ * four and tail-jumps, so the drawer returns straight to the game and the
+ * pushed argument is still at [ebp+8] where it expects it.
+ *
+ * Scoped to this one call site.  The same drawer is used elsewhere, and a
+ * blanket offset would move whatever else it draws.
+ */
+static const unsigned char mdk_itemfill_sig[] =  /* 0x0046be14 */
+    { 0x8d, 0x4e, 0x36, 0x31, 0xc0, 0x8d, 0x56, 0x09, 0xe8 };
+#define MDK_ITEMFILL_CALL_AT   8
+
+static const unsigned char mdk_itemfill_stub[] = {
+    0x81, 0xc2, 0, 0, 0, 0,             // add   $cx,%edx        x0   <- @2
+    0x81, 0xc1, 0, 0, 0, 0,             // add   $cx,%ecx        x1   <- @8
+    0x81, 0xc3, 0, 0, 0, 0,             // add   $cy,%ebx        y0   <- @14
+    0x81, 0x44, 0x24, 0x04, 0, 0, 0, 0, // addl  $cy,0x4(%esp)   y1   <- @22
+    0xe9, 0, 0, 0, 0                    // jmp   drawer               <- @27
+};
+#define MDK_FILL_X0_AT   2
+#define MDK_FILL_X1_AT   8
+#define MDK_FILL_Y0_AT   14
+#define MDK_FILL_Y1_AT   22
+#define MDK_FILL_JMP_AT  27
+
+/* K32.  The enemy health bar's FILL.
+ *
+ * The bar is two calls, both at the same hardcoded layout position (0,4):
+ *
+ *     4388a2  push $0xa
+ *     4388a7  mov  $0x4,%ebx          ; y = 4
+ *     4388ac  mov  $0x3,%eax          ; colour index
+ *     4388b1  xor  %edx,%edx          ; x = 0
+ *     4388b3  call 0x416dd0           ; <- the FILL
+ *     4388c6  call 0x416d30           ; <- the frame, via the LFB rect drawer
+ *
+ * The frame goes through the view lock, so it is centred with the rest of the
+ * 2D layer and lands at (660,224).  The fill does not: 0x416dd0 looks a
+ * colour out of the table at 0x546448 and draws GLIDE QUADS through 0x46f098,
+ * offset by the viewport origin globals -- which K1 forces to (0,0).  So it
+ * stays at raw (0,4), in the screen's top-left corner, while its own frame
+ * sits at the centred window's origin.  That is exactly what the marked
+ * screenshot shows: yellow at (660,220), pink at (0,0).
+ *
+ * Same class as K28, the item background, and the same fix: the two
+ * coordinates are in registers at the call site, so a stub adds the centring
+ * and tail-jumps.  Entered by `call` and leaving by `jmp`, so the drawer
+ * returns straight to the game and the pushed argument is still where it
+ * expects it.
+ *
+ * Offset by g_mdkHudCx/Cy -- the DEFAULT 2D centring, which is precisely what
+ * the frame gets -- rather than by K15's band numbers, so the two cannot
+ * drift apart.
+ */
+static const unsigned char mdk_hpfill_sig[] =    /* 0x004388a2 */
+    { 0x6a, 0x0a, 0x8b, 0x4d, 0xe8, 0xbb, 0x04, 0x00, 0x00, 0x00,
+      0xb8, 0x03, 0x00, 0x00, 0x00, 0x31, 0xd2 };
+#define MDK_HPFILL_CALL_AT  (sizeof(mdk_hpfill_sig))   /* the call follows */
+
+/* The drawer takes a RECTANGLE, not a point.  Read off its own tail:
+ *
+ *     416e1c  add %esi,%eax     x0 = edx arg
+ *     416e1a  add %edi,%edx     y0 = ebx arg
+ *     416e18  add %eax,%ebx     x1 = ecx arg      <- the health WIDTH
+ *     416e1e  call 0x471d28     rect(x0,y0,x1,y1)
+ *
+ * 0158 offset x0 to 293 and left x1 at the bar's width, which inverted the
+ * rectangle -- so the fill did not move badly, it stopped existing.  Both
+ * edges have to move, which is obvious once the call is read as a rect and
+ * invisible while it is read as a position. */
+static const unsigned char mdk_hpfill_stub[] = {
+    0x81, 0xc2, 0, 0, 0, 0,             // add  $cx,%edx      x0    <- @2
+    0x81, 0xc1, 0, 0, 0, 0,             // add  $cx,%ecx      x1    <- @8
+    0x81, 0xc3, 0, 0, 0, 0,             // add  $cy,%ebx      y0    <- @14
+    0x81, 0x44, 0x24, 0x04, 0, 0, 0, 0, // addl $cy,0x4(%esp) y1    <- @22
+    0xe9, 0, 0, 0, 0                    // jmp  0x416dd0            <- @27
+};
+#define MDK_HPF_X0_AT   2
+#define MDK_HPF_X1_AT   8
+#define MDK_HPF_Y0_AT  14
+#define MDK_HPF_Y1_AT  22
+#define MDK_HPF_JMP_AT 27
+
+static void InstallMdkHealthFill(unsigned char *code, unsigned int codeSize)
+{
+    unsigned char *at, *stub, *target;
+    unsigned char  patch[5];
+
+    /* Read per install, and installed late for that reason: these are set by
+       the 2D centring installer, and K28 already cost a build by baking in
+       two zeroes because it ran first. */
+    if (g_mdkBoxX0 == 0 && g_mdkHudCy == 0) {
+        MdkDiag("hpfill DECLINED -- offsets still zero");
+        return;
+    }
+
+    at = FindUnique(code, codeSize, mdk_hpfill_sig, sizeof(mdk_hpfill_sig));
+    if (!at) { MdkDiag("hpfill: signature not found"); return; }
+    at += MDK_HPFILL_CALL_AT;
+
+    target = (at + 5) + (int)ReadU32(at + 1);   /* from the displaced call */
+
+    stub = (unsigned char *)VirtualAlloc(NULL, sizeof(mdk_hpfill_stub),
+                                         MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+    if (!stub) return;
+
+    memcpy(stub, mdk_hpfill_stub, sizeof(mdk_hpfill_stub));
+    /* The top-left of the PICTURE, not of the centred window.
+     *
+     * 0157 used the centring, on the reasoning that it is what the frame
+     * gets.  Two things were wrong with that.  The frame's position was not
+     * right either -- it only looked like a target because it was the one of
+     * the two that had moved.  And 660 is outside the 600-wide layout this
+     * drawer culls against, so the fill did not merely land badly, it
+     * vanished: the same bounds check that hid the player character until K11
+     * raised it.
+     *
+     * g_mdkBoxX0 keeps it inside that limit (293) and puts it where the rest
+     * of the left-hand HUD lives. */
+    PutU32(stub + MDK_HPF_X0_AT, (unsigned int)g_mdkBoxX0);
+    PutU32(stub + MDK_HPF_X1_AT, (unsigned int)g_mdkBoxX0);
+    PutU32(stub + MDK_HPF_Y0_AT, 0);
+    PutU32(stub + MDK_HPF_Y1_AT, 0);
+    PutU32(stub + MDK_HPF_JMP_AT,
+           (unsigned int)(int)(target - (stub + MDK_HPF_JMP_AT + 4)));
+
+    MdkDiag("hpfill site=%08lx drawer=%08lx stub=%08lx off=%ld,%ld",
+            (long)(unsigned int)at, (long)(unsigned int)target,
+            (long)(unsigned int)stub, (long)g_mdkBoxX0, 0L);
+
+    patch[0] = 0xe8;
+    PutU32(patch + 1, (unsigned int)(int)(stub - (at + 5)));
+    if (!WriteCode(at, patch, 5))
+        VirtualFree(stub, 0, MEM_RELEASE);
+}
+
+/* K37.  The loading screen's two progress bars -- K32's bug at two more call
+ * sites, and the third time this exact pair of drawers has come apart.
+ *
+ * 0x41ae00 draws the loading screen, and each bar is a fill and a frame drawn
+ * back to back by two UNRELATED routines:
+ *
+ *     41af15  call 0x416dd0   the FILL   -- Glide quads, raw layout space
+ *     41af33  call 0x416d30   the FRAME  -- LFB rect, centred by K5
+ *     41af7a  call 0x416dd0   the second bar's fill
+ *     41af98  call 0x416d30   the second bar's frame
+ *
+ * with the arguments in registers: eax = colour index, edx = x0, ebx = y0,
+ * ecx = x1, and y1 pushed.  Both bars span layout x 10..594; bar one is
+ * y 290..310 and bar two y 330..350, and only the fill's x1 moves with the
+ * progress.
+ *
+ * The frames therefore land at screen (670,510)..(1254,530) and (670,550)..
+ * (1254,570), and the fills stayed at raw layout in the top-left corner --
+ * which is exactly what the screenshot measures and exactly what K28 (the item
+ * background) and K32 (the enemy health bar) each were.
+ *
+ * Offset by K5's DEFAULT centring rather than by any band rule, because that
+ * is what the frame beside it gets: neither the item nor the health keying
+ * matches these call sites, so 0x416d30 falls through to (g_mdkHudCx,
+ * g_mdkHudCy).  Matching the frame is the whole requirement -- a fill that is
+ * merely "somewhere sensible" is still wrong if its own frame is elsewhere.
+ *
+ * One stub serves both sites: the offsets are identical and the drawer returns
+ * straight to the game, since the stub is entered by `call` and leaves by
+ * `jmp` with the pushed y1 untouched on the stack.
+ *
+ * The signature pins the routine and the two call sites are then VERIFIED
+ * rather than trusted -- each must be an `e8`, and both must name the same
+ * drawer (section 5b).
+ *
+ * The other thirteen callers of 0x416dd0 are left alone.  Some of them are
+ * very likely misplaced in the same way; each needs its own frame identified
+ * first, which is a five-minute job once one is reported.
+ */
+static const unsigned char mdk_loadbar_sig[] = { /* 0x0041aef0 */
+    0x68, 0x36, 0x01, 0x00, 0x00,                /* push $0x136   y1 = 310  */
+    0xbb, 0x22, 0x01, 0x00, 0x00,                /* mov  $0x122,%ebx  y0    */
+    0xba, 0x0a, 0x00, 0x00, 0x00,                /* mov  $0xa,%edx    x0    */
+    0xd8, 0x05, 0x8c, 0xc5, 0x48, 0x00,          /* fadds 0x48c58c          */
+    0xb8, 0x03, 0x00, 0x00, 0x00,                /* mov  $0x3,%eax  colour  */
+    0xe8, 0xe7, 0xa0, 0x05, 0x00,                /* call 0x474ff6   round   */
+    0xdb, 0x5d, 0xe0,                            /* fistpl -0x20(%ebp)      */
+    0x8b, 0x4d, 0xe0 };                          /* mov  -0x20(%ebp),%ecx x1 */
+#define MDK_LOADBAR_A   (sizeof(mdk_loadbar_sig))       /* 0x0041af15 */
+#define MDK_LOADBAR_B   (MDK_LOADBAR_A + 0x65)          /* 0x0041af7a */
+
+static void InstallMdkLoadBars(unsigned char *code, unsigned int codeSize)
+{
+    unsigned char *at, *stub, *a, *b, *target;
+    unsigned char  patch[5];
+    int            i;
+
+    /* Read per install and installed late for the same reason K28 is: these
+       are baked into the stub, and both are computed after MdkApply starts.
+       A silent decline is the failure mode that costs a build, so it says so. */
+    if (g_mdkHudCx == 0 && g_mdkHudCy == 0) {
+        MdkDiag("loadbar DECLINED -- centring still zero");
+        return;
+    }
+
+    at = FindUnique(code, codeSize, mdk_loadbar_sig, sizeof(mdk_loadbar_sig));
+    if (!at) { MdkDiag("loadbar: signature not found"); return; }
+
+    a = at + MDK_LOADBAR_A;
+    b = at + MDK_LOADBAR_B;
+
+    if (*a != 0xe8 || *b != 0xe8) {
+        MdkDiag("loadbar DECLINED -- the two fill calls are not where they were");
+        return;
+    }
+
+    target = (a + 5) + (int)ReadU32(a + 1);      /* from the displaced call */
+    if (((b + 5) + (int)ReadU32(b + 1)) != target) {
+        MdkDiag("loadbar DECLINED -- the two fill calls disagree");
+        return;
+    }
+
+    stub = (unsigned char *)VirtualAlloc(NULL, sizeof(mdk_hpfill_stub),
+                                         MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+    if (!stub) return;
+
+    memcpy(stub, mdk_hpfill_stub, sizeof(mdk_hpfill_stub));
+    PutU32(stub + MDK_HPF_X0_AT, (unsigned int)g_mdkHudCx);
+    PutU32(stub + MDK_HPF_X1_AT, (unsigned int)g_mdkHudCx);
+    PutU32(stub + MDK_HPF_Y0_AT, (unsigned int)g_mdkHudCy);
+    PutU32(stub + MDK_HPF_Y1_AT, (unsigned int)g_mdkHudCy);
+    PutU32(stub + MDK_HPF_JMP_AT,
+           (unsigned int)(int)(target - (stub + MDK_HPF_JMP_AT + 4)));
+
+    MdkDiag("loadbar a=%08lx b=%08lx drawer=%08lx stub=%08lx off=%ld,%ld",
+            (long)(unsigned int)a, (long)(unsigned int)b,
+            (long)(unsigned int)target, (long)(unsigned int)stub,
+            (long)g_mdkHudCx, (long)g_mdkHudCy);
+
+    for (i = 0; i < 2; i++) {
+        unsigned char *site = i ? b : a;
+
+        patch[0] = 0xe8;
+        PutU32(patch + 1, (unsigned int)(int)(stub - (site + 5)));
+        WriteCode(site, patch, 5);
+    }
+}
+
+static void InstallMdkItemFill(unsigned char *code, unsigned int codeSize)
+{
+    unsigned char *at, *stub, *target;
+    unsigned char  patch[5];
+
+    /* Loud, not silent: a zero here means this ran before the offsets were
+       computed, which is a build mistake rather than a 4:3 no-op. */
+    if (g_mdkBoxX0 == 0 && g_mdkHudCy == 0) {
+        MdkDiag("itemfill DECLINED -- offsets still zero");
+        return;
+    }
+
+    at = FindUnique(code, codeSize, mdk_itemfill_sig,
+                    sizeof(mdk_itemfill_sig));
+    if (!at) return;
+    at += MDK_ITEMFILL_CALL_AT;
+
+    /* From the displaced call, never a constant -- section 5b. */
+    target = (at + 5) + (int)ReadU32(at + 1);
+
+    stub = (unsigned char *)VirtualAlloc(NULL, sizeof(mdk_itemfill_stub),
+                                         MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+    if (!stub) return;
+
+    memcpy(stub, mdk_itemfill_stub, sizeof(mdk_itemfill_stub));
+    PutU32(stub + MDK_FILL_X0_AT, (unsigned int)g_mdkBoxX0);
+    PutU32(stub + MDK_FILL_X1_AT, (unsigned int)g_mdkBoxX0);
+    PutU32(stub + MDK_FILL_Y0_AT, (unsigned int)(g_mdkHudCy * 2));
+    PutU32(stub + MDK_FILL_Y1_AT, (unsigned int)(g_mdkHudCy * 2));
+    PutU32(stub + MDK_FILL_JMP_AT,
+           (unsigned int)(int)(target - (stub + MDK_FILL_JMP_AT + 4)));
+
+    MdkDiag("itemfill site=%08lx drawer=%08lx stub=%08lx off=%ld,%ld",
+            (long)(unsigned int)at, (long)(unsigned int)target,
+            (long)(unsigned int)stub,
+            (long)g_mdkBoxX0, (long)(g_mdkHudCy * 2));
+
+    patch[0] = 0xe8;
+    PutU32(patch + 1, (unsigned int)(int)(stub - (at + 5)));
+    if (!WriteCode(at, patch, 5))
+        VirtualFree(stub, 0, MEM_RELEASE);
+}
+
 static void InstallMdkSpritePos(unsigned char *code, unsigned int codeSize)
 {
     /* Anchored on the singly-referenced 256.0 load, because `mov edx,300`
@@ -6259,6 +6988,745 @@ MdkBackdrop(unsigned int *f)
     }
 }
 
+/* ==========================================================================
+ * K29.  SNIPE MODE.
+ *
+ * Two halves, on two unrelated mechanisms, and the screenshot measured both.
+ *
+ * The 3D view came out as a 384x280 box at (108,80).  That is PROJECTION MODE
+ * 1 exactly -- one of the four inset projections this project deliberately
+ * left alone when K2/K3 widened mode 0, on the reasoning that the inset
+ * projections were never widened either so each inset stays internally
+ * consistent.  True for the three 140x70 panels; wrong for this one, because
+ * snipe mode is not an inset at all, it is the whole view.
+ *
+ * The 2D scope frame is a 600x360 8bpp image blitted 1:1 through the view
+ * lock -- the same shape as K20's backdrop -- so K5 centred it and it stayed
+ * 600x360 in the middle of the screen.
+ *
+ * ---- the 3D half -------------------------------------------------------
+ *
+ * Mode 1 is drawn by 0x46ca28, and its five constants are singly-referenced
+ * doubles, exactly like mode 0:
+ *
+ *     0x48fc9c Kx 191.95    0x48fca4 Cx 108.0
+ *     0x48fcb4 Ky 139.95    0x48fcbc Cy  80.0     0x48fcac 0.05 (both axes)
+ *
+ * screen = (coord/z + 1) * K + C, so K is the half extent and C the origin:
+ * 108 .. 108+2*191.95 is 384 wide, and 80 .. 80+2*139.95 is 280 tall.  Setting
+ * K to half the screen and C to zero makes it the whole screen.
+ *
+ * Extents alone would STRETCH it, which is the K2-without-K3 failure.  Mode 1
+ * carries its own frustum aspect group -- three sites, each A=0.5, B=280.0,
+ * C=1/384, giving yscale/xscale = 384/280 -- and each A is singly referenced.
+ * A' = 0.5*(W*280)/(H*384) makes the ratio W/H, exactly as K3 does for mode 0.
+ *
+ * Note this is deliberately NOT a no-op at 4:3: the mode-1 frustum is 384:280
+ * and the screen is 4:3, so they genuinely differ.  Nothing runs at all unless
+ * an override is active.
+ *
+ * ---- the 2D half -------------------------------------------------------
+ *
+ * The overlay decoder 0x46f520 is run-length encoded WITH TRANSPARENCY -- a
+ * u16 token, values >= 0x8000 meaning skip -- and the transparency is
+ * load-bearing: the hole in the middle of the scope is how the 3D shows
+ * through once both halves are full screen.
+ *
+ * Rather than reimplement that format (K12 work, and the expensive kind to get
+ * subtly wrong), the decoder is left to do it: its destination is redirected
+ * to a 600x360 buffer of ours with a row advance of 0, and the result is then
+ * scaled out.  Transparency is recovered WITHOUT knowing the format at all --
+ * the buffer is pre-filled with a 16-bit value that appears nowhere in the
+ * 256-entry palette, so any pixel still holding it was never written.  The
+ * decoder only ever stores palette entries, so the test is exact, and a free
+ * value always exists among 65536 for a 256-entry table.
+ */
+#define MDK_SCOPE_ROWS 400              /* slack, in case the image is taller */
+
+static unsigned short *g_mdkScopeBuf = NULL;    /* 600 x MDK_SCOPE_ROWS      */
+static unsigned short *g_mdkScopeRow = NULL;    /* one expanded output row   */
+static int            *g_mdkScopeCol = NULL;    /* precomputed source column */
+static unsigned short  g_mdkScopeKey = 0;       /* the transparent sentinel  */
+static int             g_mdkScopeCols = 0;      /* columns already built     */
+
+/* A 16-bit value the palette cannot produce, so "never written" is exact. */
+static unsigned short MdkScopeSentinel(void)
+{
+    const unsigned short *pal = (const unsigned short *)MDK_BD_PAL;
+    unsigned int v, i;
+
+    if (IsBadReadPtr(pal, 512)) return 0xf81fu;      /* magenta, best effort */
+
+    for (v = 0; v < 0x10000u; v++) {
+        for (i = 0; i < 256; i++)
+            if (pal[i] == (unsigned short)v) break;
+        if (i == 256) return (unsigned short)v;
+    }
+    return 0xf81fu;                                  /* cannot happen */
+}
+
+extern "C" void __attribute__((cdecl, used, noinline))
+MdkScopeBefore(unsigned int *f)
+{
+    unsigned int n;
+
+    if (!f || !g_mdkScopeBuf) return;
+
+    n = (unsigned int)MDK_SCOPE_W * MDK_SCOPE_ROWS;
+    while (n--) g_mdkScopeBuf[n] = g_mdkScopeKey;
+
+    f[5] = (unsigned int)g_mdkScopeBuf;    /* edx -- destination            */
+    f[4] = 0;                              /* ebx -- row advance; we are    */
+                                           /*        exactly 600 wide       */
+}
+
+extern "C" void __attribute__((cdecl, used, noinline))
+MdkScopeAfter(unsigned int *f)
+{
+    const unsigned short *src = g_mdkScopeBuf;
+    unsigned short       *base, *dst, *row = g_mdkScopeRow;
+    int                  *col = g_mdkScopeCol;
+    int    strideP, W, H, x, y, lastRow = -1;
+    int    dx0, dy0, dw, dh;
+    unsigned int sxStep, syStep, sy;
+
+    if (!f || !src || !row || !col) return;
+    if (!g_mdkLfbPtr || !*g_mdkLfbPtr || !g_mdkStride) return;
+
+    base    = (unsigned short *)*g_mdkLfbPtr;   /* the TRUE origin, not the  */
+    strideP = (int)(*g_mdkStride) / 2;          /* K5-centred one            */
+    W = (int)g_targetW;
+    H = (int)g_targetH;
+    if (!base || strideP <= 0 || W <= 0 || H <= 0) return;
+    if (W > strideP) W = strideP;               /* the 2048 LFB limit        */
+    if (W > 4096) W = 4096;                     /* our row/col buffers       */
+
+    /* fit, NOT stretch.  A uniform scale is what keeps the scope round and
+       -- far more importantly -- what lets the 3D view and the three bullet
+       cams keep their own shapes while landing in the right holes.  See
+       InstallMdkSnipe: every one of them is scaled by this same factor. */
+    MdkFitRect(MDK_SCOPE_W, MDK_SCOPE_H, W, H, 1,
+               &dx0, &dy0, &dw, &dh, &sxStep, &syStep);
+
+    /* Build the column table once per band, not per frame. */
+    if (g_mdkScopeCols != W) {
+        unsigned int sx = 0;
+
+        for (x = 0; x < W; x++) {
+            int c = -1;
+
+            if (x >= dx0 && x < dx0 + dw) {
+                c = (int)(sx >> 16);
+                if (c >= MDK_SCOPE_W) c = MDK_SCOPE_W - 1;
+                sx += sxStep;
+            }
+            col[x] = c;
+        }
+        g_mdkScopeCols = W;
+    }
+
+    g_mdkInScope   = 1;         /* the scope is up: see the HUD branch in K5 */
+    GameFix_TriHot = 1;
+    g_mdkScopeHold = 2;         /* ...and still up at the NEXT frame's clear.
+                                   TWO is the minimum that survives the swap
+                                   decrement, and the minimum matters: it is
+                                   also how many frames the clamp outlives
+                                   snipe mode, i.e. how long a black band
+                                   could show at the top on the way out. */
+
+    sy = 0;
+    for (y = 0; y < H; y++) {
+        int srcRow;
+
+        dst = base + (unsigned int)y * (unsigned int)strideP;
+
+        /* Outside the picture is a BAR, and it is painted rather than left
+           alone: the 3D is confined to the same box, so anything out here is
+           whatever the previous frame put there. */
+        if (y < dy0 || y >= dy0 + dh) {
+            memset(dst, 0, (unsigned int)W * 2);
+            continue;
+        }
+
+        srcRow = (int)(sy >> 16);
+        sy += syStep;
+        if (srcRow >= MDK_SCOPE_H) srcRow = MDK_SCOPE_H - 1;
+
+        /* Resample horizontally once per SOURCE row -- the vertical
+           magnification is 2.22x at 1920x800, so most output rows repeat. */
+        if (srcRow != lastRow) {
+            const unsigned short *s = src + (unsigned int)srcRow * MDK_SCOPE_W;
+
+            for (x = 0; x < W; x++)
+                row[x] = (col[x] < 0) ? g_mdkScopeKey : s[col[x]];
+            lastRow = srcRow;
+        }
+
+        for (x = 0; x < dx0; x++)          dst[x] = 0;
+        for (x = dx0 + dw; x < W; x++)     dst[x] = 0;
+
+        /* Per pixel, because transparency means this cannot be a memcpy: the
+           holes have to keep whatever the 3D drew underneath. */
+        for (x = dx0; x < dx0 + dw; x++)
+            if (row[x] != g_mdkScopeKey) dst[x] = row[x];
+    }
+}
+
+static const unsigned char mdk_scope_sig[] =     /* 0x0040dd07 */
+    { 0x89, 0xf0, 0x8b, 0x55, 0xec, 0x81, 0xeb, 0xb0, 0x04, 0x00, 0x00 };
+#define MDK_SCOPE_CALL_AT  (sizeof(mdk_scope_sig))   /* the call follows */
+
+static const unsigned char mdk_scope_stub[] = {
+    0x60,                       // pushad
+    0x54,                       // push  %esp
+    0xe8, 0, 0, 0, 0,           // call  MdkScopeBefore       rel32 <- @3
+    0x83, 0xc4, 0x04,           // add   $0x4,%esp
+    0x61,                       // popad          (carries edx/ebx back)
+    0xe8, 0, 0, 0, 0,           // call  the game decoder     rel32 <- @12
+    0x60,                       // pushad
+    0x54,                       // push  %esp
+    0xe8, 0, 0, 0, 0,           // call  MdkScopeAfter        rel32 <- @19
+    0x83, 0xc4, 0x04,           // add   $0x4,%esp
+    0x61,                       // popad
+    0xc3                        // ret   -> 0x40dd17, the unlock
+};
+#define MDK_SCOPE_BEFORE_AT  3
+#define MDK_SCOPE_DEC_AT    12
+#define MDK_SCOPE_AFTER_AT  19
+
+/* Every viewport that lives inside the scope, scaled by the SAME factor as
+   the scope art itself.
+
+   The reference shot settled what mode 1 actually is.  Unpatched at 640x480
+   the 3D view is a 384x280 window at (108,80) in layout space, sitting behind
+   the big hole in the scope frame -- it was never the whole screen.  Build
+   0140 made it the whole screen, which is why the world showed through the
+   three ovals at the top as well as through the hole.
+
+   So the right model is: the scope art defines the picture, and everything
+   drawn inside it -- the sniper view and the three bullet cams -- is a
+   rectangle in that same 600x360 layout.  Scale the art into a letterboxed
+   box, scale every viewport by the same factor into the same box, and the
+   whole assembly stays exactly as designed, only bigger.
+
+   Two consequences worth stating, because they are why this is simpler than
+   0140 rather than more complicated:
+
+   - THE ASPECT PATCH IS GONE.  0140 rescaled the three mode-1 frustum
+     constants because a stretched viewport needs a stretched frustum.  A
+     uniform scale does not: 384:280 stays 384:280, so the frustum is already
+     right and touching it would be the bug.
+
+   - Nothing here is resolution-dependent beyond one number, k.  At 1920x800
+     the box is 1333x800 at x=293 and k = 2.2222, which is exactly H/360 --
+     the same scale the rest of the game already uses.
+
+   The three cams are modes 2/3/4, selected from one site that loops over the
+   three (0x460b7c does lea 0x2(%edx),%eax).  They are the three ovals along
+   the top, and they stay black until a bullet is in flight.
+
+   Mode 3 has no Cy constant at all -- its viewport starts at y=0, so the
+   compiler folded the add away.  That means its vertical origin cannot take
+   dy0.  Harmless while the bars are vertical (dy0 = 0), which is every
+   widescreen override; a taller-than-4:3 mode would put that one cam a little
+   high. */
+static void MdkScaleViewport(unsigned int kx, unsigned int cx,
+                             unsigned int ky, unsigned int cy,
+                             double oKx, double oCx, double oKy, double oCy,
+                             double k, double dx0, double dy0)
+{
+    MdkPatchDouble((unsigned char *)kx, oKx, oKx * k);
+    MdkPatchDouble((unsigned char *)cx, oCx, dx0 + oCx * k);
+    MdkPatchDouble((unsigned char *)ky, oKy, oKy * k);
+    if (cy) MdkPatchDouble((unsigned char *)cy, oCy, dy0 + oCy * k);
+}
+
+/* The scope: its art, the sniper view, and the three bullet cams. */
+static void InstallMdkSnipe(unsigned char *code, unsigned int codeSize)
+{
+    unsigned char *at, *stub, *target;
+    unsigned char  patch[5];
+    int            W = (int)g_targetW, H = (int)g_targetH;
+    int            dx0, dy0, dw, dh;
+    unsigned int   sx, sy;
+    double         k, fx, fy;
+
+    if (W < 16 || H < 16) return;
+
+    /* The same box, computed the same way, as the art will be scaled into. */
+    MdkFitRect(MDK_SCOPE_W, MDK_SCOPE_H, W, H, 1,
+               &dx0, &dy0, &dw, &dh, &sx, &sy);
+    if (dw <= 0 || dh <= 0) return;
+
+    k  = (double)dw / (double)MDK_SCOPE_W;
+    fx = (double)dx0;
+    fy = (double)dy0;
+
+    g_mdkSnipeX0 = dx0;  g_mdkSnipeY0 = dy0;
+    g_mdkSnipeW  = dw;   g_mdkSnipeH  = dh;
+
+    {
+        unsigned char *c = FindUnique(code, codeSize, mdk_cross_sig,
+                                      sizeof(mdk_cross_sig));
+        g_mdkCrossRet = c ? (unsigned int)(c + MDK_CROSS_RET) : 0;
+
+        c = FindUnique(code, codeSize, mdk_cam_sig, sizeof(mdk_cam_sig));
+        g_mdkCamRet = c ? (unsigned int)(c + MDK_CAM_RET) : 0;
+
+        c = FindUnique(code, codeSize, mdk_camrot_sig,
+                       sizeof(mdk_camrot_sig));
+        g_mdkCamRotRet = c ? (unsigned int)(c + MDK_CAMROT_RET) : 0;
+
+        c = FindUnique(code, codeSize, mdk_hpframe_sig,
+                       sizeof(mdk_hpframe_sig));
+        g_mdkHpFrom = c ? (unsigned int)(c + MDK_HPFRAME_RET) : 0;
+        MdkDiag("hpframe from=%08lx", (long)g_mdkHpFrom);
+    }
+
+    MdkDiag("snipe box=%ldx%ld@%ld,%ld  k=%ld/1000  cross ret=%08lx",
+            (long)dw, (long)dh, (long)dx0, (long)dy0, (long)(k * 1000.0),
+            (long)g_mdkCrossRet);
+    MdkDiag("snipe cam ret=%08lx camrot=%08lx",
+            (long)g_mdkCamRet, (long)g_mdkCamRotRet);
+
+    /* mode 1 -- the sniper view, 384x280 at (108,80) */
+    MdkScaleViewport(0x0048fc9cu, 0x0048fca4u, 0x0048fcb4u, 0x0048fcbcu,
+                     191.95, 108.0, 139.95, 80.0, k, fx, fy);
+
+    /* modes 2/3/4 -- the three bullet cams, 140x70 along the top */
+    MdkScaleViewport(0x0048fcc4u, 0x0048fcccu, 0x0048fcdcu, 0x0048fce4u,
+                     69.95, 72.0, 34.95, 10.0, k, fx, fy);
+    MdkScaleViewport(0x0048fcecu, 0x0048fcf4u, 0x0048fd04u, 0,
+                     69.95, 228.0, 34.95, 0.0, k, fx, fy);
+    MdkScaleViewport(0x0048fd0cu, 0x0048fd14u, 0x0048fd24u, 0x0048fd2cu,
+                     69.95, 384.0, 34.95, 10.0, k, fx, fy);
+
+    /* --- the 2D scope frame: scaled out of a buffer of our own ---------- */
+    at = FindUnique(code, codeSize, mdk_scope_sig, sizeof(mdk_scope_sig));
+    if (!at) { MdkDiag("snipe overlay: signature not found"); return; }
+    at += MDK_SCOPE_CALL_AT;
+
+    target = (at + 5) + (int)ReadU32(at + 1);   /* the decoder -- section 5b */
+
+    g_mdkScopeBuf = (unsigned short *)
+        VirtualAlloc(NULL, MDK_SCOPE_W * MDK_SCOPE_ROWS * 2,
+                     MEM_COMMIT, PAGE_READWRITE);
+    g_mdkScopeRow = (unsigned short *)
+        VirtualAlloc(NULL, 4096 * 2, MEM_COMMIT, PAGE_READWRITE);
+    g_mdkScopeCol = (int *)
+        VirtualAlloc(NULL, 4096 * 4, MEM_COMMIT, PAGE_READWRITE);
+    if (!g_mdkScopeBuf || !g_mdkScopeRow || !g_mdkScopeCol) return;
+
+    g_mdkScopeKey = MdkScopeSentinel();
+
+    stub = (unsigned char *)VirtualAlloc(NULL, sizeof(mdk_scope_stub),
+                                         MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+    if (!stub) return;
+
+    memcpy(stub, mdk_scope_stub, sizeof(mdk_scope_stub));
+    PutU32(stub + MDK_SCOPE_BEFORE_AT,
+           (unsigned int)(int)((unsigned char *)&MdkScopeBefore
+                               - (stub + MDK_SCOPE_BEFORE_AT + 4)));
+    PutU32(stub + MDK_SCOPE_DEC_AT,
+           (unsigned int)(int)(target - (stub + MDK_SCOPE_DEC_AT + 4)));
+    PutU32(stub + MDK_SCOPE_AFTER_AT,
+           (unsigned int)(int)((unsigned char *)&MdkScopeAfter
+                               - (stub + MDK_SCOPE_AFTER_AT + 4)));
+
+    MdkDiag("snipe overlay: site=%08lx decoder=%08lx stub=%08lx key=%04lx",
+            (long)(unsigned int)at, (long)(unsigned int)target,
+            (long)(unsigned int)stub, (long)g_mdkScopeKey);
+
+    patch[0] = 0xe8;
+    PutU32(patch + 1, (unsigned int)(int)(stub - (at + 5)));
+    if (!WriteCode(at, patch, 5))
+        VirtualFree(stub, 0, MEM_RELEASE);
+}
+
+/* K30.  The snipe HUD is drawn at 1:1 into a scope magnified 2.22x.
+ *
+ * 0142 put these elements in the right PLACE and left them the wrong SIZE,
+ * and for the bullets in the barrel that reads as a position error rather
+ * than a size one: a 15x35 bullet anchored at the top-left of a slot drawn
+ * for a 33x78 one looks like a small bullet in the wrong corner.
+ *
+ * Measured off the reference: the two bullets sit at layout (83,245) and
+ * (111,288), and the log has this drawer at 112,304 -- the second one, to the
+ * pixel in x.  So the anchor was already right in 0142.
+ *
+ * The drawer turns out to be trivially replaceable.  Read off its own loop:
+ *
+ *     eax  source pixels, flat 8bpp        [ebp+8]  transparent INDEX
+ *     ecx  -> { width, height }            0x546848 the palette
+ *     edx  -> { source stride }            ebx -> { x, y }
+ *
+ * so it is a colour-keyed 8bpp blit with the dimensions handed to it -- no
+ * format to reverse, and the key is given rather than inferred (K29 needed a
+ * palette sentinel precisely because it was not).
+ *
+ * Hooked after its lock and rejoining at its unlock, so the lock, the clip
+ * and the unlock all stay the game's.  It draws scaled only while the scope
+ * is up; in ordinary play it declines and the game's own loop runs, so the
+ * normal HUD is byte-for-byte untouched.
+ *
+ * The anchor needs no work here: the base this drawer is handed has already
+ * been offset by the box transform (see the HUD branch in K5), so
+ * base + Y*stride + X is the correct scaled position by construction.  Only
+ * the extent is ours.
+ */
+static int g_mdkHudDrew = 0;         /* the stub reads this after popad */
+
+extern "C" void __attribute__((cdecl, used, noinline))
+MdkHudScale(unsigned int *f)
+{
+    const unsigned short *pal = (const unsigned short *)MDK_BD_PAL;
+    const unsigned char  *src;
+    const int            *dims, *pos, *srcStridePtr;
+    unsigned short       *base;
+    unsigned int          ebp, sx, sy, sxStep, syStep;
+    int  w, h, X, Y, strideP, srcStride, dw, dh, x, y, key;
+
+    g_mdkHudDrew = 0;
+    if (!f || !g_mdkInScope || g_mdkSnipeW <= 0) return;
+
+    src  = (const unsigned char *)f[1];          /* esi */
+    dims = (const int *)f[0];                    /* edi */
+    pos  = (const int *)f[4];                    /* ebx */
+    ebp  = f[2];
+    if (!src || !dims || !pos || !ebp) return;
+    if (IsBadReadPtr(dims, 8) || IsBadReadPtr(pos, 8)) return;
+    if (IsBadReadPtr((const void *)(ebp - 0x18), 0x20)) return;
+
+    base         = *(unsigned short **)(ebp - 0x14);
+    strideP      = *(const int *)(ebp - 0x18) / 2;
+    srcStridePtr = *(const int **)(ebp - 0x10);
+    key          = *(const unsigned char *)(ebp + 8);
+    if (!base || strideP <= 0 || !srcStridePtr) return;
+    if (IsBadReadPtr(srcStridePtr, 4)) return;
+
+    w = dims[0];  h = dims[1];
+    X = pos[0];   Y = pos[1];
+    srcStride = *srcStridePtr;
+    if (w <= 0 || h <= 0 || srcStride < w) return;
+
+    dw = (w * g_mdkSnipeW) / MDK_SCOPE_W;
+    dh = (h * g_mdkSnipeH) / MDK_SCOPE_H;
+    if (dw <= 0 || dh <= 0) return;              /* let the game draw it */
+    if (IsBadReadPtr(src, (unsigned int)srcStride * (unsigned int)h)) return;
+
+    /* Clip to the framebuffer.  The row is 4096 pixels with the linear LFB
+       and 2048 without, and running off the end wraps onto the next scanline
+       rather than faulting -- section 7c, which cost a whole round trip to
+       diagnose once already. */
+    if (X < 0 || Y < 0) return;
+    if (X + dw > strideP)        dw = strideP - X;
+    if (Y + dh > (int)g_targetH) dh = (int)g_targetH - Y;
+    if (dw <= 0 || dh <= 0) return;
+
+    /* TEMPORARY.  Two builds have now been spent inferring which element is
+       which from an anchor alone, and both were wrong.  This logs what is
+       actually DRAWN -- the caller, the source size, and the final screen
+       rect -- so one capture plus one screenshot identifies every element by
+       measurement instead.  The caller is the drawer's own return address,
+       which is live at [ebp+4]. */
+    {
+        unsigned int from = *(const unsigned int *)(ebp + 4);
+
+        /* Y was masked to SIX bits here, so two records 64 apart collided
+           and one was silently dropped.  An instrument that hides records is
+           worse than none: it makes an absent element look like proof. */
+        if (MdkDiagFresh(0x6e000000u ^ (from & 0x1fffu)
+                                     ^ ((unsigned int)(X & 0x7ff) << 13)
+                                     ^ ((unsigned int)(Y & 0x7ff) << 24)))
+            MdkDiag("hudrect from=%08lx layout %ld,%ld %ldx%ld"
+                    "  -> screen %ld,%ld %ldx%ld",
+                    (long)from, (long)X, (long)Y, (long)w, (long)h,
+                    (long)(X + ((base - (unsigned short *)*g_mdkLfbPtr)
+                                % (unsigned int)strideP)),
+                    (long)(Y + ((base - (unsigned short *)*g_mdkLfbPtr)
+                                / (unsigned int)strideP)),
+                    (long)dw, (long)dh);
+    }
+
+    sxStep = ((unsigned int)w << 16) / (unsigned int)dw;
+    syStep = ((unsigned int)h << 16) / (unsigned int)dh;
+
+    sy = 0;
+    for (y = 0; y < dh; y++) {
+        const unsigned char *s = src + (sy >> 16) * (unsigned int)srcStride;
+        unsigned short      *d = base + (unsigned int)(Y + y)
+                                        * (unsigned int)strideP + X;
+
+        sy += syStep;
+        sx = 0;
+        for (x = 0; x < dw; x++, sx += sxStep) {
+            unsigned char v = s[sx >> 16];
+
+            if ((int)v != key) d[x] = pal[v];
+        }
+    }
+
+    g_mdkHudDrew = 1;
+}
+
+static const unsigned char mdk_hudscale_sig[] =  /* 0x00419411 */
+    { 0xe8, 0x62, 0x7b, 0x05, 0x00, 0x8b, 0x55, 0xe8, 0xd1, 0xfa };
+#define MDK_HUDSCALE_AT   5                      /* past the lock call */
+#define MDK_HUDSCALE_JOIN 0x0041948bu            /* the unlock call    */
+
+static const unsigned char mdk_hudscale_stub[] = {
+    0x60,                             // pushad
+    0x54,                             // push  %esp
+    0xe8, 0, 0, 0, 0,                 // call  MdkHudScale       rel32 <- @3
+    0x83, 0xc4, 0x04,                 // add   $0x4,%esp
+    0x61,                             // popad
+    0x83, 0x3d, 0, 0, 0, 0, 0x00,     // cmpl  $0,g_mdkHudDrew   addr  <- @13
+    0x74, 0x05,                       // je    +5   (we did not draw)
+    0xe9, 0, 0, 0, 0,                 // jmp   the unlock        rel32 <- @21
+    0x8b, 0x55, 0xe8, 0xd1, 0xfa,     // the displaced pair
+    0xe9, 0, 0, 0, 0                  // jmp   back              rel32 <- @31
+};
+#define MDK_HS_CALL_AT  3
+#define MDK_HS_FLAG_AT  13
+#define MDK_HS_SKIP_AT  21
+#define MDK_HS_BACK_AT  31
+
+static void InstallMdkHudScale(unsigned char *code, unsigned int codeSize)
+{
+    unsigned char *at, *stub;
+    unsigned char  patch[5];
+
+    if (g_mdkSnipeW <= 0) return;
+
+    at = FindUnique(code, codeSize, mdk_hudscale_sig,
+                    sizeof(mdk_hudscale_sig));
+    if (!at) { MdkDiag("hudscale: signature not found"); return; }
+    at += MDK_HUDSCALE_AT;
+
+    stub = (unsigned char *)VirtualAlloc(NULL, sizeof(mdk_hudscale_stub),
+                                         MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+    if (!stub) return;
+
+    memcpy(stub, mdk_hudscale_stub, sizeof(mdk_hudscale_stub));
+    PutU32(stub + MDK_HS_CALL_AT,
+           (unsigned int)(int)((unsigned char *)&MdkHudScale
+                               - (stub + MDK_HS_CALL_AT + 4)));
+    PutU32(stub + MDK_HS_FLAG_AT, (unsigned int)&g_mdkHudDrew);
+    PutU32(stub + MDK_HS_SKIP_AT,
+           (unsigned int)(int)((unsigned char *)MDK_HUDSCALE_JOIN
+                               - (stub + MDK_HS_SKIP_AT + 4)));
+    PutU32(stub + MDK_HS_BACK_AT,
+           (unsigned int)(int)((at + 5) - (stub + MDK_HS_BACK_AT + 4)));
+
+    MdkDiag("hudscale site=%08lx stub=%08lx join=%08lx",
+            (long)(unsigned int)at, (long)(unsigned int)stub,
+            (long)MDK_HUDSCALE_JOIN);
+
+    patch[0] = 0xe9;                  /* jmp, not call -- the stub returns
+                                         control with its own jmp either way */
+    PutU32(patch + 1, (unsigned int)(int)(stub - (at + 5)));
+    if (!WriteCode(at, patch, 5))
+        VirtualFree(stub, 0, MEM_RELEASE);
+}
+
+/* K35's installer.  It writes no code at all -- everything it does is record
+   four return addresses that the two existing hooks then key on, so a failure
+   here leaves the bombing run exactly as it is today rather than moving
+   something it should not.
+
+   The signature is short and pins the function; the three call sites inside it
+   are then VERIFIED rather than trusted, which is what makes an offset into a
+   routine safe (section 5b).  The last check is the strongest: the lock the
+   counter is keyed on has to live inside the very routine the counter's own
+   call goes to. */
+static void InstallMdkBomb(unsigned char *code, unsigned int codeSize)
+{
+    unsigned char *at, *f, *sprA, *sprB, *font;
+
+    at = FindUnique(code, codeSize, mdk_bomb_sig, sizeof(mdk_bomb_sig));
+    if (!at) { MdkDiag("bomb: signature not found"); return; }
+
+    if (at[MDK_BOMB_TARG_AT]  != 0xe8 ||
+        at[MDK_BOMB_CROSS_AT] != 0xe8 ||
+        at[MDK_BOMB_TEXT_AT]  != 0xe8) {
+        MdkDiag("bomb DECLINED -- the three calls are not where they were");
+        return;
+    }
+
+    sprA = (at + MDK_BOMB_TARG_AT  + 5) + (int)ReadU32(at + MDK_BOMB_TARG_AT  + 1);
+    sprB = (at + MDK_BOMB_CROSS_AT + 5) + (int)ReadU32(at + MDK_BOMB_CROSS_AT + 1);
+    font = (at + MDK_BOMB_TEXT_AT  + 5) + (int)ReadU32(at + MDK_BOMB_TEXT_AT  + 1);
+
+    if (sprA != sprB) {
+        MdkDiag("bomb DECLINED -- the two sprite calls disagree");
+        return;
+    }
+
+    f = FindUnique(code, codeSize, mdk_font_sig, sizeof(mdk_font_sig));
+    if (!f || f < font || f > font + 0x80) {
+        MdkDiag("bomb DECLINED -- the font lock is not inside %08lx",
+                (long)(unsigned int)font);
+        return;
+    }
+
+    g_mdkBombTargRet  = (unsigned int)(at + MDK_BOMB_TARG_AT  + 5);
+    g_mdkBombCrossRet = (unsigned int)(at + MDK_BOMB_CROSS_AT + 5);
+    g_mdkBombTextFrom = (unsigned int)(at + MDK_BOMB_TEXT_AT  + 5);
+    g_mdkFontRet      = (unsigned int)(f + MDK_FONT_RET);
+
+    MdkDiag("bomb targ=%08lx cross=%08lx text=%08lx  helper=%08lx"
+            " font=%08lx lock=%08lx",
+            (long)g_mdkBombTargRet, (long)g_mdkBombCrossRet,
+            (long)g_mdkBombTextFrom, (long)(unsigned int)sprA,
+            (long)(unsigned int)font, (long)g_mdkFontRet);
+}
+
+/* K34.  The brown band -- MDK's own leftover sky fill, and the last thing on
+ * this screen still laid out in 600x360.
+ *
+ * The backdrop routine 0x471e80 draws the panorama for as many rows as it
+ * has and paints the REST of the window with a flat colour out of the table
+ * at 0x552808.  Two sites do it, one for each end:
+ *
+ *     471ff6   the panorama runs out below   -> fill (x, 360-skyTop)..(x+w, y+h)
+ *     4721d8   it starts below the window top -> fill the strip above it
+ *
+ * with skyTop = [0x552dac], the source row the panorama is scrolled to.  Both
+ * are FillRect(eax=x0, edx=y0, ebx=x1, ecx=y1, colour) through 0x471d28 --
+ * which is grClipWindow followed by grBufferClear, so it is a hard-edged
+ * solid rectangle and NO 2D blitter hook could ever have seen it.  Nor could
+ * the triangle probe: it is not geometry either.
+ *
+ * The arithmetic identifies it rather than fitting it.  The log carries
+ * `live rotAC = 165`, and the band measured off the screenshot starts at
+ * y = 195 = 360 - 165 exactly; a second frame gave 236 against a skyTop of
+ * 124.  It is 600 wide because the size struct 0x471e80 is handed still
+ * describes the original window, and it slides vertically with the camera
+ * PITCH while staying put horizontally -- which is exactly "it moves with the
+ * camera, always in the same place whichever way we look".
+ *
+ * K14 draws the panorama itself at S = H/360 across the whole screen, so the
+ * fill has to be scaled to match or it covers a strip of the corner instead
+ * of the band under the sky.  Same two factors K33 gives the damage overlay,
+ * which comes out of the same routine.
+ *
+ * Why it only turned up with the health-fill build: until then our sky was
+ * redrawn on EVERY grBufferClear, and this fill goes through one -- so the
+ * sky was painted straight back over it every time.  Making the sky draw once
+ * a frame stopped hiding it.  The band has been there since K14.
+ *
+ * 0x471e80 is SHARED with the bullet cams, whose own black/brown overlay must
+ * not be stretched to the screen, so this declines unless the rectangle
+ * really is the full-width window and the routine was not entered from the
+ * cam site.  Declining leaves the game's own fill -- today's behaviour --
+ * rather than moving something that should stay put.
+ */
+extern "C" void __attribute__((cdecl, used, noinline))
+MdkSkyFill(unsigned int *f)
+{
+    int x0, y0, x1, y1, W, H;
+
+    if (!f || !g_targetW || !g_targetH) return;
+
+    x0 = (int)f[7];  y0 = (int)f[5];        /* eax, edx */
+    x1 = (int)f[4];  y1 = (int)f[6];        /* ebx, ecx */
+
+    if (x1 - x0 < MDK_VIEW_W - 60) return;  /* a cam oval, not the window */
+    if (y1 <= y0) return;
+
+    /* f[2] is still 0x471e80's own ebp -- the stub runs inside it -- so
+       [ebp+4] names whoever asked for a backdrop. */
+    if (g_mdkCamRotRet && f[2]
+        && !IsBadReadPtr((const void *)(f[2] + 4), 4)
+        && *(const unsigned int *)(f[2] + 4) == g_mdkCamRotRet)
+        return;
+
+    W = (int)g_targetW;  H = (int)g_targetH;
+
+    if (MdkDiagFresh(0x79000000u ^ (f[8] & 0xffffu)))
+        MdkDiag("skyfill from=%08lx  %ld,%ld..%ld,%ld -> %ld,%ld..%ld,%ld",
+                (long)f[8], (long)x0, (long)y0, (long)x1, (long)y1,
+                (long)(x0 * W / MDK_VIEW_W), (long)(y0 * H / MDK_VIEW_H),
+                (long)(x1 * W / MDK_VIEW_W), (long)(y1 * H / MDK_VIEW_H));
+
+    x0 = x0 * W / MDK_VIEW_W;   x1 = x1 * W / MDK_VIEW_W;
+    y0 = y0 * H / MDK_VIEW_H;   y1 = y1 * H / MDK_VIEW_H;
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > W) x1 = W;
+    if (y1 > H) y1 = H;
+
+    f[7] = (unsigned int)x0;  f[5] = (unsigned int)y0;
+    f[4] = (unsigned int)x1;  f[6] = (unsigned int)y1;
+}
+
+/* Both sites end the same way -- the colour looked up out of 0x552808 and
+   pushed -- and differ only in which locals they load next, which is what
+   makes each of them unique in the image. */
+static const unsigned char mdk_skyfillA_sig[] =  /* 0x00471feb */
+    { 0x8b, 0x3c, 0x95, 0x08, 0x28, 0x55, 0x00,  /* mov 0x552808(,%edx,4),%edi */
+      0x57,                                      /* push %edi                  */
+      0x8b, 0x55, 0xc8 };                        /* mov  -0x38(%ebp),%edx      */
+
+static const unsigned char mdk_skyfillB_sig[] =  /* 0x004721ca */
+    { 0x8b, 0x3c, 0x95, 0x08, 0x28, 0x55, 0x00,
+      0x57,
+      0x8b, 0x4d, 0xdc,                          /* mov  -0x24(%ebp),%ecx      */
+      0x8b, 0x55, 0xc8 };
+
+static const unsigned char mdk_skyfill_stub[] = {
+    0x60,                       // pushad
+    0x54,                       // push  %esp   -> &frame
+    0xe8, 0, 0, 0, 0,           // call  MdkSkyFill           rel32 <- @3
+    0x83, 0xc4, 0x04,           // add   $0x4,%esp
+    0x61,                       // popad
+    0xe9, 0, 0, 0, 0            // jmp   the filler           rel32 <- @12
+};
+#define MDK_SF_CALL_AT   3
+#define MDK_SF_JMP_AT   12
+
+static void InstallMdkSkyFillOne(unsigned char *code, unsigned int codeSize,
+                                 const unsigned char *sig, unsigned int sigLen,
+                                 const char *tag)
+{
+    unsigned char *at, *stub, *target;
+    unsigned char  patch[5];
+
+    at = FindUnique(code, codeSize, sig, sigLen);
+    if (!at) { MdkDiag("skyfill %s: signature not found", tag); return; }
+    at += sigLen;                              /* the call follows the load */
+
+    target = (at + 5) + (int)ReadU32(at + 1);  /* from the displaced call   */
+
+    stub = (unsigned char *)VirtualAlloc(NULL, sizeof(mdk_skyfill_stub),
+                                         MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+    if (!stub) return;
+
+    memcpy(stub, mdk_skyfill_stub, sizeof(mdk_skyfill_stub));
+    PutU32(stub + MDK_SF_CALL_AT,
+           (unsigned int)(int)((unsigned char *)&MdkSkyFill
+                               - (stub + MDK_SF_CALL_AT + 4)));
+    PutU32(stub + MDK_SF_JMP_AT,
+           (unsigned int)(int)(target - (stub + MDK_SF_JMP_AT + 4)));
+
+    MdkDiag("skyfill %s site=%08lx filler=%08lx stub=%08lx",
+            tag, (long)(unsigned int)at, (long)(unsigned int)target,
+            (long)(unsigned int)stub);
+
+    patch[0] = 0xe8;
+    PutU32(patch + 1, (unsigned int)(int)(stub - (at + 5)));
+    if (!WriteCode(at, patch, 5))
+        VirtualFree(stub, 0, MEM_RELEASE);
+}
+
+static void InstallMdkSkyFill(unsigned char *code, unsigned int codeSize)
+{
+    InstallMdkSkyFillOne(code, codeSize, mdk_skyfillA_sig,
+                         sizeof(mdk_skyfillA_sig), "below");
+    InstallMdkSkyFillOne(code, codeSize, mdk_skyfillB_sig,
+                         sizeof(mdk_skyfillB_sig), "above");
+}
+
 static const unsigned char mdk_bd_sig[] =        /* 0x0046e7f3 */
     "\xe8\x80\x27\x00\x00\x8b\x55\xe8\xd1\xfa";
 #define MDK_BD_SITE_AT   5                       /* the 5 bytes we replace   */
@@ -6674,6 +8142,206 @@ static void InstallMdkBackdrop(unsigned char *code, unsigned int codeSize)
         VirtualFree(stub, 0, MEM_RELEASE);
 }
 
+//
+// K36.  The OUTRO gameplay backdrop -- K20's third twin, scrolling on BOTH
+// axes, and the last 600x360 island left on screen.
+//
+// 0x42fe00 is a self-contained scrolling background with exactly one caller
+// (0x42ccd4).  It loads its image once, by name: 0x42afff passes the string
+// "BG" at 0x48dd1c and stores the result in 0x4e5c4c, which nothing outside
+// this routine ever reads.  Its two scroll values are computed at the head of
+// the routine from the camera's own direction vectors (0x538d74/0x538d84 and
+// 0x538d8c/0x538d9c), so the picture drifts with where you are looking:
+//
+//     0x492570   horizontal scroll, wrapped to 0..599
+//     0x492574   vertical   scroll, wrapped to 0..359
+//
+// then it locks the view LFB and blits the 600x360 image 1:1 through the same
+// shared 8bpp->16bpp row helper (0x46e884, palette 0x546848) K20 and K23 use.
+// Four loops -- two for the vertical wrap, and two more per row at 0x430013
+// when the horizontal scroll is non-zero -- but they all reduce to one thing:
+//
+//     shown[r][c] = src[(vscroll + r) mod 360][(hscroll + c) mod 600]
+//
+// which is K23's cancellation in both axes at once, so one body serves every
+// path and there is no need to reproduce the four loops.
+//
+// MEASURED, not inferred.  The marked rectangle is 600x360 with its right edge
+// at 1260 and its bottom at 580 -- an edge-energy scan puts both to the pixel
+// -- and 660+600 = 1260, 220+360 = 580 are exactly K5's default 2D centring.
+// So it is a full-window backdrop drawn 1:1 and then centred, which is the
+// same thing K20 was written for.
+//
+// It shares K20's destination maths (MdkFitRect against `backdrop=`), and that
+// is the part that matters: the OTHER backdrop in this scene goes through K20,
+// and the two have to agree or there is a seam between them.  It shares the
+// scratch row too, for the reason K20 learnt the hard way -- the framebuffer is
+// only ever written, never read back.
+//
+// Entered after the lock and rejoined at the unlock (section 5c).  The five
+// bytes replaced are `mov -0x24(%ebp),%edx ; sar %edx`, which only recompute
+// the stride we read ourselves.
+//
+#define MDK_STAR_SRC     0x004e5c4cu   /* the "BG" image, 600x360 8bpp */
+#define MDK_STAR_HSCROLL 0x00492570u   /* 0..599 */
+#define MDK_STAR_VSCROLL 0x00492574u   /* 0..359 */
+
+extern "C" void __attribute__((cdecl, used, noinline))
+MdkStarfield(unsigned int *f)
+{
+    const unsigned char  *src;
+    const unsigned short *pal = (const unsigned short *)MDK_BD_PAL;
+    unsigned short       *base, *dst, *row = g_mdkBdRow;
+    unsigned int          ebp;
+    int  strideB, strideP, W, H, x, y, hs, vs, lastRow = -1;
+    int  dx0, dy0, dw, dh;
+    unsigned int sxStep, syStep, sy;
+
+    if (!f || !row) return;
+
+    ebp = f[2];                                  /* the routine's own frame */
+    if (!ebp || IsBadReadPtr((const void *)(ebp - 0x30), 0x10)) return;
+
+    src = *(const unsigned char *const *)MDK_STAR_SRC;
+    if (!src || IsBadReadPtr(src, MDK_BD_W * MDK_BD_H)) return;
+
+    base    = *(unsigned short **)(ebp - 0x30);
+    strideB = *(const int *)(ebp - 0x24);        /* still BYTES at the hook */
+    if (!base || strideB <= 0) return;
+
+    /* K20's lesson, and it cost a build there: the base the lock hands back is
+       ALREADY offset by K5's centring, so a full-screen image drawn from it
+       runs off the end of the row and comes out as a diagonal.  A backdrop
+       wants the true framebuffer origin. */
+    if (g_mdkLfbPtr && *g_mdkLfbPtr)
+        base = (unsigned short *)*g_mdkLfbPtr;
+
+    strideP = strideB / 2;
+    W = (int)g_targetW;
+    H = (int)g_targetH;
+    if (W <= 0 || H <= 0 || strideP <= 0) return;
+    if (W > strideP) W = strideP;                /* the 2048/4096 row limit */
+
+    hs = *(const int *)MDK_STAR_HSCROLL;
+    vs = *(const int *)MDK_STAR_VSCROLL;
+    if (hs < 0 || hs >= MDK_BD_W) hs = 0;        /* the game wraps them itself,
+                                                    but a hook runs in more
+                                                    states than the code it
+                                                    watches */
+    if (vs < 0 || vs >= MDK_BD_H) vs = 0;
+
+    MdkFitRect(MDK_BD_W, MDK_BD_H, W, H, g_mdkBackdrop == 2,
+               &dx0, &dy0, &dw, &dh, &sxStep, &syStep);
+
+    g_mdkBoxDrew = 1;
+
+    sy = 0;
+    for (y = 0; y < H; y++) {
+        int srcRow;
+
+        dst = base + (unsigned int)y * (unsigned int)strideP;
+
+        if (y < dy0 || y >= dy0 + dh) {          /* outside the picture: bar */
+            memset(dst, 0, (unsigned int)W * 2);
+            continue;
+        }
+
+        srcRow = (int)(sy >> 16);
+        sy += syStep;
+        if (srcRow >= MDK_BD_H) srcRow = MDK_BD_H - 1;
+        srcRow += vs;                            /* one subtract, not a modulo:
+                                                    both terms are below 360 */
+        if (srcRow >= MDK_BD_H) srcRow -= MDK_BD_H;
+
+        /* The scroll is constant across a frame, so a row's content depends on
+           srcRow alone -- and the 2.22x vertical magnification means most
+           output rows cost only the copy out. */
+        if (srcRow != lastRow) {
+            const unsigned char *s = src + (unsigned int)srcRow * MDK_BD_W;
+            unsigned int         sx = 0;
+
+            for (x = 0; x < dx0; x++) row[x] = 0;
+            for (; x < dx0 + dw; x++, sx += sxStep) {
+                int col = (int)(sx >> 16);
+
+                if (col >= MDK_BD_W) col = MDK_BD_W - 1;
+                col += hs;
+                if (col >= MDK_BD_W) col -= MDK_BD_W;
+                row[x] = pal[s[col]];
+            }
+            for (; x < W; x++) row[x] = 0;
+            lastRow = srcRow;
+        }
+
+        memcpy(dst, row, (unsigned int)W * 2);
+    }
+}
+
+/* The five bytes at the site happen to be unique here, unlike K20's, but the
+   signature still starts at the two `lea`s and the `call` to the lock helper:
+   that is what K20's five-way collision taught, and it is also what lets the
+   two stack slots the body reads be part of the match rather than an
+   assumption. */
+static const unsigned char mdk_star_sig[] =      /* 0x0042ff09 */
+    { 0x8d, 0x55, 0xdc,                          /* lea -0x24(%ebp),%edx  stride */
+      0x8d, 0x45, 0xd0,                          /* lea -0x30(%ebp),%eax  base   */
+      0xe8 };                                    /* call the lock helper         */
+#define MDK_STAR_SITE_AT   (sizeof(mdk_star_sig) + 4)      /* past the call */
+#define MDK_STAR_REJOIN_AT (MDK_STAR_SITE_AT + 0xb4)       /* its unlock call */
+
+static void InstallMdkStarfield(unsigned char *code, unsigned int codeSize)
+{
+    unsigned char *at, *stub, *lock, *rejoin;
+    unsigned char  patch[5];
+    int            rel;
+
+    if (!g_mdkBackdrop) return;
+
+    at = FindUnique(code, codeSize, mdk_star_sig, sizeof(mdk_star_sig));
+    if (!at) { MdkDiag("starfield: signature not found"); return; }
+
+    /* Read out of the displaced instruction, never hardcoded -- section 5b,
+       the mistake that crashed build 0116. */
+    lock   = (at + MDK_STAR_SITE_AT)
+           + (int)ReadU32(at + sizeof(mdk_star_sig));
+    rejoin = at + MDK_STAR_REJOIN_AT;
+
+    /* The rejoin is an offset into a routine the signature has pinned, so it
+       is checked rather than trusted: it has to be the unlock CALL, and it has
+       to name the same helper the lock's own module unlocks through. */
+    if (*rejoin != 0xe8) {
+        MdkDiag("starfield DECLINED -- no unlock call at %08lx",
+                (long)(unsigned int)rejoin);
+        return;
+    }
+
+    at += MDK_STAR_SITE_AT;
+
+    if (!g_mdkBdRow)
+        g_mdkBdRow = (unsigned short *)VirtualAlloc(NULL, (g_targetW + 8) * 2,
+                                                    MEM_COMMIT, PAGE_READWRITE);
+    if (!g_mdkBdRow) return;                     /* fails closed, like K20 */
+
+    stub = (unsigned char *)VirtualAlloc(NULL, sizeof(mdk_bd_stub), MEM_COMMIT,
+                                         PAGE_EXECUTE_READWRITE);
+    if (!stub) return;
+
+    memcpy(stub, mdk_bd_stub, sizeof(mdk_bd_stub));
+    rel = (int)((unsigned char *)&MdkStarfield - (stub + MDK_BD_CALL_AT + 4));
+    PutU32(stub + MDK_BD_CALL_AT, (unsigned int)rel);
+    rel = (int)(rejoin - (stub + MDK_BD_JMP_AT + 4));
+    PutU32(stub + MDK_BD_JMP_AT, (unsigned int)rel);
+
+    MdkDiag("starfield site=%08lx lock=%08lx rejoin=%08lx stub=%08lx",
+            (long)(unsigned int)at, (long)(unsigned int)lock,
+            (long)(unsigned int)rejoin, (long)(unsigned int)stub);
+
+    patch[0] = 0xe9;                             /* jmp rel32 -> stub */
+    PutU32(patch + 1, (unsigned int)(int)(stub - (at + 5)));
+    if (!WriteCode(at, patch, 5))
+        VirtualFree(stub, 0, MEM_RELEASE);
+}
+
 static void InstallMdkSky(unsigned char *code, unsigned int codeSize)
 {
     unsigned char *at, *at2, *end, *stub;
@@ -6703,24 +8371,11 @@ static void InstallMdkSky(unsigned char *code, unsigned int codeSize)
                                                  MEM_COMMIT, PAGE_READWRITE);
     if (!g_mdkSkyRow) return;
 
+    /* Both loops go through the same helper.  This site used to be a copy of
+       it, which is how it would have been left behind by the fall-through
+       change below. */
     if (!MdkHookSkyLoop(at2, end)) return;
-
-    stub = (unsigned char *)VirtualAlloc(NULL, sizeof(mdk_sky_stub),
-                                         MEM_COMMIT, PAGE_EXECUTE_READWRITE);
-    if (!stub) return;
-
-    memcpy(stub, mdk_sky_stub, sizeof(mdk_sky_stub));
-    rel = (int)((unsigned char *)&MdkSkyScaled - (stub + MDK_SKY_CALL_AT + 4));
-    PutU32(stub + MDK_SKY_CALL_AT, (unsigned int)rel);
-    rel = (int)(end - (stub + MDK_SKY_JMP_AT + 4));
-    PutU32(stub + MDK_SKY_JMP_AT, (unsigned int)rel);
-
-    patch[0] = 0xe9;                            /* jmp rel32 -> stub */
-    rel = (int)(stub - (at + 5));
-    PutU32(patch + 1, (unsigned int)rel);
-
-    if (!WriteCode(at, patch, 5))
-        VirtualFree(stub, 0, MEM_RELEASE);
+    if (!MdkHookSkyLoop(at,  end)) return;
 }
 
 //
@@ -6826,10 +8481,22 @@ static void InstallMdkHud(unsigned char *code, unsigned int codeSize)
                             sizeof(mdk_hudlock_sig) - 1);
     g_mdkHudRet = spriteLock ? (unsigned int)(spriteLock + MDK_HUDLOCK_RET) : 0;
 
+    {
+        unsigned char *r = FindUnique(code, codeSize, mdk_rectlock_sig,
+                                      sizeof(mdk_rectlock_sig));
+        unsigned char *i = FindUnique(code, codeSize, mdk_itemrect_sig,
+                                      sizeof(mdk_itemrect_sig));
+
+        g_mdkRectRet  = r ? (unsigned int)(r + MDK_RECT_RET) : 0;
+        g_mdkItemFrom = i ? (unsigned int)(i + MDK_ITEM_RET) : 0;
+        MdkDiag("itemrect lock=%08lx from=%08lx",
+                (long)g_mdkRectRet, (long)g_mdkItemFrom);
+    }
+
     spriteLock = FindUnique(code, codeSize, mdk_numdraw_sig,
-                            sizeof(mdk_numdraw_sig) - 1);
+                            sizeof(mdk_numdraw_sig));
     g_mdkNumRet = spriteLock
-                ? (unsigned int)(spriteLock + sizeof(mdk_numdraw_sig) - 1) : 0;
+                ? (unsigned int)(spriteLock + MDK_NUMDRAW_RET) : 0;
 
     /* Record which call site is drawing, from the drawer's own entry. */
     {
@@ -6839,7 +8506,7 @@ static void InstallMdkHud(unsigned char *code, unsigned int codeSize)
         int            rel;
 
         at = FindUnique(code, codeSize, mdk_huddraw_sig,
-                        sizeof(mdk_huddraw_sig) - 1);
+                        sizeof(mdk_huddraw_sig));
         stub = at ? (unsigned char *)VirtualAlloc(NULL, sizeof(t), MEM_COMMIT,
                                                   PAGE_EXECUTE_READWRITE)
                   : NULL;
@@ -6945,6 +8612,125 @@ static unsigned int  g_diagFrame = 0;
    open while the header is being written, shut once MdkApply finishes, and
    thereafter open only between INSERT and DELETE. */
 static int           g_diagGate    = 1;
+
+extern "C" void __attribute__((cdecl, used, noinline))
+MdkLfbBaseView(unsigned int *out, unsigned int caller,
+               unsigned int callerEbx, unsigned int callerEbp)
+{
+    int cx, cy;
+
+    if (!out || !g_mdkLfbPtr) return;
+
+    cx = g_mdkHudCx;
+    cy = g_mdkHudCy;
+
+    /* TEMPORARY.  The lock's return address names the DRAWER; its caller is
+       one level further out and is what actually identifies the element --
+       0x415314 for instance draws both menu text and the enemy health bar,
+       and only one of those wants centring. */
+    if (g_diagGate && MdkDiagFresh(0x2d000000u ^ (caller << 4))) {
+        unsigned int from = 0;
+
+        if (callerEbp && !IsBadReadPtr((const void *)(callerEbp + 4), 4))
+            from = *(const unsigned int *)(callerEbp + 4);
+        MdkDiag("viewlock caller=%08lx from=%08lx", (long)caller, (long)from);
+    }
+
+    /* The sprite blitter and the entity drawer are EXCLUDED, not centred:
+       their coordinates are already real screen pixels.  Centring them was
+       the bug this replaces, so the installer fails closed if either lock
+       cannot be found. */
+    if (caller == g_mdkSpriteRet) {
+        cx = 0;
+        cy = 0;
+    }
+    else if (g_mdkEntityRet && caller == g_mdkEntityRet) {
+        cx = 0;
+        cy = 0;
+    }
+    /* K26.  The item frame: anchored with the ammo icon it belongs to, using
+       K15's left-band numbers so the three stay together.  Keyed on the
+       drawer's own caller, because its other 21 callers must stay put. */
+    else if (g_mdkRectRet && caller == g_mdkRectRet && callerEbp
+             && g_mdkItemFrom
+             && !IsBadReadPtr((const void *)(callerEbp + 4), 4)
+             && *(const unsigned int *)(callerEbp + 4) == g_mdkItemFrom) {
+        cx = g_mdkBoxX0;
+        cy = g_mdkHudCy * 2;
+    }
+    /* The enemy health bar's frame: the picture's top-left, matching its
+       fill.  Keyed on the caller, like the item frame above, because this
+       drawer has 22 of them. */
+    else if (g_mdkRectRet && caller == g_mdkRectRet && callerEbp
+             && g_mdkHpFrom
+             && !IsBadReadPtr((const void *)(callerEbp + 4), 4)
+             && *(const unsigned int *)(callerEbp + 4) == g_mdkHpFrom) {
+        cx = g_mdkBoxX0;
+        cy = 0;
+    }
+    /* K35.  The bombing run's bomb counter.  The font renderer has seven
+       callers and draws every string in the game, so this is keyed on the one
+       that is the bomb sight's -- 0x46af17, the return address 0x414fa8 was
+       entered with, which is live at [ebp+4] exactly as the two rect drawers
+       above use it.
+
+       Its own arguments are still in its frame at the lock: x at [ebp-0x28]
+       and y at [ebp-0x18], stored by the first three instructions of the
+       function.  Reading them is what lets one offset express a per-element
+       map, which is all this hook can do. */
+    else if (g_mdkFontRet && caller == g_mdkFontRet && callerEbp
+             && g_mdkBombTextFrom && g_mdkSnipeW > 0
+             && !IsBadReadPtr((const void *)(callerEbp - 0x28), 4)
+             && !IsBadReadPtr((const void *)(callerEbp + 4), 4)
+             && *(const unsigned int *)(callerEbp + 4) == g_mdkBombTextFrom) {
+        int lx = *(const int *)(callerEbp - 0x28);
+        int ly = *(const int *)(callerEbp - 0x18);
+
+        cx = g_mdkSnipeX0 + (lx * g_mdkSnipeW) / MDK_SCOPE_W - lx;
+        cy = g_mdkSnipeY0 + (ly * g_mdkSnipeH) / MDK_SCOPE_H - ly;
+
+        if (MdkDiagFresh(0x77000000u ^ ((unsigned int)lx & 0xffffu)))
+            MdkDiag("bombtext layout %ld,%ld -> screen %ld,%ld",
+                    (long)lx, (long)ly, (long)(lx + cx), (long)(ly + cy));
+    }
+    else if (g_mdkHudRet && callerEbx && caller == g_mdkHudRet
+             && !IsBadReadPtr((const void *)callerEbx, 8)) {
+        const int *p = (const int *)callerEbx;
+
+        /* K29.  In snipe mode there are no HUD corners to anchor to: every
+           element on that screen is laid out in the SCOPE's own 600x360
+           space, the same space as the art and the four viewports, so they
+           take the same box transform.  Expressed as an offset because that
+           is all this hook can do, but it is per element, so it is the box
+           map exactly. */
+        if (g_mdkInScope && g_mdkSnipeW > 0) {
+            cx = g_mdkSnipeX0 + (p[0] * g_mdkSnipeW) / MDK_SCOPE_W - p[0];
+            cy = g_mdkSnipeY0 + (p[1] * g_mdkSnipeH) / MDK_SCOPE_H - p[1];
+        }
+        /* Anchored to the edges of the PICTURE, not of the screen: with a
+           letterboxed backdrop those differ, and the bars are painted last,
+           so a HUD anchored to the screen corners was drawn correctly and
+           then blacked out. */
+        else if (p[0] < MDK_HUD_LEFT_X) {
+            cx = g_mdkBoxX0;                    /* ammo counter, far left */
+            cy = cy * 2;
+        } else {
+            cx = g_mdkBoxX0 + g_mdkBoxW - MDK_VIEW_W;   /* right cluster  */
+            cy = cy * 2;
+        }
+
+        if (g_diagGate
+            && MdkDiagFresh(0x6d000000u ^ ((unsigned int)p[0] & 0x3ff)
+                                        ^ (((unsigned int)p[1] & 0x3ff) << 10)))
+            MdkDiag("hudpos %ld,%ld -> screen %ld,%ld  (caller %08lx)",
+                    (long)p[0], (long)p[1],
+                    (long)(p[0] + cx), (long)(p[1] + cy), (long)caller);
+    }
+
+    *out = *g_mdkLfbPtr
+         + (unsigned int)((*g_mdkOrgY + cy) * (int)*g_mdkStride)
+         + (unsigned int)(2 * (*g_mdkOrgX + cx));
+}
 static int           g_diagCapture = 0;
 static BOOL          g_diagHdrWritten = FALSE;
 static unsigned int  g_diagCaptureN = 0;
@@ -7557,10 +9343,27 @@ static void MdkDiagKeys(int insert, int del)
 /* TEMPORARY -- every grBufferClear the wrapper sees, from anywhere.  MDK's
    backdrop has to be re-laid after any of them, and there are 30 sites it can
    clear from; catching it here catches all of them without knowing which. */
+/* ONCE PER FRAME, not once per clear.
+ *
+ * grBufferClear is not only the frame clear.  MDK also paints small filled
+ * rectangles with it -- 0x471d28 is grClipWindow followed by grBufferClear,
+ * and that is how the enemy health bar's fill is drawn.  Firing this hook on
+ * every clear meant we drew the whole sky again inside whatever clip window
+ * the game had just set, so the fill came out full of SKYBOX.  That is
+ * exactly what it looked like, and why it differed between targets: different
+ * clip rectangles, different piece of sky.
+ *
+ * The frame clear is the first of the frame, so drawing on the first one and
+ * ignoring the rest is both the fix and the original intent.  Cleared at the
+ * swap, so it is one flag with one setter and one clearer. */
+static int g_mdkSkyDrawn = 0;
+
 void GameFix_AfterClear(void)
 {
     if (!g_mdkClear || g_mdkSkyBusy) return;    /* MDK only, and no re-entry */
+    if (g_mdkSkyDrawn) return;                  /* not a frame clear         */
     g_mdkClears++;
+    g_mdkSkyDrawn = 1;
     g_mdkSkyBusy = 1;
     MdkSkyDrawHW(1);
     g_mdkSkyBusy = 0;
@@ -7572,9 +9375,130 @@ static void DrvTick(void);
 
 /* TEMPORARY -- called from the wrapper's grBufferSwap BEFORE it forwards, so
    the letterbox bars are the last thing written to the frame. */
+/* K31.  The bullets in the barrel -- GLIDE GEOMETRY, which is why nine
+ * captures of the 2D blitters came back clean: they never touch one.
+ *
+ * The probe that found them logged 137 triangles in the barrel area, every
+ * one from the same emitter, in two clusters that match the two missiles I
+ * measured off the screenshot to within a few pixels.
+ *
+ * Their screen x is layout * W/600 and their y is layout * H/360 -- the main
+ * projection's extents after the world was widened.  Everything else inside
+ * the scope is on a UNIFORM k with the letterbox offset, so the two disagree.
+ * In the original they agreed, because the projection and the scope art were
+ * both 600x360.
+ *
+ * The projection cannot be corrected from its constants: it has a horizontal
+ * scale but no horizontal offset -- its one offset is shared between both
+ * axes, so it cannot say "shift x, leave y alone".  But the vertices reach us
+ * already in screen space, so the correction is exact and one line:
+ *
+ *     undo x * W/600, apply dw/600, add dx0   ==   dx0 + x * dw/W
+ *
+ * y needs nothing: layout * H/360 is already the scope's own vertical scale,
+ * and the letterbox has no vertical bar at any widescreen override.
+ *
+ * SCOPE OF THE TEST, and it is why this is safe: only while the scope is up,
+ * and only triangles wholly left of the sniper view (x=533) and below the cam
+ * ovals.  The scope art is 2D, the view is to the right, the cams are above --
+ * nothing else draws in that box, and the 137 logged triangles are the
+ * evidence rather than an assumption.  The test uses the ORIGINAL coordinates,
+ * so a triangle is moved whole or not at all; it cannot tear.
+ */
+extern "C" void GameFix_Tri(const void *a, const void *b, const void *c,
+                            unsigned int caller)
+{
+    float *v[3];
+    float  minx, maxx, miny, maxy;
+    int    i;
+
+    if (!g_targetW || !a || !b || !c) return;
+
+    v[0] = (float *)a;  v[1] = (float *)b;  v[2] = (float *)c;
+    minx = maxx = v[0][0];
+    miny = maxy = v[0][1];
+    for (i = 1; i < 3; i++) {
+        if (v[i][0] < minx) minx = v[i][0];
+        if (v[i][0] > maxx) maxx = v[i][0];
+        if (v[i][1] < miny) miny = v[i][1];
+        if (v[i][1] > maxy) maxy = v[i][1];
+    }
+
+    /* TEMPORARY.  Outside snipe mode this is a PROBE and changes nothing:
+       the red damage overlay is drawn as geometry, like the barrel props
+       were, so no 2D hook can see it.  Anything large and confined to the
+       top-left is a candidate -- the overlay measures about 600 wide, which
+       is the layout width, while its correct full-screen twin spans the
+       screen and is filtered out here by the maxx test. */
+    /* K33.  The damage overlay.  Its producer is 0x472306/0x472333 -- two
+       triangles making one quad, inside the same routine K14 hooks for the
+       sky but on a geometry path rather than a blit loop.  It is laid out in
+       the game's 600x360 space, so with the viewport origin forced to (0,0)
+       it covers 600 of 1920 and sits in the corner.
+
+       Scaled the way the game would if it knew the screen size.  Keyed on the
+       PRODUCER, which is why the emitter probe had to exist: the shared
+       emitter draws world geometry in the same region and must not move. */
+    if (g_mdkEmitFrom == 0x00472306u || g_mdkEmitFrom == 0x00472333u) {
+        float kx = (float)(int)g_targetW / (float)MDK_VIEW_W;
+        float ky = (float)(int)g_targetH / (float)MDK_VIEW_H;
+
+        for (i = 0; i < 3; i++) {
+            v[i][0] *= kx;
+            v[i][1] *= ky;
+        }
+        if (MdkDiagFresh(0x7c000000u ^ (g_mdkEmitFrom & 0xffffu)))
+            MdkDiag("overlay from=%08lx  x %ld..%ld -> %ld..%ld",
+                    (long)g_mdkEmitFrom, (long)minx, (long)maxx,
+                    (long)(minx * kx), (long)(maxx * kx));
+        return;
+    }
+
+    if (!g_mdkScopeHold || g_mdkSnipeW <= 0) {
+        /* Tightened after the first run.  It caught two things that are not
+           the overlay: our OWN sky quads, which reach the export through
+           MDK's thunk and so report a caller inside this DLL, and MDK's
+           shared triangle emitter at 0x4701cb, which is all the world
+           geometry.  The overlay is a single quad anchored at the corner and
+           about 600 wide, so require exactly that. */
+        if (caller >= 0x1a000000u) return;          /* our own sky quads */
+        /* The overlay is a STACK of bands: 0..195 was caught, 190..330 was
+           not, because this required the top edge to be near the corner.
+           Anchored on the LEFT only, so every band is seen. */
+        if (minx > 40.0f || miny > 400.0f) return;
+        if (maxx < 400.0f || maxx > 700.0f) return; /* ~600 wide, not full screen */
+        if (maxy - miny < 60.0f) return;
+
+        if (MdkDiagFresh(0x7b000000u ^ (g_mdkEmitFrom & 0xffffu)
+                                     ^ ((unsigned int)((int)(maxx - minx) / 32) << 16)))
+            MdkDiag("quad from=%08lx via=%08lx  x %ld..%ld  y %ld..%ld",
+                    (long)g_mdkEmitFrom, (long)caller,
+                    (long)minx, (long)maxx, (long)miny, (long)maxy);
+        return;
+    }
+
+    if (minx < 0.0f  || maxx > 520.0f) return;   /* left of the view only */
+    if (miny < 380.0f || maxy > (float)(int)g_targetH) return;  /* below the ovals */
+
+    for (i = 0; i < 3; i++)
+        v[i][0] = (float)g_mdkSnipeX0
+                + v[i][0] * (float)g_mdkSnipeW / (float)(int)g_targetW;
+
+    if (MdkDiagFresh(0x7a000000u ^ ((unsigned int)((int)minx / 16) << 8)
+                                 ^ ((unsigned int)((int)miny / 16) << 20)))
+        MdkDiag("barrel x %ld..%ld -> %ld..%ld  y %ld..%ld",
+                (long)minx, (long)maxx,
+                (long)v[0][0], (long)(g_mdkSnipeX0
+                    + (int)(maxx * g_mdkSnipeW / (int)g_targetW)),
+                (long)miny, (long)maxy);
+}
+
 void GameFix_PreSwap(void)
 {
     MdkPaintBars();
+    g_mdkInScope = 0;       /* K29: true only within the frame the scope drew */
+    if (g_mdkScopeHold > 0) g_mdkScopeHold--;
+    g_mdkSkyDrawn = 0;      /* the next frame's first clear draws the sky */
 }
 
 void GameFix_Tick(void)
@@ -7770,6 +9694,7 @@ static void MdkApply(const char *exePath, const char *ini, BOOL haveIni)
     if (mask & MDK_P_SKY)      InstallMdkSky(code, codeSize);
     if (mask & MDK_P_BACKDR)   InstallMdkBackdrop(code, codeSize);
     if (mask & MDK_P_BACKDR)   InstallMdkIntroBg(code, codeSize);
+    if (mask & MDK_P_BACKDR)   InstallMdkStarfield(code, codeSize);
     if (mask & MDK_P_BACKDR)   InstallMdkDive(code, codeSize);
 
     MdkDiag("entity spriteRet=%08lx entityRet=%08lx",
@@ -7778,6 +9703,35 @@ static void MdkApply(const char *exePath, const char *ini, BOOL haveIni)
     MdkDiag("hud cx=%ld cy=%ld spriteRet=%08lx  box=%ld+%ld",
             (long)g_mdkHudCx, (long)g_mdkHudCy, (long)g_mdkSpriteRet,
             (long)g_mdkBoxX0, (long)g_mdkBoxW);
+
+    /* K28 runs HERE, not with the other item work, and the ordering is the
+       whole reason: it bakes the offsets into its stub, and g_mdkBoxX0 is not
+       computed until MdkApply runs while g_mdkHudCy is set inside the 2D
+       centring installer.  Placed with K26 it read two zeroes and declined in
+       silence.  K26 itself is immune because it reads them per draw. */
+    if (mask & MDK_P_HUD)    InstallMdkItemFill(code, codeSize);
+    if (mask & MDK_P_HUD)    InstallMdkHealthFill(code, codeSize);
+    if (mask & MDK_P_HUD)    InstallMdkLoadBars(code, codeSize);
+
+    /* TEMPORARY.  Armed for the whole of MDK, not just snipe mode, so the
+       triangle probe can see the red damage overlay -- which is geometry, so
+       nothing else can.  It costs MDK one call per triangle; it goes out with
+       the rest of the diagnostic.  Other games never set this, so they still
+       pay a load and a not-taken branch. */
+    InstallMdkEmitProbe(code, codeSize);
+    GameFix_TriHot = 1;
+    if (mask & MDK_P_PROJ)   InstallMdkSnipe(code, codeSize);
+    if (mask & MDK_P_PROJ)   InstallMdkHudScale(code, codeSize);
+
+    /* K35.  The bombing run: three elements in the same layout space the
+       scope uses, so it goes with the projection bit and after the box
+       has been computed. */
+    if (mask & MDK_P_PROJ)   InstallMdkBomb(code, codeSize);
+
+    /* K34.  The sky's own leftover fill -- part of the backdrop, so it goes
+       with the sky bit.  Reads its offsets per draw, so ordering is free. */
+    if (mask & MDK_P_SKY)    InstallMdkSkyFill(code, codeSize);
+
     InstallMdkDiag(code, codeSize);
 
     /* Everything above is the header: it survives every capture, and is the

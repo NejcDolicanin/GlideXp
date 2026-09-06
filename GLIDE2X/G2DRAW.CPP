@@ -11,6 +11,7 @@
 
 #include "g2pch.h"
 #include <malloc.h>
+#include "gamefix.h"
 
 namespace Glide3 {
 
@@ -269,6 +270,8 @@ NAKED_CALL void FX_CALL grDrawTriangle( const void *a, const void *b, const void
 #define FN_NAME "grDrawTriangle"
     GDBG_INFO(80, "%s\n", FN_NAME);
 
+	if (GameFix_TriHot)
+		GameFix_Tri(a, b, c, (unsigned int)__builtin_return_address(0));
 	using Glide3::grDrawTriangle;
 	VOID_ASM_JMP (grDrawTriangle,(a,b,c));
 

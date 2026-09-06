@@ -10,6 +10,7 @@
 //
 
 #include "g2pch.h"
+#include "gamefix.h"
 
 /* Moved per GMT cleanup */
 #define GU_PRIM_MAX_VERTICES 100
@@ -210,6 +211,12 @@ static const float vertex_snap_constant = ( float ) ( 1L << 19 );
 
 void FX_CALL guDrawTriangleWithClip (const GrVertex *a, const GrVertex *b, const GrVertex *c )
 {
+	/* TEMPORARY: the same probe as grDrawTriangle.  MDK reaches this one
+	   too, and it calls Glide3 directly, so anything drawn through here
+	   was invisible to the other hook. */
+	if (GameFix_TriHot)
+		GameFix_Tri(a, b, c, (unsigned int)__builtin_return_address(0));
+
 	GrVertex
 		output_array[8],
 		output_array2[8],
