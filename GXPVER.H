@@ -23,13 +23,13 @@
 	#define MAJVERSION				1
 	#define MAJREVISION				00
 	#define MINREVISION				01
-	#define BUILD_NUMBER			0117
+	#define BUILD_NUMBER			107
 
 	// Glide2x translator str version
 	#define MAJVERSIONSTR			"1"
 	#define MAJREVISIONSTR			"00"
 	#define MINREVISIONSTR			"01"
-	#define BUILD_NUMBERSTR			"0117"
+	#define BUILD_NUMBERSTR			"0107"
 
 	// Glide2x version page strings
 	#define HWSTR   "Voodoo Graphics" _REGISTERED_ ", Voodoo Rush" _REGISTERED_ ", Voodoo^2" _REGISTERED_ ", Voodoo Banshee" _REGISTERED_ ", Voodoo3" _REGISTERED_ ", Velocity" _TRADEMARK_ " 100/200" ", Voodoo4" _REGISTERED_ ", & Voodoo5" _REGISTERED_ ""
@@ -45,7 +45,7 @@
 	#define MAJVERSION				1
 	#define MAJREVISION				00
 	#define MINREVISION				01
-	#define BUILD_NUMBER			0117
+	#define BUILD_NUMBER			0106
 
 	// Glide2x translator str version
 	#define MAJVERSIONSTR			"1"

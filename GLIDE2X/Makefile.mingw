@@ -135,8 +135,14 @@ $(GENDATE): ../H5/INCSRC/GENDATE.C | $(OBJDIR)
 	$(CC) -O1 $< -o $(OBJDIR)/gendate.exe
 	$(OBJDIR)/gendate.exe > $@
 
-$(RESOBJ): $(RCFILE) | $(OBJDIR)
-	$(WINDRES) $(INCLUDES) -I.. $< -O coff -o $@
+# The .rc needs $(DEFINES) too, not just the include path.  gxpVer.h is one
+# long #if chain selecting which product's version block to emit, and G2_TRANS
+# is what picks the Glide2->Glide3 translator.  Without it the chain falls
+# through to its final #else and stamps this DLL with GlideXP's glide3x
+# identity -- "GlideXP Fast DLL", 3.20.00.1016, OriginalFilename glide3x.dll.
+# The failure is silent: the resource compiles cleanly either way.
+$(RESOBJ): $(RCFILE) ../gxpVer.h ../SWLIBS/fxmisc/fxver.h | $(OBJDIR)
+	$(WINDRES) $(DEFINES) $(INCLUDES) $< -O coff -o $@
 
 $(OBJDIR):
 	mkdir $(OBJDIR)
