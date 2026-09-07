@@ -13,5 +13,5 @@ mingw32-make -f Makefile.mingw exports      ; dump the export table (must be 123
 mingw32-make -f Makefile.mingw SYMBOLS=1    ; keep DWARF for gdb
 <br/>
 
-##More info - the original site
+## More info - the original site
 https://wenchy.net/old/glidexp/
